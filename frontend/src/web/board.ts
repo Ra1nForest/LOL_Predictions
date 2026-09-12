@@ -1,21 +1,23 @@
 /**
  * 看板和比赛列表 —— api.py 里 /esports/live、/esports/upcoming、/esports/board 的浏览器版。
  *
- * 输出和服务器逐字段同形, 前端组件一行不用改。唯一有意为之的差别:
- * **不算 BP 后 (Stage 2) 那条参考线** —— 它要带上一万多行的选手-英雄表, 而静态站只做
- * 赛程 + 赛前预测 + 局内看板。postdraft_probability_blue 因此恒为 null。
+ * 输出和服务器逐字段同形, 前端组件一行不用改, 包括 BP 后 (Stage 2) 那条参考线
+ * (postdraft_probability_blue, 见 stage2.ts 和 draftFromMeta)。
  *
- * 正确性由 scripts/diff-board.mjs 保证: 对已打完的比赛和本机 API 逐字段比对。
+ * 正确性由 scripts/diff-board.mjs 保证: 对已打完的比赛和一个全新的 Python 进程逐字段比对。
  */
 import type { ExplainFile } from "./explain.ts";
 import type { IngameModel } from "./ingame.ts";
 import { ingameResponse } from "./ingame.ts";
 import type { PreCtx, Stage1 } from "./stage1.ts";
 import { preContext } from "./stage1.ts";
+import type { Draft, Stage2 } from "./stage2.ts";
+import { predictCore } from "./stage2.ts";
 import type { TeamsFile } from "./teams.ts";
 import { knownTeams, mapTeam, norm } from "./teams.ts";
-import type { LiveState, Match } from "./feed.ts";
+import type { LiveState, Match, MetaEntry } from "./feed.ts";
 import { DDRAGON, Feed, LEAGUE_IDS, PERSISTED, parseTs19, predictable, toState } from "./feed.ts";
+import { oePlayerName } from "./names.ts";
 import { pyRound } from "./pyfmt.ts";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -24,6 +26,7 @@ type Json = any;
 export interface Models {
   ingame: IngameModel;
   s1: Stage1;
+  s2: Stage2;
   ex: ExplainFile;
 }
 
@@ -236,6 +239,37 @@ async function lineups(feed: Feed, gameId: string): Promise<[string[], string[]]
   return bl.length === 5 && rd.length === 5 ? [bl, rd] : null;
 }
 
+const ROLE_OE = new Map([
+  ["jungle", "jng"],
+  ["bottom", "bot"],
+  ["support", "sup"],
+]);
+
+/**
+ * api._board_draft 的纯函数部分: 元数据里的十个人 → {side: {role: {player, champion}}}。
+ * 选手名去掉战队简称前缀 (oePlayerName); 英雄名原样, 查表时再按 championKey 对齐。
+ * 凑不齐十个人返回 null。黄金测试直接调它, 所以和取数分开。
+ */
+export function draftFromMeta(players: Iterable<MetaEntry>, codes: (string | null | undefined)[]): Draft | null {
+  const draft: Draft = { blue: {}, red: {} };
+  for (const mm of players) {
+    const role = mm.role == null ? mm.role : (ROLE_OE.get(mm.role) ?? mm.role);
+    const nm = oePlayerName(mm.summoner_name, codes);
+    const ch = mm.champion;
+    const side = mm.side;
+    if (role && ch && nm && (side === "blue" || side === "red")) draft[side][role] = { player: nm, champion: ch };
+  }
+  return Object.keys(draft.blue).length + Object.keys(draft.red).length === 10 ? draft : null;
+}
+
+/** api._board_draft */
+async function boardDraft(feed: Feed, gameId: string, minfo: Match): Promise<Draft | null> {
+  return draftFromMeta(
+    (await feed.gameMetadata(gameId)).values(),
+    minfo.teams.map((t) => t.code),
+  );
+}
+
 /** GET /esports/board/{match_id} */
 export async function buildBoard(
   feed: Feed,
@@ -402,14 +436,22 @@ export async function buildBoard(
 
   const MIN_MINUTE = 3;
   if (st.minute === null || st.minute < MIN_MINUTE) {
-    // 局内模型给不了, 赛前那一段一直有效 —— 照给
+    // 局内模型给不了, 赛前和 BP 后这两段一直有效 —— 照给
     let p1: number | null = null;
-    const p2: number | null = null; // BP 后 (Stage 2) 浏览器版不做, 见文件头
+    let p2: number | null = null;
     if (minfo && predictable(minfo)) {
+      const b = minfo.teams[0]!.model_name;
+      const r = minfo.teams[1]!.model_name;
       try {
-        p1 = preContext(s1, teams, minfo.teams[0]!.model_name, minfo.teams[1]!.model_name, minfo.league, today).preP;
+        p1 = preContext(s1, teams, b, r, minfo.league, today).preP;
       } catch {
         /* 队伍不认识就没有赛前概率 */
+      }
+      try {
+        const draft = await boardDraft(feed, st.game_id, minfo);
+        if (draft) p2 = predictCore(models.s2, teams, b, r, minfo.league, draft, today);
+      } catch {
+        /* 和服务器一样: BP 后算不出来就只给赛前 */
       }
     }
     out.prediction = {
@@ -434,7 +476,7 @@ export async function buildBoard(
       } catch (e) {
         warn("头条取阵容失败, 本次预测不含阵容强势期", e);
       }
-      out.prediction = ingameResponse(
+      const pred = ingameResponse(
         ingame,
         s1,
         teams,
@@ -455,7 +497,25 @@ export async function buildBoard(
           redChamps: ln ? ln[1] : null,
         },
         today,
-      );
+      ) as Record<string, unknown>;
+      // BP 后 (第二段) 的参考值, 同 api.py: 凑不齐十个人就不给这条线, 不猜
+      try {
+        const draft = await boardDraft(feed, st.game_id, minfo);
+        if (draft) {
+          pred.postdraft_probability_blue = predictCore(
+            models.s2,
+            teams,
+            minfo.teams[0]!.model_name,
+            minfo.teams[1]!.model_name,
+            minfo.league,
+            draft,
+            today,
+          );
+        }
+      } catch (e) {
+        console.warn(`Stage2 参考线跳过: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      out.prediction = pred;
     } catch (e) {
       out.prediction = { error: e instanceof Error ? e.message : String(e) };
     }

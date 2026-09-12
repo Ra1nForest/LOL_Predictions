@@ -86,7 +86,15 @@ class IngameModel:
 
     # ── 阵容强势期 ──
     def comp_scaling(self, champs: list[str]) -> tuple[float, int]:
-        vals = [self.scaling[c] for c in champs if c in self.scaling]
+        # 按 champion_key 对齐: 看板传来的是 Data Dragon id (LeeSin), 表里是训练用的
+        # OE 显示名 (Lee Sin)。原样查的话名字带空格/撇号的英雄全被漏掉, 阵容强势期
+        # 只按剩下几个算, 不报错。见 feature_store.CHAMP_ID_ALIAS
+        from feature_store import champion_key
+        idx = self.__dict__.get("_scaling_idx")
+        if idx is None:
+            idx = {champion_key(k): v for k, v in self.scaling.items()}
+            self._scaling_idx = idx
+        vals = [idx[k] for k in map(champion_key, champs) if k in idx]
         if len(vals) < 3:
             return float("nan"), len(vals)
         return float(np.mean(vals)), len(vals)

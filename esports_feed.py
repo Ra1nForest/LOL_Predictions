@@ -93,6 +93,22 @@ TEAM_ALIASES = {
 _norm = lambda s: re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
+def oe_player_name(summoner: Optional[str], team_codes) -> str:
+    """lolesports 的 summonerName 带战队简称前缀 (IGTheShy, "TH Hype"), OE 的 playername
+    没有 (TheShy, Hype)。训练里的选手-英雄熟练度按 OE 名字存, 带着前缀去查一个都查不到 ——
+    看板上 BP 后预测的熟练度特征因此恒为 0 (2026-09-12: collected/ 2540 个槽位原样命中 0,
+    去前缀后 2515; 当前赛程 40 支队 1345 个名字全以本队简称开头)。
+
+    只剥**这场比赛两队的简称**, 长的优先 (免得 "T" 抢了 "T1"); 都不是前缀就原样返回 ——
+    查不到历史就是 0 场, 和新人一样, 不做模糊匹配。
+    """
+    s = (summoner or "").strip()
+    for c in sorted((c for c in team_codes if c), key=len, reverse=True):
+        if s.startswith(c) and len(s) > len(c):
+            return s[len(c):].strip()
+    return s
+
+
 def _https(url: Optional[str]) -> Optional[str]:
     """队标 URL 升到 https。
 

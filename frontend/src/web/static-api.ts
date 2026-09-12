@@ -5,8 +5,8 @@
  * 服务器版照旧请求 api.py, 包里也不带它 (client.ts 里是动态 import)。
  * 输出和服务器同形, 组件感知不到差别。
  *
- * 下载量: 列表页只要 15 KB 的队伍表 (队名映射要用); 两个模型 (~1.4 MB, gzip 后约
- * 450 KB) 第一次打开看板或赛前页时才下载, 之后整个会话复用。
+ * 下载量: 列表页只要 15 KB 的队伍表 (队名映射要用); 三个模型 (局内、赛前、BP 后, 后者
+ * 带选手-英雄表) 第一次打开看板或赛前页时才下载, 之后整个会话复用。
  *
  * 数据直连 lolesports: 两个主机都回 Access-Control-Allow-Origin: *, 流量摊在每个访客
  * 自己的 IP 上 —— 不像服务器版那样, 所有人的请求都从一台机器、一把 key 发出去。
@@ -20,6 +20,8 @@ import type { IngameModelFile } from "./ingame.ts";
 import { loadIngame } from "./ingame.ts";
 import type { Stage1File } from "./stage1.ts";
 import { loadStage1, predictResponse } from "./stage1.ts";
+import type { Stage2File } from "./stage2.ts";
+import { loadStage2 } from "./stage2.ts";
 import type { TeamsFile } from "./teams.ts";
 import { localToday } from "./teams.ts";
 
@@ -47,8 +49,9 @@ function models(): Promise<Models> {
     getJSON<IngameModelFile>("ingame_live.json"),
     getJSON<Stage1File>("stage1_pre.json"),
     getJSON<ExplainFile>("explain.json"),
+    getJSON<Stage2File>("stage2_post.json"),
   ])
-    .then(([ig, s1, ex]) => ({ ingame: loadIngame(ig), s1: loadStage1(s1), ex }))
+    .then(([ig, s1, ex, s2]) => ({ ingame: loadIngame(ig), s1: loadStage1(s1), s2: loadStage2(s2), ex }))
     .catch((e) => {
       modelsP = null;
       throw e;

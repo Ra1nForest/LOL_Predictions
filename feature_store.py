@@ -10,6 +10,7 @@ Feature Store — 特征仓库
       本模块是唯一的特征定义处, 训练和推理共用。
 """
 from __future__ import annotations
+import re
 import pandas as pd, numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -39,6 +40,21 @@ DRAFT_PREFIXES = ("champ_wr", "champ_games", "comfort")
 
 def _is_draft_feature(name: str) -> bool:
     return any(k in name for k in DRAFT_PREFIXES)
+
+
+# ── 英雄名 ──────────────────────────────────────────────────
+# lolesports 的帧给的是 Data Dragon 的英雄 id (LeeSin, KSante, MissFortune, MonkeyKing),
+# Oracle's Elixir 用的是显示名 (Lee Sin, K'Sante, Miss Fortune, Wukong)。训练只见过后者,
+# 看板拿前者直接查表, 名字带空格/撇号的英雄全都查不到 —— collected/ 里 2540 个选手槽位
+# 有 337 个 (13%) 这样丢掉 (2026-09-12), BP 后的英雄胜率和局内的阵容强势期都受影响, 不报错。
+# 统一成"小写、只留字母数字"再比; id 和显示名差得更远的三个单独列出。五年 OE 的 168 个
+# 英雄归一化后没有撞名。这不是模糊匹配: 对不上就是对不上, 查表照旧查不到。
+CHAMP_ID_ALIAS = {"monkeyking": "wukong", "renata": "renataglasc", "nunu": "nunuwillump"}
+
+
+def champion_key(name) -> str:
+    k = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    return CHAMP_ID_ALIAS.get(k, k)
 
 
 @dataclass
@@ -156,15 +172,27 @@ class FeatureStore:
         snap["_last_date"] = last["date"]
         return snap
 
+    def oe_champion(self, champion: str) -> str:
+        """任意写法的英雄名 → 本特征库里的 OE 显示名; 认不出来就原样返回 (查表自然查不到)。
+
+        表本身仍按 OE 名字存 —— 训练传进来的就是 OE 名字, 换回来还是它自己, 结果不变;
+        research/ 里也有脚本直接按 OE 名字读这两张表。见 champion_key。
+        """
+        idx = self.__dict__.get("_champ_idx")
+        if idx is None:
+            idx = {champion_key(c): c for c, _lg in self.champ_records}
+            self._champ_idx = idx
+        return idx.get(champion_key(champion), champion)
+
     def champ_winrate(self, champion: str, league: str,
                       before: pd.Timestamp | None = None, min_g: int = 5) -> float:
-        recs = self.champ_records.get((champion, league), [])
+        recs = self.champ_records.get((self.oe_champion(champion), league), [])
         p = [r for d, r in recs if before is None or d < before]
         return float(np.mean(p)) if len(p) >= min_g else np.nan
 
     def player_champ_stats(self, player: str, champion: str,
                            before: pd.Timestamp | None = None) -> tuple[float, int]:
-        recs = self.player_champ.get((player, champion), [])
+        recs = self.player_champ.get((player, self.oe_champion(champion)), [])
         p = [r for d, r in recs if before is None or d < before]
         wr = float(np.mean(p)) if len(p) >= 3 else np.nan
         return wr, len(p)

@@ -11,7 +11,6 @@
  *
  * 不参与比对的字段 (都有理由, 不是为了让测试变绿):
  *   live.stale_seconds                     "此刻减帧时刻", 两边取数的时刻不同
- *   prediction.postdraft_probability_blue  BP 后参考线, 浏览器版有意不做 (见 board.ts)
  *
  *   node scripts/diff-board.mjs                 最近 4 天, 每赛区最多 3 场
  *   node scripts/diff-board.mjs --days 7 --per 4
@@ -25,6 +24,7 @@ import { buildBoard, liveList, upcomingList } from "../src/web/board.ts";
 import { Feed, LEAGUE_IDS } from "../src/web/feed.ts";
 import { loadIngame } from "../src/web/ingame.ts";
 import { loadStage1 } from "../src/web/stage1.ts";
+import { loadStage2 } from "../src/web/stage2.ts";
 import { knownTeams, localToday } from "../src/web/teams.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -41,6 +41,7 @@ const teams = read("../public/web/teams.json");
 const models = {
   ingame: loadIngame(read("../public/web/ingame_live.json")),
   s1: loadStage1(read("../public/web/stage1_pre.json")),
+  s2: loadStage2(read("../public/web/stage2_post.json")),
   ex: read("../public/web/explain.json"),
 };
 const feed = new Feed({ teams });
@@ -78,7 +79,6 @@ function diffs(js, py, path = "$", out = [], limit = 8) {
 function normalize(b) {
   const o = JSON.parse(JSON.stringify(b));
   if (o.live) delete o.live.stale_seconds;
-  if (o.prediction) delete o.prediction.postdraft_probability_blue;
   return o;
 }
 

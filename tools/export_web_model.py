@@ -25,10 +25,12 @@ explain.py 改一句话, 重新导出就跟上了。
 产物:
   frontend/public/web/ingame_live.json     局内模型 (树) + 保序表 + 阵容强势期表
   frontend/public/web/stage1_pre.json      赛前模型 (树) + Platt 系数
+  frontend/public/web/stage2_post.json     BP 后模型 (树) + Platt + 英雄/选手-英雄的胜场场数表
   frontend/public/web/teams.json           每队一行的滚动统计 + 各赛区已知队伍 + 队名别名
   frontend/public/web/explain.json         explain.py 的文案表
   frontend/scripts/golden/ingame_cases.json    黄金用例 (不发布)
   frontend/scripts/golden/stage1_cases.json
+  frontend/scripts/golden/stage2_cases.json
 
     python tools/export_web_model.py
     npm --prefix frontend run test:golden
@@ -118,6 +120,7 @@ def _trees(path: Path, features: list[str]) -> tuple[float, list[dict]]:
 
 
 def export_ingame(ig) -> dict:
+    from feature_store import CHAMP_ID_ALIAS
     from ingame_service import GOLD_TOTAL_MEDIAN
 
     base, trees = _trees(ART / "model_ingame_live.json", ig.features)
@@ -139,6 +142,8 @@ def export_ingame(ig) -> dict:
         "slices": [int(s) for s in ig.slices],
         "gold_total_median": {str(k): int(v) for k, v in GOLD_TOTAL_MEDIAN.items()},
         "scaling_index": {k: float(v) for k, v in ig.scaling.items()},
+        # 看板传来的英雄名是 Data Dragon id, 表里是 OE 显示名 —— 按 champion_key 对齐, 见 names.ts
+        "champion_alias": dict(CHAMP_ID_ALIAS),
         "has_xpdiff": bool(ig.has_xpdiff),
         "metrics": {"accuracy": m.get("accuracy"), "ece": m.get("ece"),
                     "per_T": m.get("per_T")},
@@ -158,6 +163,45 @@ def export_stage1(s1, model_keys) -> dict:
         "calibrator": "platt",
         "platt": {"a": float(s1.a), "b": float(s1.b)},
         "metrics": {k: s1.metrics[k] for k in model_keys if k in s1.metrics},
+        "exported_at": _now(),
+    }
+
+
+def export_stage2(s2, store, model_keys) -> dict:
+    """BP 后 (Stage 2): 树 + Platt, 外加两张查表 —— 每个 (英雄, 赛区) 和每个 (选手, 英雄)
+    的 [胜场, 场数]。
+
+    存整数不存胜率: FeatureStore 里是 np.mean(0/1 列表), 即精确求和再除以 n, JS 做同一次
+    除法就逐位相同。英雄按 champion_key 存 (看板传来的 Data Dragon id 直接能查); 归一化后
+    撞名就拒绝导出 —— 两个英雄共用一行胜率不会报错, 只会给出一个看着合理的错数字。
+    """
+    from feature_store import CHAMP_ID_ALIAS, champion_key
+
+    base, trees = _trees(ART / "model_post_draft.json", s2.features)
+    seen: dict = {}
+    for c, _lg in store.champ_records:
+        if isinstance(c, str) and seen.setdefault(champion_key(c), c) != c:
+            raise SystemExit(f"英雄名归一化后撞名: {seen[champion_key(c)]} / {c} —— champion_key 要加区分")
+    champ: dict = {}
+    for (c, lg), recs in store.champ_records.items():
+        if isinstance(c, str):
+            champ.setdefault(lg, {})[champion_key(c)] = [int(sum(r for _d, r in recs)), len(recs)]
+    player: dict = {}
+    for (p, c), recs in store.player_champ.items():
+        if isinstance(p, str) and isinstance(c, str):
+            player.setdefault(p, {})[champion_key(c)] = [int(sum(r for _d, r in recs)), len(recs)]
+    return {
+        "format": FORMAT,
+        "features": list(s2.features),
+        "base_score": base,
+        "trees": trees,
+        "importance": {k: float(v) for k, v in s2.importance.items()},
+        "calibrator": "platt",
+        "platt": {"a": float(s2.a), "b": float(s2.b)},
+        "metrics": {k: s2.metrics[k] for k in model_keys if k in s2.metrics},
+        "champion_alias": dict(CHAMP_ID_ALIAS),
+        "champ_league": champ,
+        "player_champ": player,
         "exported_at": _now(),
     }
 
@@ -387,6 +431,111 @@ def stage1_cases(api, store) -> list[dict]:
     return out
 
 
+def stage2_cases(api, store) -> dict:
+    """看板那条"BP 后"参考线: 元数据里的十个人 → api._board_draft 组 BP → api._predict_core。
+
+    两步都核对: 名字对齐 (去战队前缀、英雄 id 归一化) 发生在第一步, 概率在第二步; 另存一份
+    特征向量 —— 名字对不齐时概率可能只差一点点, 向量能直接指出是哪一列。
+    输入取 collected/ 的真实元数据; 战队简称用同一方五个名字的公共前缀代替 (元数据里没存
+    简称, 而这里只要两边拿到同样的输入)。另有一组合成用例专打别名英雄和认不出来的名字。
+    """
+    import os
+    from esports_feed import map_team, oe_player_name
+
+    s2 = api.STATE["stages"]["post_draft"]
+
+    class _Feed:
+        def __init__(self, md):
+            self.md = md
+
+        def game_metadata(self, _gid):
+            return self.md
+
+    class _Team:
+        def __init__(self, code):
+            self.code = code
+
+    class _Minfo:
+        def __init__(self, codes):
+            self.teams = [_Team(c) for c in codes]
+
+    def run(src, players, codes, blue, red, league):
+        c = {"src": src, "in": {"players": players, "codes": codes, "blue": blue, "red": red,
+                                "league": league}}
+        draft = api._board_draft(_Feed({i + 1: p for i, p in enumerate(players)}), "g", _Minfo(codes))
+        c["draft"] = draft
+        if draft:
+            try:
+                c["p2"] = api._predict_core(blue, red, league, False, draft)
+                dd = {s: {r: (v["player"], v["champion"]) for r, v in draft[s].items()}
+                      for s in ("blue", "red")}
+                row, _w = store.make_row(blue, red, league, draft=dd, playoffs=0)
+                # 和 Stage.predict 里组向量的两行一字不差
+                x = np.nan_to_num(np.array([[float(row.get(f, np.nan)) for f in s2.features]]),
+                                  nan=-999.0)
+                c["x"] = [float(v) for v in x[0]]
+            except Exception as e:
+                c["error"] = str(e)
+        return c
+
+    cases = []
+    for mp in sorted(COLLECTED.glob("*.meta.json")):
+        meta = json.loads(mp.read_text(encoding="utf-8"))
+        lg = meta.get("league")
+        if lg not in MAJORS:
+            continue
+        players = [{k: p.get(k) for k in ("summoner_name", "champion", "role", "side")}
+                   for p in (meta.get("players") or {}).values()]
+        codes = []
+        for side in ("blue", "red"):
+            names = [p["summoner_name"] or "" for p in players if p["side"] == side]
+            codes.append(os.path.commonprefix(names).strip() if len(names) == 5 else "")
+        known = store.known_teams(lg)
+        cases.append(run(mp.name[: -len(".meta.json")], players, codes,
+                         map_team(meta.get("blue") or "", known),
+                         map_team(meta.get("red") or "", known), lg))
+
+    base = next((c for c in cases if "p2" in c), None)
+    if base is None:
+        raise SystemExit("collected/ 里找不到一场能算出 BP 后概率的比赛当合成用例的底子")
+    bi = base["in"]
+
+    def syn(label, **kw):
+        d = {"players": [dict(p) for p in bi["players"]], "codes": list(bi["codes"]),
+             "blue": bi["blue"], "red": bi["red"], "league": bi["league"]}
+        edit = kw.pop("edit", None)
+        d.update(kw)
+        if edit:
+            edit(d["players"])
+        return run(f"syn:{label}", d["players"], d["codes"], d["blue"], d["red"], d["league"])
+
+    def champs(names):
+        def f(ps):
+            for p, n in zip([p for p in ps if p["side"] == "blue"], names):
+                p["champion"] = n
+        return f
+
+    cases += [
+        syn("别名英雄", edit=champs(["MonkeyKing", "LeeSin", "Renata", "Nunu", "KSante"])),
+        syn("认不出的英雄", edit=champs(["NotAChampion"] * 5)),
+        syn("同一英雄五个", edit=champs(["Azir"] * 5)),
+        syn("简称对不上", codes=["ZZ", "YY"]),
+        syn("缺一个人", edit=lambda ps: ps.pop()),
+        syn("位置缺失", edit=lambda ps: ps[0].update(role=None)),
+        syn("选手名为空", edit=lambda ps: ps[1].update(summoner_name="")),
+        syn("队伍不认识", blue="Definitely Not A Team"),
+        syn("换边", blue=bi["red"], red=bi["blue"]),
+    ]
+    for lg in MAJORS:
+        cases.append(syn(f"赛区={lg}", league=lg))
+
+    names = [["IGTheShy", ["IG", "AL"]], ["TH Hype", ["TH", "G2"]], ["T1Faker", ["T", "T1"]],
+             ["Faker", ["IG", "AL"]], ["IG", ["IG"]], [None, ["IG"]], ["  IGRookie ", ["IG", None]],
+             ["", ["IG"]], ["iGRookie", ["IG"]]]
+    return {"cases": cases,
+            "names": [{"in": [s, c], "out": oe_player_name(s, c)} for s, c in names]}
+
+
 # ══════════════════════════════════════════════════════════
 
 def _write(path: Path, obj) -> int:
@@ -406,17 +555,19 @@ def main():
     api = _import_api()
     ig = IngameModel("_live")
     s1 = api.Stage("pre_draft")
+    s2 = api.Stage("post_draft")
 
     print("加载特征库 (五年 CSV, 和服务同一份 api.DATA) …")
     store = FeatureStore.from_csv(api.DATA)
     # 线上函数要的全局状态 —— 和 lifespan 里装的是同一批东西
     api.STATE["store"] = store
-    api.STATE["stages"] = {"pre_draft": s1}
+    api.STATE["stages"] = {"pre_draft": s1, "post_draft": s2}
     api.STATE["ingame_live"] = ig
     today = str(pd.Timestamp.now().normalize().date())
 
     for name, obj in (("ingame_live.json", export_ingame(ig)),
                       ("stage1_pre.json", export_stage1(s1, api.MODEL_KEYS)),
+                      ("stage2_post.json", export_stage2(s2, store, api.MODEL_KEYS)),
                       ("teams.json", export_teams(store)),
                       ("explain.json", export_explain())):
         n = _write(OUT_WEB / name, obj)
@@ -455,6 +606,14 @@ def main():
     n = _write(OUT_GOLD / "stage1_cases.json", {"generated_at": _now(), "today": today, "cases": s1c})
     print(f"  stage1_cases.json  {n / 1024:>6,.0f} KB   {len(s1c)} 组对阵 "
           f"(其中 {sum('error' in c for c in s1c)} 组预期报错)")
+
+    g2 = stage2_cases(api, store)
+    n = _write(OUT_GOLD / "stage2_cases.json", {"generated_at": _now(), "today": today,
+                                                "features": list(s2.features), **g2})
+    c2 = g2["cases"]
+    print(f"  stage2_cases.json  {n / 1024:>6,.0f} KB   {len(c2)} 局阵容, 其中 "
+          f"{sum('p2' in c for c in c2)} 局算出 BP 后概率、{sum(not c['draft'] for c in c2)} 局凑不齐十人、"
+          f"{sum('error' in c for c in c2)} 局预期报错")
     print(f"完成, {time.time() - t0:.0f} 秒。下一步: npm --prefix frontend run test:golden")
 
 

@@ -243,6 +243,29 @@ def _predict_core(blue, red, league, playoffs, draft):
     return float(cal)
 
 
+_ROLE_OE = {"jungle": "jng", "bottom": "bot", "support": "sup"}
+
+
+def _board_draft(feed, game_id, minfo):
+    """看板上本局的 BP, 给 Stage 2 用: {side: {role: {player, champion}}}; 凑不齐十个人返回 None。
+
+    选手名剥掉战队简称前缀 (esports_feed.oe_player_name) —— 早先原样传 "IGTheShy", 训练里
+    按 OE 名字 "TheShy" 存的熟练度一个都查不到, BP 后预测的熟练度特征恒为 0, 不报错。
+    英雄名不在这里转: FeatureStore 查表时自己按 champion_key 对齐。
+    浏览器版 frontend/src/web/board.ts 的 boardDraft 是同一套逻辑。
+    """
+    from esports_feed import oe_player_name
+    codes = [t.code for t in minfo.teams]
+    draft = {"blue": {}, "red": {}}
+    for mm2 in feed.game_metadata(game_id).values():
+        role = _ROLE_OE.get(mm2.get("role"), mm2.get("role"))
+        nm = oe_player_name(mm2.get("summoner_name"), codes)
+        ch = mm2.get("champion")
+        if role and ch and nm and mm2.get("side") in draft:
+            draft[mm2["side"]][role] = {"player": nm, "champion": ch}
+    return draft if sum(len(v) for v in draft.values()) == 10 else None
+
+
 def _clinched(m) -> bool:
     """这场 BO 是否已经分出胜负。
 
@@ -783,15 +806,8 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
             except Exception:
                 pass
             try:
-                meta = feed.game_metadata(st.game_id)
-                draft = {"blue": {}, "red": {}}
-                for pid, mm2 in meta.items():
-                    role = {"jungle": "jng", "bottom": "bot",
-                            "support": "sup"}.get(mm2.get("role"), mm2.get("role"))
-                    if role and mm2.get("champion") and mm2.get("summoner_name"):
-                        draft[mm2["side"]][role] = {
-                            "player": mm2["summoner_name"], "champion": mm2["champion"]}
-                if sum(len(v) for v in draft.values()) == 10:
+                draft = _board_draft(feed, st.game_id, minfo)
+                if draft:
                     p2 = _predict_core(b, r, minfo.league, False, draft)
             except Exception:
                 pass
@@ -846,22 +862,10 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                            blue_kills=st.blue_kills, red_kills=st.red_kills)
 
             # BP 后 (第二段) 的参考值。帧的 gameMetadata 里有本局英雄和选手,
-            # 选手名带队伍前缀 (IGTheShy -> TheShy), 剥掉再交给 Stage 2。
-            # 对不上就不给这条线, 不猜。
+            # 名字怎么对齐见 _board_draft。凑不齐十个人就不给这条线, 不猜。
             try:
-                meta = feed.game_metadata(st.game_id)
-                draft, sides = {"blue": {}, "red": {}}, 0
-                known_p = store.known_players() if hasattr(store, "known_players") else None
-                for pid, mm2 in meta.items():
-                    role = {"jungle": "jng", "bottom": "bot",
-                            "support": "sup"}.get(mm2.get("role"), mm2.get("role"))
-                    nm = (mm2.get("summoner_name") or "").strip()
-                    ch = mm2.get("champion")
-                    if not role or not ch or not nm:
-                        continue
-                    draft[mm2["side"]][role] = {"player": nm, "champion": ch}
-                    sides += 1
-                if sides == 10:
+                draft = _board_draft(feed, st.game_id, minfo)
+                if draft:
                     p2 = _predict_core(minfo.teams[0].model_name,
                                        minfo.teams[1].model_name,
                                        minfo.league, False, draft)

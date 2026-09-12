@@ -25,6 +25,7 @@
  */
 import type { ExplainFile, EvidenceItem } from "./explain.ts";
 import { confidenceNote, explainEvidence, rangeNote, summarize } from "./explain.ts";
+import { championKey } from "./names.ts";
 import { pyFixed, pyPct, pyRound } from "./pyfmt.ts";
 import type { PreCtx, Stage1 } from "./stage1.ts";
 import { preContext } from "./stage1.ts";
@@ -48,6 +49,7 @@ export interface IngameModelFile extends TreeModelFile {
   slices: number[];
   gold_total_median: Record<string, number>;
   scaling_index: Record<string, number>;
+  champion_alias: Record<string, string>;
   has_xpdiff: boolean;
   metrics: {
     accuracy?: number | null;
@@ -69,14 +71,19 @@ export interface IngameModel {
   pMax: number | null;
   slices: number[];
   goldTotalMedian: Map<string, number>;
-  /** 用 Map 而不是普通对象: 普通对象上 "constructor" 这种键会查到原型链上 */
+  /**
+   * 按 championKey 存: 看板传来的是 Data Dragon id (LeeSin), 表里是 OE 显示名 (Lee Sin)。
+   * 用 Map 而不是普通对象: 普通对象上 "constructor" 这种键会查到原型链上
+   */
   scaling: Map<string, number>;
+  alias: Map<string, string>;
   hasXpdiff: boolean;
   metrics: IngameModelFile["metrics"];
   trainedThrough: string;
 }
 
 export function loadIngame(file: IngameModelFile): IngameModel {
+  const alias = new Map(Object.entries(file.champion_alias));
   return {
     forest: loadForest(file),
     calibrator: file.calibrator,
@@ -89,7 +96,8 @@ export function loadIngame(file: IngameModelFile): IngameModel {
     pMax: file.p_max,
     slices: file.slices,
     goldTotalMedian: new Map(Object.entries(file.gold_total_median)),
-    scaling: new Map(Object.entries(file.scaling_index)),
+    scaling: new Map(Object.entries(file.scaling_index).map(([k, v]) => [championKey(k, alias), v])),
+    alias,
     hasXpdiff: file.has_xpdiff,
     metrics: file.metrics,
     trainedThrough: file.trained_through,
@@ -133,17 +141,17 @@ export function nearestSlice(slices: number[], minute: number): number {
  * np.mean(vals), vals 最多 5 个 (一方的阵容)。依次相加再除以 n —— 见头注释第 3 条,
  * 这是用 494 组真实阵容对出来的。numpy 在 n >= 8 时换成分块累加, 这里用不到。
  */
-function npMean(vals: number[]): number {
+export function npMean(vals: number[]): number {
   let s = 0;
   for (const v of vals) s += v;
   return s / vals.length;
 }
 
-/** IngameModel.comp_scaling: 认得的英雄不到 3 个就算不出来 */
-function compScaling(scaling: Map<string, number>, champs: string[]): number {
+/** IngameModel.comp_scaling: 按 championKey 查, 认得的英雄不到 3 个就算不出来 */
+function compScaling(model: IngameModel, champs: string[]): number {
   const vals: number[] = [];
   for (const c of champs) {
-    const v = scaling.get(c);
+    const v = model.scaling.get(championKey(c, model.alias));
     if (v !== undefined) vals.push(v);
   }
   return vals.length < 3 ? NaN : npMean(vals);
@@ -179,8 +187,8 @@ export function buildRow(model: IngameModel, preRow: Record<string, number> | nu
   let rSc = NaN;
   // Python 的 `if blue_champs and red_champs:` —— None 和空列表都算没有
   if (inp.blueChamps && inp.blueChamps.length > 0 && inp.redChamps && inp.redChamps.length > 0) {
-    bSc = compScaling(model.scaling, inp.blueChamps);
-    rSc = compScaling(model.scaling, inp.redChamps);
+    bSc = compScaling(model, inp.blueChamps);
+    rSc = compScaling(model, inp.redChamps);
     if (Number.isNaN(bSc) || Number.isNaN(rSc)) {
       warn.push("这几个英雄的历史样本不足, 算不出阵容强势期 —— " + "「领先但阵容吃亏」这类隐患本次无法识别。");
     }

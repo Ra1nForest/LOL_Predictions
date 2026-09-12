@@ -136,8 +136,9 @@ also what gets deployed — `research/`, `tools/`, `attic/` are not needed at ru
   `esports_feed.py`, `board.ts` ports the `/esports/*` routes, `stage1.ts` / `ingame.ts` / `xgb.ts`
   run the Stage 1 and Stage 4 models in the browser, `explain.ts` ports `explain.py` (its text
   tables are *exported*, not copied). The browser calls lolesports directly — both hosts send
-  `Access-Control-Allow-Origin: *` — so traffic is spread over visitors' own IPs. Stage 2's
-  post-draft line and Stage 3 are not in the static build.
+  `Access-Control-Allow-Origin: *` — so traffic is spread over visitors' own IPs. `stage2.ts`
+  computes the board's post-draft line from two exported win/game tallies (champion×league,
+  player×champion); Stage 3 is not in the static build.
   Being a second implementation, **it is only trustworthy while two checks pass**: `test:golden`
   (features, probabilities, whole `api._ingame_core` and `/predict` responses, bit-for-bit) and
   `test:diff` (the whole board, against `tools/board_oracle.py`). The oracle is a **fresh**
@@ -203,6 +204,14 @@ guards. If one goes red, work out whether that trap is back before changing the 
   local run from 2026-09-04 reported "数据没有变化" and never retrained — and every run logged
   success. The same garbling makes the `games` / `个快照` parse fail, which silently skips the
   gate's minimum-count checks.
+- **Live names must be mapped to OE names before any lookup.** lolesports sends
+  `summonerName` with the team code glued on (`IGTheShy`; OE has `TheShy`) and champions as Data
+  Dragon ids (`LeeSin`, `MonkeyKing`; OE has `Lee Sin`, `Wukong`). Looked up raw, every
+  player-champion familiarity on the board was 0 and 13% of champions vanished from both the
+  Stage 2 champion win rates and Stage 4's composition scaling index — no error, just a plausible
+  number. `feature_store.champion_key` (+ `CHAMP_ID_ALIAS`) is applied inside the lookups, so
+  training, which passes OE names, is unchanged; `esports_feed.oe_player_name` strips only the two
+  match team codes. `web/names.ts` mirrors both.
 - **A failed start calibration is not a result.** `_game_start` (and `gameStart` in
   `frontend/src/web/feed.ts`) retries every `START_RETRY_SEC` until the calibration windows have
   settled; only then does it accept `frames[0]`. Caching the first-sight failure put every live

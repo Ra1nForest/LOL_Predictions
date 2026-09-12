@@ -547,6 +547,72 @@ class TestWebPublishStatus(unittest.TestCase):
                 update_status.STATUS_FILE = old
 
 
+class TestLiveNamesMatchTraining(unittest.TestCase):
+    """坑: 看板把 lolesports 的名字原样交给 Stage 2 / Stage 4 查表, 而训练只见过 OE 的写法 ——
+    选手带战队前缀 (IGTheShy vs TheShy) 一个都查不到, 英雄用 Data Dragon id (LeeSin vs
+    Lee Sin) 查不到 13%。不报错, 只是熟练度恒为 0、阵容强势期少算几个英雄。
+    浏览器版 frontend/src/web/names.ts 是同一套规则, 由 test:golden 对账。
+    """
+
+    def test_champion_key_matches_ddragon_ids_to_oe_names(self):
+        from feature_store import champion_key as k
+        for ddid, oe in (("LeeSin", "Lee Sin"), ("KSante", "K'Sante"), ("MissFortune", "Miss Fortune"),
+                         ("MonkeyKing", "Wukong"), ("Renata", "Renata Glasc"),
+                         ("Nunu", "Nunu & Willump"), ("DrMundo", "Dr. Mundo"), ("Kaisa", "Kai'Sa"),
+                         ("Leblanc", "LeBlanc"), ("JarvanIV", "Jarvan IV")):
+            self.assertEqual(k(ddid), k(oe), ddid)
+        self.assertNotEqual(k("Nunu"), k("Nami"))
+
+    def test_store_lookup_accepts_both_spellings(self):
+        import pandas as pd
+        from feature_store import FeatureStore
+        d = pd.Timestamp("2026-01-01")
+        s = FeatureStore(champ_records={("Lee Sin", "LPL"): [(d, 1)] * 4 + [(d, 0)]},
+                         player_champ={("Wei", "Lee Sin"): [(d, 1)] * 3})
+        self.assertEqual(s.champ_winrate("LeeSin", "LPL"), 0.8, "看板传的是 Data Dragon id")
+        self.assertEqual(s.player_champ_stats("Wei", "LeeSin"), (1.0, 3))
+        self.assertEqual(s.champ_winrate("Lee Sin", "LPL"), 0.8, "训练传的 OE 名字必须照旧")
+        import math
+        self.assertTrue(math.isnan(s.champ_winrate("Azir", "LPL")), "认不出来的照旧查不到")
+
+    def test_comp_scaling_accepts_ddragon_ids(self):
+        from ingame_service import IngameModel
+        m = IngameModel.__new__(IngameModel)
+        m.scaling = {"Lee Sin": 1.0, "Wukong": 2.0, "K'Sante": 3.0, "Azir": 4.0}
+        self.assertEqual(m.comp_scaling(["LeeSin", "MonkeyKing", "KSante", "Azir", "Unknown"]), (2.5, 4))
+
+    def test_player_name_strips_only_the_match_team_codes(self):
+        from esports_feed import oe_player_name as f
+        self.assertEqual(f("IGTheShy", ["IG", "AL"]), "TheShy")
+        self.assertEqual(f("TH Hype", ["TH", "G2"]), "Hype")
+        self.assertEqual(f("T1Faker", ["T", "T1"]), "Faker", "长的简称优先")
+        self.assertEqual(f("Faker", ["IG", "AL"]), "Faker", "不是前缀就原样返回")
+        self.assertEqual(f("IG", ["IG"]), "IG", "名字整个就是简称时不剥成空串")
+        self.assertEqual(f(None, ["IG"]), "")
+
+    def test_board_draft_hands_oe_player_names_to_stage2(self):
+        import api
+
+        class Feed:
+            def game_metadata(self, gid):
+                out = {}
+                for i, r in enumerate(["top", "jungle", "mid", "bottom", "support"]):
+                    out[i + 1] = {"summoner_name": f"IGP{i}", "champion": "LeeSin", "role": r, "side": "blue"}
+                    out[i + 6] = {"summoner_name": f"ALQ{i}", "champion": "Azir", "role": r, "side": "red"}
+                return out
+
+        class Team:
+            def __init__(self, code):
+                self.code = code
+
+        class Minfo:
+            teams = [Team("IG"), Team("AL")]
+
+        d = api._board_draft(Feed(), "g", Minfo())
+        self.assertEqual(d["blue"]["jng"], {"player": "P1", "champion": "LeeSin"})
+        self.assertEqual(d["red"]["sup"]["player"], "Q4")
+
+
 class TestBackfillJoin(unittest.TestCase):
     """坑: 只按蓝方队名 + 局号 + 最近日期配对, 同一天两场比赛会配错,
     标签张冠李戴且完全不报错。必须两队都对上。
