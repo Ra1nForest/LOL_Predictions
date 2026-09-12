@@ -220,10 +220,10 @@ function PlayerCell({
         ) : (
           <div className="champ-icon" />
         )}
-        {/* 阵亡: 头像压一层黑白遮罩 + "死亡" 两个字, 一直到复活。
+        {/* 阵亡: 头像压一层黑白遮罩 + "阵亡" 两个字, 一直到复活。
             比在血条上写字醒目得多 —— 头像是这一行视觉上最重的元素,
             它一灰整行就"暗"下去了。 */}
-        {dead && <span className="champ-dead">死亡</span>}
+        {dead && <span className="champ-dead">阵亡</span>}
         <span className="champ-lv">{p.level}</span>
       </button>
 

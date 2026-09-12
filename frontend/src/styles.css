@@ -1608,9 +1608,11 @@ svg.sb-ico {
   left: -4px;
 }
 
-/* 阵亡遮罩。头像是这一行视觉上最重的元素, 它一灰整行就"暗"下去了。 */
+/* 阵亡遮罩。头像是这一行视觉上最重的元素, 它一灰整行就"暗"下去了。
+   亮度 0.75 而不是原来的 0.45: 那样几乎全黑, 连是哪个英雄都认不出来。
+   去色已经足够表达"阵亡", 不需要再压暗; "阵亡"两个字靠阴影在浅底上也看得清。 */
 .champ-btn.dead .champ-icon {
-  filter: grayscale(1) brightness(0.45);
+  filter: grayscale(1) brightness(0.75);
 }
 .champ-dead {
   position: absolute;
