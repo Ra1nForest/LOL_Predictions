@@ -25,6 +25,8 @@ import { loadStage2 } from "./stage2.ts";
 import type { TeamsFile } from "./teams.ts";
 import { localToday } from "./teams.ts";
 import { EN } from "../i18n.ts";
+import type { ViewCtx } from "./player.ts";
+import { LivePlayer, liveView } from "./player.ts";
 
 async function getJSON<T>(name: string): Promise<T> {
   const r = await fetch(`${import.meta.env.BASE_URL}web/${name}`);
@@ -83,6 +85,32 @@ export const staticApi = {
   async board(matchId: string, gameId: string | null, points: number, curves: boolean): Promise<BoardResponse> {
     const [f, t, m] = await Promise.all([feed(), teams(), models()]);
     return (await buildBoard(f, t, m, localToday(), matchId, gameId, curves, points)) as unknown as BoardResponse;
+  },
+
+  /**
+   * 直播回放 (见 player.ts): 每回放到一帧, 用它改写最新的看板再交给界面。
+   * getBoard 取的是界面手里最新的一份看板 —— 轮询还在照常刷新它 (暂停、完整曲线靠它)。
+   * 返回停止函数。
+   */
+  async play(
+    gameId: string,
+    getBoard: () => BoardResponse | null,
+    onView: (v: BoardResponse) => void,
+  ): Promise<() => void> {
+    const [f, t, m] = await Promise.all([feed(), teams(), models()]);
+    const [start, trinkets] = await Promise.all([f.gameStart(gameId), f.trinketIds()]);
+    const ctx: ViewCtx = { models: m, teams: t, today: localToday(), start, trinkets };
+    const player = new LivePlayer(f, gameId, (pf) => {
+      const b = getBoard();
+      if (!b?.live || b.live.game_id !== gameId || b.prediction?.probability_blue == null) return;
+      try {
+        onView(liveView(b, pf, ctx));
+      } catch (e) {
+        console.warn(`回放帧失败: ${e}`);
+      }
+    });
+    void player.start();
+    return () => player.stop();
   },
 
   async predict(body: PredictRequestBody): Promise<PredictResponse> {

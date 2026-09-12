@@ -1370,9 +1370,15 @@ class EsportsFeed:
         # 卡住的帧仍然是我们**唯一**的战况来源, 交出去、由上层标明它有多旧,
         # 远好过什么都不给。只回退到 in_game 的那一局: 已经 finished 的局
         # 不是"当前局", 那种情形走 esports_board 原有的 playable 回退。
+        #
+        # 而且**只看有帧的最后一局**。实测 2026-09-12 LEC VIT vs MKOI: 第 1 局的
+        # 帧流断在第 1 分钟, 最后一帧永远写着 in_game; 第 2 局正常打完。第 3 局
+        # BP 时还没有帧, 这里往前一路找, 越过已经 finished 的第 2 局, 把第 1 局
+        # 交了出去 —— 页面跳回第 1 局, 点第 3 局的标签也被拽回来。一局后面已经
+        # 有打完的局, 它自己就不可能还在打。
         for g, st in zip(reversed(gs), reversed(states)):
-            if st and st.game_state == "in_game":
-                return g, st
+            if st:
+                return (g, st) if st.game_state == "in_game" else None
         return None
 
     def live_by_frames(self, matches: list[Match],

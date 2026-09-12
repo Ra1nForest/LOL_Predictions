@@ -15,7 +15,9 @@ const R = 16;
 const T = 12;
 const B = 24;
 
-const kfmt = (g: number) => `${g > 0 ? "+" : g < 0 ? "−" : ""}${(Math.abs(g) / 1000).toFixed(1)}k`;
+/** 经济一律写正数, 哪边领先靠颜色 (蓝/红) 分 —— 正负号要读者先记住"正 = 蓝方" */
+const kfmt = (g: number) => `${(Math.abs(g) / 1000).toFixed(1)}k`;
+const sideOf = (g: number) => (g > 0 ? "blue" : g < 0 ? "red" : "");
 
 /**
  * 经济差走势。零线两侧分别染色, 谁在上面谁领先。
@@ -97,9 +99,8 @@ export function GoldChart({ series, blueName, redName }: Props) {
         {gridVals.map((g) => (
           <g key={g}>
             <line x1={L} x2={W - R} y1={y(g)} y2={y(g)} stroke="var(--hair-2)" />
-            <text x={L - 8} y={y(g) + 3.5} textAnchor="end" fontSize="10.5" fill="var(--ink-3)">
-              {g > 0 ? "+" : ""}
-              {Math.round(g / 1000)}k
+            <text x={L - 8} y={y(g) + 3.5} textAnchor="end" fontSize="10.5" fill={`var(--${sideOf(g)})`} opacity="0.75">
+              {Math.round(Math.abs(g) / 1000)}k
             </text>
           </g>
         ))}
@@ -175,12 +176,12 @@ export function GoldChart({ series, blueName, redName }: Props) {
       {hp && (
         <ChartTip x={x(hp.minute)} y={y(hp.golddiff)} W={W} H={H}>
           <div className="tip-time">{clock(hp.minute)}</div>
-          <div className={hp.golddiff > 0 ? "blue" : hp.golddiff < 0 ? "red" : ""}>
+          <div className={sideOf(hp.golddiff)}>
             {hp.golddiff === 0 ? (
               tr("经济持平")
             ) : (
               <>
-                <b>{hp.golddiff > 0 ? blueName : redName}</b> +{Math.round(Math.abs(hp.golddiff)).toLocaleString()}
+                <b>{hp.golddiff > 0 ? blueName : redName}</b> {Math.round(Math.abs(hp.golddiff)).toLocaleString()}
               </>
             )}
           </div>

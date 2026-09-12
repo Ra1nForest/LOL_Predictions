@@ -228,6 +228,19 @@ async function playersJson(feed: Feed, gameId: string, ver: string): Promise<Jso
   }));
 }
 
+/** 五路对位的经济差 —— 看板和回放器 (player.ts) 共用 */
+export function lanesOf(ps: Json[]): Json[] {
+  const alias: Record<string, string> = { jng: "jungle", bot: "bottom", sup: "support" };
+  const lanes: Json[] = [];
+  for (const lane of ["top", "jungle", "mid", "bottom", "support"]) {
+    const pick = (side: string) => ps.find((p) => p.side === side && (alias[p.role] ?? p.role) === lane);
+    const b = pick("blue");
+    const r = pick("red");
+    if (b && r) lanes.push({ lane, gold_diff: b.gold - r.gold, blue_gold: b.gold, red_gold: r.gold });
+  }
+  return lanes;
+}
+
 async function lineups(feed: Feed, gameId: string): Promise<[string[], string[]] | null> {
   const meta = await feed.gameMetadata(gameId);
   const bl: string[] = [];
@@ -419,15 +432,7 @@ export async function buildBoard(
   try {
     const ps = await playersJson(feed, st.game_id, ver);
     live.players = ps;
-    const alias: Record<string, string> = { jng: "jungle", bot: "bottom", sup: "support" };
-    const lanes: Json[] = [];
-    for (const lane of ["top", "jungle", "mid", "bottom", "support"]) {
-      const pick = (side: string) => ps.find((p) => p.side === side && (alias[p.role] ?? p.role) === lane);
-      const b = pick("blue");
-      const r = pick("red");
-      if (b && r) lanes.push({ lane, gold_diff: b.gold - r.gold, blue_gold: b.gold, red_gold: r.gold });
-    }
-    live.lanes = lanes;
+    live.lanes = lanesOf(ps);
   } catch (e) {
     live.players = [];
     live.lanes = [];

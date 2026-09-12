@@ -212,6 +212,21 @@ async function pool<T, R>(items: T[], n: number, fn: (t: T) => Promise<R>): Prom
   return out;
 }
 
+/** window 帧里一方 (blueTeam / redTeam) 的队伍总计 —— 看板 (window()) 和回放器共用 */
+export function teamObjectives(t: Json): TeamObjectives {
+  const d = pget(t, "dragons", undefined);
+  return {
+    gold: pget(t, "totalGold", 0),
+    kills: pget(t, "totalKills", 0),
+    towers: pget(t, "towers", 0),
+    inhibitors: pget(t, "inhibitors", 0),
+    barons: pget(t, "barons", 0),
+    dragons: Array.isArray(d) ? (d.length ? d.length : 0) : d || 0,
+    dragon_types: Array.isArray(d) && d.length ? d : [],
+    cs: pget(t, "participants", []).reduce((s: number, x: Json) => s + pget(x, "creepScore", 0), 0),
+  };
+}
+
 // ── 客户端 ──────────────────────────────────────────────────
 
 export interface FeedOptions {
@@ -390,6 +405,16 @@ export class Feed {
     let url = `${FEED}/window/${gameId}`;
     if (starting) url += `?startingTime=${starting}`;
     return this.get(url, ttl, false, emptyTtl);
+  }
+
+  /** details 端点的原始响应, 缓存规则和 rawWindow 一样 (回放器 player.ts 用) */
+  async rawDetails(gameId: string, starting: string, ttl: number, emptyTtl?: number): Promise<Json> {
+    return this.get(`${FEED}/details/${gameId}?startingTime=${starting}`, ttl, false, emptyTtl);
+  }
+
+  /** window() 此刻采用的自适应 lag (秒); 还没取过是 null —— 回放器从这里起步 */
+  currentLag(gameId: string): number | null {
+    return this.lag.get(gameId) ?? null;
   }
 
   private static objectives(t: Json) {
@@ -624,19 +649,7 @@ export class Feed {
     const stale = Math.max(0, Math.trunc((Date.now() - frameTs(f)) / 1000));
     const gs = pget(f, "gameState", "");
     const stalled = gs === "in_game" && stale > LIVE_STALE_SEC;
-    const side = (t: Json): TeamObjectives => {
-      const d = pget(t, "dragons", undefined);
-      return {
-        gold: pget(t, "totalGold", 0),
-        kills: pget(t, "totalKills", 0),
-        towers: pget(t, "towers", 0),
-        inhibitors: pget(t, "inhibitors", 0),
-        barons: pget(t, "barons", 0),
-        dragons: Array.isArray(d) ? (d.length ? d.length : 0) : d || 0,
-        dragon_types: Array.isArray(d) && d.length ? d : [],
-        cs: csOf(t),
-      };
-    };
+    const side = teamObjectives;
     return {
       game_id: gameId,
       game_state: gs,
@@ -956,9 +969,11 @@ export class Feed {
       const [g, st] = pairs[i]!;
       if (st && st.live) return [g, st];
     }
+    // 卡住的回退只看有帧的最后一局: 它后面已经有打完的局, 它就不可能还在打
+    // (2026-09-12 LEC VIT vs MKOI, 第 1 局帧断在第 1 分钟, 第 3 局 BP 时页面被拽回第 1 局)
     for (let i = pairs.length - 1; i >= 0; i--) {
       const [g, st] = pairs[i]!;
-      if (st && st.game_state === "in_game") return [g, st];
+      if (st) return st.game_state === "in_game" ? [g, st] : null;
     }
     return null;
   }

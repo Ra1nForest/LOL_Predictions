@@ -9,6 +9,7 @@ import { ThemeToggle } from "./ThemeToggle";
 import { DebatePanel } from "./DebatePanel";
 import { PreMatch } from "./PreMatch";
 import { T } from "../i18n";
+import { useLivePlayback } from "./useLivePlayback";
 
 const STATE_CN: Record<string, string> = {
   in_game: "进行中",
@@ -143,12 +144,16 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
     };
   }, []);
 
+  // 比赛进行中 (静态版): 记分板、胜率、走势图末端改用逐帧回放, 见 web/player.ts。
+  // 其余情况 shown 就是轮询拿到的那份
+  const shown = useLivePlayback(data) ?? data;
+
   const teams = data?.match?.teams ?? initial?.teams ?? [];
   const blueName = teams[0]?.model_name ?? teams[0]?.name ?? T("蓝方");
   const redName = teams[1]?.model_name ?? teams[1]?.name ?? T("红方");
 
-  const lv = data?.live ?? null;
-  const pr = data?.prediction ?? null;
+  const lv = shown?.live ?? null;
+  const pr = shown?.prediction ?? null;
   // **model 缺席时不能走局内视图。** 后端在开局不足 10 分钟时返回 too_early:
   // 它带着 probability_blue (赛前/BP 后的概率), 却**没有 model** —— 于是
   // 老的 hasLive 判定为真, 渲染时读 pr.model.p_min 抛 TypeError,
@@ -484,12 +489,12 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
           </div>
         )}
 
-        {hasLive && data && data.timeline.length > 0 && (
+        {hasLive && shown && shown.timeline.length > 0 && (
           <>
             <section className="panel pad rise d2">
               <h3 className="card-title">{T("胜率走势")}</h3>
               <WinChart
-                series={data.timeline}
+                series={shown.timeline}
                 pMin={card!.p_min}
                 pMax={card!.p_max}
                 blueName={blueName}
@@ -501,7 +506,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
             </section>
             <section className="panel pad rise d3">
               <h3 className="card-title">{T("经济差")}</h3>
-              <GoldChart series={data.timeline} blueName={blueName} redName={redName} />
+              <GoldChart series={shown.timeline} blueName={blueName} redName={redName} />
             </section>
           </>
         )}

@@ -1693,6 +1693,15 @@ class SlowFeedBlanksBoard(unittest.TestCase):
         feed = self._feed([("finished", 300), ("finished", 200), None])
         self.assertIsNone(EsportsFeed.current_game(feed, "m"))
 
+    def test_打完的局前面卡住的局不算当前局(self):
+        from esports_feed import EsportsFeed
+        # 2026-09-12 LEC VIT vs MKOI: 第 1 局帧断在第 1 分钟 (永远 in_game),
+        # 第 2 局打完, 第 3 局 BP 还没帧 -> 不能把第 1 局当成正在打的局
+        feed = self._feed([("in_game", 7200), ("finished", 600), None])
+        self.assertIsNone(
+            EsportsFeed.current_game(feed, "m"),
+            "越过打完的第 2 局去交第 1 局 -> 页面跳回第 1 局, 第 3 局点不进去")
+
     def test_一局都没有帧时仍然是None(self):
         from esports_feed import EsportsFeed
         feed = self._feed([None, None, None])

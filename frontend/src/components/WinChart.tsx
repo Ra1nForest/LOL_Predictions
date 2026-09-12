@@ -386,19 +386,10 @@ export function WinChart({
       {hp && (
         <ChartTip x={x(hp.minute)} y={y(hp.probability_blue)} W={W} H={H}>
           <div className="tip-time">{clock(hp.minute)}</div>
+          {/* 只写胜率 —— 经济和人头归经济图的气泡, 两张图各说各的 */}
           <div className={hp.probability_blue >= 0.5 ? "blue" : "red"}>
             <b>{hp.probability_blue >= 0.5 ? blueName : redName}</b>{" "}
             {Math.round(Math.max(hp.probability_blue, 1 - hp.probability_blue) * 100)}%
-          </div>
-          <div>
-            {tr("经济差")}{" "}
-            <span className={hp.golddiff > 0 ? "blue" : hp.golddiff < 0 ? "red" : ""}>
-              {hp.golddiff > 0 ? "+" : hp.golddiff < 0 ? "−" : ""}
-              {Math.round(Math.abs(hp.golddiff)).toLocaleString()}
-            </span>
-          </div>
-          <div>
-            {tr("击杀")} <span className="blue">{hp.blue_kills}</span> : <span className="red">{hp.red_kills}</span>
           </div>
         </ChartTip>
       )}
