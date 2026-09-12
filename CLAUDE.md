@@ -211,7 +211,10 @@ guards. If one goes red, work out whether that trap is back before changing the 
   Stage 2 champion win rates and Stage 4's composition scaling index — no error, just a plausible
   number. `feature_store.champion_key` (+ `CHAMP_ID_ALIAS`) is applied inside the lookups, so
   training, which passes OE names, is unchanged; `esports_feed.oe_player_name` strips only the two
-  match team codes. `web/names.ts` mirrors both.
+  match team codes. `web/names.ts` mirrors both. Measured on the held-out test split
+  (`research/gate_live_names.py`, 1755 games): broken names made Stage 2 no better than Stage 1
+  (59.5% vs 59.4%); aligned names give 61.7%, Brier `t = +3.16`, log loss `t = +2.85` over 5
+  time blocks (accuracy `t = +1.78`), and reproduce the training matrix's draft features exactly.
 - **A failed start calibration is not a result.** `_game_start` (and `gameStart` in
   `frontend/src/web/feed.ts`) retries every `START_RETRY_SEC` until the calibration windows have
   settled; only then does it accept `frames[0]`. Caching the first-sight failure put every live
