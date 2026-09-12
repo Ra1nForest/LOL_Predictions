@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Reason } from "../api/types";
+import { T } from "../i18n";
 
 /**
  * 胜率解析 —— 从"胜率解析"那四个字**原地**冒出来的气泡群。
@@ -139,7 +140,7 @@ export function WhyBubbles({
       className="wb"
       ref={ref}
       role="dialog"
-      aria-label="胜率解析"
+      aria-label={T("胜率解析")}
       // 直径按内容算, 所以写在内联样式里而不是 CSS
       style={{ width: panel, height: panel }}
       onMouseLeave={onClose}
@@ -187,7 +188,7 @@ export function WhyBubbles({
                 {on ? (
                   <>
                     <em>{r.text}</em>
-                    <i>相对权重 {Math.round(r.rel * 100)}%</i>
+                    <i>{T("相对权重 {n}%", { n: Math.round(r.rel * 100) })}</i>
                   </>
                 ) : (
                   Math.round(r.rel * 100)

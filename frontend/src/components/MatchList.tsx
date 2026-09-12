@@ -1,4 +1,5 @@
 import type { Match, TeamRef } from "../api/types";
+import { T } from "../i18n";
 
 function Crest({ team }: { team: TeamRef }) {
   if (team.image) {
@@ -16,8 +17,8 @@ function when(iso: string): string {
   const sameDay = t.toDateString() === now.toDateString();
   const tomorrow = new Date(now.getTime() + 86400_000).toDateString() === t.toDateString();
   const hm = t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
-  if (sameDay) return `今天 ${hm}`;
-  if (tomorrow) return `明天 ${hm}`;
+  if (sameDay) return T("今天 {hm}", { hm });
+  if (tomorrow) return T("明天 {hm}", { hm });
   return `${t.getMonth() + 1}/${t.getDate()} ${hm}`;
 }
 
@@ -54,13 +55,13 @@ function Card({
       className="card"
       disabled={!usable}
       onClick={() => usable && onOpen(match)}
-      title={usable ? "" : "缺少历史数据, 无法预测"}
+      title={usable ? "" : T("缺少历史数据, 无法预测")}
     >
       <div className="side">
         {a && <Crest team={a} />}
         <div style={{ minWidth: 0 }}>
           <div className="team-name">{a?.name ?? "TBD"}</div>
-          {a && !a.known && <div className="team-sub">无历史数据</div>}
+          {a && !a.known && <div className="team-sub">{T("无历史数据")}</div>}
         </div>
       </div>
 
@@ -73,8 +74,8 @@ function Card({
           <div className="when">{when(match.start_time)}</div>
         )}
         <div className="tags">
-          {live && <span className="tag live">进行中</span>}
-          {done && <span className="tag">已结束</span>}
+          {live && <span className="tag live">{T("进行中")}</span>}
+          {done && <span className="tag">{T("已结束")}</span>}
           <span className="tag">{match.league}</span>
           {match.best_of != null && <span className="tag">BO{match.best_of}</span>}
         </div>
@@ -84,7 +85,7 @@ function Card({
         {b && <Crest team={b} />}
         <div style={{ minWidth: 0 }}>
           <div className="team-name">{b?.name ?? "TBD"}</div>
-          {b && !b.known && <div className="team-sub">无历史数据</div>}
+          {b && !b.known && <div className="team-sub">{T("无历史数据")}</div>}
         </div>
       </div>
     </button>
@@ -120,7 +121,7 @@ export function MatchList({
         {!!matches.length && <span className="count">{matches.length}</span>}
         <span className="spacer" />
         <button className="btn" onClick={onRefresh} disabled={loading}>
-          刷新
+          {T("刷新")}
         </button>
       </div>
       {error ? (
@@ -134,7 +135,7 @@ export function MatchList({
           ))}
         </div>
       ) : (
-        <div className="panel pad empty">{loading ? "加载中…" : emptyText}</div>
+        <div className="panel pad empty">{loading ? T("加载中…") : emptyText}</div>
       )}
     </section>
   );

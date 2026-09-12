@@ -1,5 +1,6 @@
 import type { PredictResponse } from "../api/types";
 import { ProbabilityScale } from "./ProbabilityScale";
+import { T } from "../i18n";
 
 /**
  * 赛前预测视图 —— 比赛还没开打时看到的那一屏。
@@ -26,7 +27,11 @@ export function PreMatch({
     model?.note,
     model?.range_note,
     data.data_quality?.league_data_through &&
-      `${data.league} 数据截至 ${data.data_quality.league_data_through}（${data.data_quality.days_old} 天前）`,
+      T("{league} 数据截至 {date}（{days} 天前）", {
+        league: data.league,
+        date: data.data_quality.league_data_through,
+        days: data.data_quality.days_old ?? "?",
+      }),
     data.disclaimer,
   ].filter(Boolean);
 
@@ -47,7 +52,7 @@ export function PreMatch({
       <div className="summary-row">
         {data.final.summary && <p className="summary">{data.final.summary}</p>}
         <p className="shift">
-          {key === "2_post_draft" ? "已计入 BP 的预测" : "赛前预测，尚未开打"}
+          {key === "2_post_draft" ? T("已计入 BP 的预测") : T("赛前预测，尚未开打")}
         </p>
       </div>
 
@@ -63,8 +68,8 @@ export function PreMatch({
         {footnotes.length > 0 && (
           <details className="fineprint">
             <summary>
-              准确率约{" "}
-              {model?.accuracy != null ? `${Math.round(model.accuracy * 100)}%` : "—"} · 模型说明
+              {T("准确率约")}{" "}
+              {model?.accuracy != null ? `${Math.round(model.accuracy * 100)}%` : "—"} · {T("模型说明")}
             </summary>
             <p className="mono">{footnotes.join(" · ")}</p>
           </details>

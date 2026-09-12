@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { T } from "../i18n";
 
 type Theme = "auto" | "light" | "dark";
 const KEY = "lolpredict.theme";
@@ -22,12 +23,12 @@ export function ThemeToggle() {
   }, [theme]);
 
   const opts: [Theme, string, string][] = [
-    ["light", "○", "亮色"],
-    ["dark", "●", "暗色"],
-    ["auto", "A", "跟随系统"],
+    ["light", "○", T("亮色")],
+    ["dark", "●", T("暗色")],
+    ["auto", "A", T("跟随系统")],
   ];
   return (
-    <div className="theme-toggle" role="group" aria-label="主题">
+    <div className="theme-toggle" role="group" aria-label={T("主题")}>
       {opts.map(([v, icon, label]) => (
         <button
           key={v}

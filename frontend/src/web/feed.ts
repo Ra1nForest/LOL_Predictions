@@ -218,6 +218,12 @@ export interface FeedOptions {
   teams: TeamsFile;
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * 符文名用 Data Dragon 的哪种语言。默认 zh_CN, 和 esports_feed.py 一样 ——
+   * 差分测试拿看板整个响应和 Python 逐字段比, 这里不能随界面语言变; 只有网页在
+   * 英文界面下才传 en_US (static-api.ts)。
+   */
+  runeLocale?: string;
 }
 
 export class Feed {
@@ -233,6 +239,7 @@ export class Feed {
   private teams: TeamsFile;
   private fetchImpl: typeof fetch;
   private sleep: (ms: number) => Promise<void>;
+  private runeLocale: string;
   private cache = new Map<string, { exp: number; val: Json }>();
   private inflight = new Map<string, Promise<Json>>();
   private writes = 0;
@@ -248,6 +255,7 @@ export class Feed {
     this.teams = opts.teams;
     this.fetchImpl = opts.fetchImpl ?? ((...a) => fetch(...a));
     this.sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.runeLocale = opts.runeLocale ?? "zh_CN";
   }
 
   // -- 底层 --
@@ -673,7 +681,7 @@ export class Feed {
     const idx = new Map<number, { name: string | null; icon: string | null; style: string | null }>();
     try {
       const ver = await this.ddragonVersion();
-      const r = await this.fetchImpl(`${DDRAGON}/cdn/${ver}/data/zh_CN/runesReforged.json`);
+      const r = await this.fetchImpl(`${DDRAGON}/cdn/${ver}/data/${this.runeLocale}/runesReforged.json`);
       for (const style of await r.json()) {
         const sname = style.name ?? null;
         idx.set(style.id, { name: sname, icon: style.icon ?? null, style: sname });

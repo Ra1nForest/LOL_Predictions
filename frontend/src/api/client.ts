@@ -3,11 +3,13 @@ import type {
   HealthResponse,
   MatchListResponse,
 } from "./types";
+import { EN, localize, tx } from "../i18n";
 
 export class ApiError extends Error {
   readonly status?: number;
   constructor(message: string, status?: number) {
-    super(message);
+    // 报错文字来自服务端 / 静态版 / 这里自己, 统一在这一处翻成界面语言
+    super(tx(message));
     this.name = "ApiError";
     this.status = status;
   }
@@ -74,19 +76,24 @@ async function fetchJSON<T>(url: string, timeoutMs = 90_000): Promise<T> {
   }
 }
 
+/**
+ * 英文界面时, 响应里程序生成的中文句子 (胜率解析、提醒、说明) 在这里统一翻掉 ——
+ * 生成端和 Python 逐字对账, 不能动, 见 i18n.ts。中文界面原样返回。
+ */
+const loc = <V>(p: Promise<V>): Promise<V> => (EN ? p.then(localize) : p);
+
 export const api = {
   health: () => fetchJSON<HealthResponse>("/health", 20_000),
 
   live: () =>
-    IS_STATIC ? viaStatic((s) => s.live()) : fetchJSON<MatchListResponse>("/esports/live", 60_000),
+    loc(IS_STATIC ? viaStatic((s) => s.live()) : fetchJSON<MatchListResponse>("/esports/live", 60_000)),
 
   upcoming: (limit = 24, pastHours = 5) =>
-    IS_STATIC
-      ? viaStatic((s) => s.upcoming(limit, pastHours))
-      : fetchJSON<MatchListResponse>(
-          `/esports/upcoming?limit=${limit}&past_hours=${pastHours}`,
-          60_000,
-        ),
+    loc(
+      IS_STATIC
+        ? viaStatic((s) => s.upcoming(limit, pastHours))
+        : fetchJSON<MatchListResponse>(`/esports/upcoming?limit=${limit}&past_hours=${pastHours}`, 60_000),
+    ),
 
   /**
    * 观赛板。
@@ -103,11 +110,11 @@ export const api = {
     opts: { points?: number; curves?: boolean } = {},
   ) => {
     const { points = 60, curves = true } = opts;
-    if (IS_STATIC) return viaStatic((s) => s.board(matchId, gameId ?? null, points, curves));
+    if (IS_STATIC) return loc(viaStatic((s) => s.board(matchId, gameId ?? null, points, curves)));
     const q = new URLSearchParams({ points: String(points) });
     if (gameId) q.set("game_id", gameId);
     if (!curves) q.set("curves", "false");
-    return fetchJSON<BoardResponse>(`/esports/board/${matchId}?${q}`);
+    return loc(fetchJSON<BoardResponse>(`/esports/board/${matchId}?${q}`));
   },
 };
 
@@ -186,9 +193,11 @@ export const mutations = {
         ),
 
   predict: (body: import("./types").PredictRequestBody) =>
-    IS_STATIC
-      ? viaStatic((s) => s.predict(body))
-      : postJSON<import("./types").PredictResponse>("/predict", body, 120_000),
+    loc(
+      IS_STATIC
+        ? viaStatic((s) => s.predict(body))
+        : postJSON<import("./types").PredictResponse>("/predict", body, 120_000),
+    ),
 
   /**
    * Stage 3。静态版没有 —— 它要调 NVIDIA 的 API, key 不能放进网页。

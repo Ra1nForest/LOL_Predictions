@@ -24,6 +24,7 @@ import type { Stage2File } from "./stage2.ts";
 import { loadStage2 } from "./stage2.ts";
 import type { TeamsFile } from "./teams.ts";
 import { localToday } from "./teams.ts";
+import { EN } from "../i18n.ts";
 
 async function getJSON<T>(name: string): Promise<T> {
   const r = await fetch(`${import.meta.env.BASE_URL}web/${name}`);
@@ -62,7 +63,7 @@ function models(): Promise<Models> {
 /** 整个会话一个 Feed —— 自适应 lag、开局零点、暂停观测这些状态要跨轮询保留 */
 function feed(): Promise<Feed> {
   feedP ??= teams()
-    .then((t) => new Feed({ teams: t }))
+    .then((t) => new Feed({ teams: t, runeLocale: EN ? "en_US" : "zh_CN" }))
     .catch((e) => {
       feedP = null;
       throw e;

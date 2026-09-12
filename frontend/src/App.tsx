@@ -4,6 +4,7 @@ import type { Match } from "./api/types";
 import { MatchList } from "./components/MatchList";
 import { Board } from "./components/Board";
 import { ThemeToggle } from "./components/ThemeToggle";
+import { T } from "./i18n";
 
 const LIST_POLL_MS = 30_000;
 
@@ -119,26 +120,26 @@ export default function App() {
         <ThemeToggle />
       </div>
       <header className="masthead rise">
-        <h1>胜率预测</h1>
-        <p>四大赛区比赛的实时胜率预测。</p>
+        <h1>{T("胜率预测")}</h1>
+        <p>{T("四大赛区比赛的实时胜率预测。")}</p>
       </header>
       <MatchList
-        title="正在进行"
+        title={T("正在进行")}
         matches={live}
         kind="live"
         loading={loading}
         error={error}
-        emptyText="当前没有进行中的比赛"
+        emptyText={T("当前没有进行中的比赛")}
         onOpen={openBoard}
         onRefresh={() => void load()}
       />
       <MatchList
-        title="即将开始"
+        title={T("即将开始")}
         matches={upcoming}
         kind="upcoming"
         loading={loading}
         error={null}
-        emptyText="近期没有排期"
+        emptyText={T("近期没有排期")}
         onOpen={openBoard}
         onRefresh={() => void load()}
       />

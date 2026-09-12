@@ -3,6 +3,7 @@ import type { Lane, Player, TeamObjectives } from "../api/types";
 import { PlayerCard } from "./PlayerCard";
 import { ObjectiveIcon, DRAKE_CN } from "./ObjectiveIcon";
 import { KillIcon } from "./icons";
+import { T } from "../i18n";
 
 // 位置名 (上单/打野…) 不再显示 —— 五行顺序固定就是上野中下辅, 而两边的
 // 头像和英雄名已经说明了是谁。中间那一栏因此能窄下来给经济差腾地方。
@@ -49,7 +50,7 @@ export function Scoreboard({ players, lanes, blue, red, blueName, redName }: Pro
   return (
     <section className="panel pad sb">
       <h3 className="card-title">
-        记分板<span className="sb-hint">左右滑动看全部</span>
+        {T("记分板")}<span className="sb-hint">{T("左右滑动看全部")}</span>
       </h3>
 
       {/* 手机上放不下时**整块左右滑**, 不改布局: 镜像的三栏、七格装备、战绩都保留。
@@ -79,7 +80,7 @@ export function Scoreboard({ players, lanes, blue, red, blueName, redName }: Pro
                 }`}
               >
                 {blue.gold === red.gold
-                  ? "经济持平"
+                  ? T("经济持平")
                   : `+${Math.abs(blue.gold - red.gold).toLocaleString()}`}
               </div>
             </div>
@@ -105,7 +106,7 @@ export function Scoreboard({ players, lanes, blue, red, blueName, redName }: Pro
                   <div className="sb-mid">
                     {gap &&
                       (d === 0 ? (
-                        <div className="sb-gap">持平</div>
+                        <div className="sb-gap">{T("持平")}</div>
                       ) : (
                         <div className={`sb-gap ${d > 0 ? "blue" : "red"}`}>
                           {d > 0 && <i className="arw">‹</i>}
@@ -162,11 +163,11 @@ function TeamSide({
   // **镜像**: 从中线往外是 经济 → 塔 → 龙 → 大龙 → 水晶。两侧顺序相反,
   // 于是同一项在左右两栏里离中线一样远, 视线横着扫就能比。
   const items = [
-    stat("gold", "总经济", k(o.gold), o.gold > 0),
-    stat("tower", "推塔", o.towers, o.towers > 0),
-    stat("dragon", "小龙", o.dragons, o.dragons > 0),
-    stat("baron", "大龙", o.barons, o.barons > 0),
-    stat("inhibitor", "水晶 (抑制器)", o.inhibitors, o.inhibitors > 0),
+    stat("gold", T("总经济"), k(o.gold), o.gold > 0),
+    stat("tower", T("推塔"), o.towers, o.towers > 0),
+    stat("dragon", T("小龙"), o.dragons, o.dragons > 0),
+    stat("baron", T("大龙"), o.barons, o.barons > 0),
+    stat("inhibitor", T("水晶 (抑制器)"), o.inhibitors, o.inhibitors > 0),
   ];
   return (
     <div className={`sb-team ${side}`}>
@@ -179,7 +180,7 @@ function TeamSide({
         <div className={`sb-drakes ${side}`}>
           {o.dragon_types.map((t, i) => (
             <ObjectiveIcon key={i} kind="dragon" drake={t} className="drake-ico"
-                           title={DRAKE_CN[t] ?? t} />
+                           title={DRAKE_CN[t] ? T(DRAKE_CN[t]!) : t} />
           ))}
         </div>
       )}
@@ -212,7 +213,7 @@ function PlayerCell({
       <button
         className={`champ-btn${isOpen ? " on" : ""}${dead ? " dead" : ""}`}
         onClick={() => onOpen(isOpen ? null : p.participant_id)}
-        title={`${p.summoner_name ?? ""} — 点开看详情`}
+        title={T("{name} — 点开看详情", { name: p.summoner_name ?? "" })}
         aria-expanded={isOpen}
       >
         {p.champion_icon ? (
@@ -223,7 +224,7 @@ function PlayerCell({
         {/* 阵亡: 头像压一层黑白遮罩 + "阵亡" 两个字, 一直到复活。
             比在血条上写字醒目得多 —— 头像是这一行视觉上最重的元素,
             它一灰整行就"暗"下去了。 */}
-        {dead && <span className="champ-dead">阵亡</span>}
+        {dead && <span className="champ-dead">{T("阵亡")}</span>}
         <span className="champ-lv">{p.level}</span>
       </button>
 
@@ -257,8 +258,8 @@ function PlayerCell({
           );
         })}
         {p.trinket ? (
-          <img className="trinket" src={p.trinket.icon} alt="饰品"
-               title={`饰品 ${p.trinket.id}`} loading="lazy" />
+          <img className="trinket" src={p.trinket.icon} alt={T("饰品")}
+               title={T("饰品 {id}", { id: p.trinket.id })} loading="lazy" />
         ) : (
           <span className="slot trinket" />
         )}
@@ -270,7 +271,7 @@ function PlayerCell({
         <div className="sb-kda">
           {p.kills}/{p.deaths}/{p.assists}
         </div>
-        <div className="sb-cs">{p.cs} 刀</div>
+        <div className="sb-cs">{T("{n} 刀", { n: p.cs })}</div>
       </div>
     </div>
   );

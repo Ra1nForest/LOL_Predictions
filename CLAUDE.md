@@ -149,6 +149,15 @@ also what gets deployed — `research/`, `tools/`, `attic/` are not needed at ru
   `frontend/public/web/` are a snapshot, and a stale one serves the old model without error.
   Node 24 runs the `.ts` files directly (type stripping), which is why `erasableSyntaxOnly` is on
   and `web/` imports carry `.ts` extensions.
+- **`frontend/src/i18n.ts`** switches the UI to English unless the system language is Chinese
+  (`?lang=en|zh` forces it). Hard-coded UI text goes through `T("中文原文")` (the Chinese string is
+  the key). Generated sentences — reasons, warnings, notes, errors — are **not** translated at the
+  source: `web/*.ts` and `api.py` must keep emitting the exact Chinese that `test:golden` compares
+  against Python. Instead `client.ts` runs every response through `localize()`, which matches each
+  sentence against Chinese templates (compiled to regexes) and fills the English one; anything it
+  doesn't recognise stays Chinese (dev mode logs `[i18n] 没有英文`). Changing a sentence in
+  `explain.py`/`web/` therefore needs the matching template in `i18n.ts` updated too. Rune names
+  come from Data Dragon in the requested locale (`Feed({ runeLocale })`, default `zh_CN` for parity).
 
 ## Invariants that are easy to break silently
 

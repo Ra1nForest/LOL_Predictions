@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { Player } from "../api/types";
+import { T } from "../i18n";
 import {
   AdIcon,
   ApIcon,
@@ -76,7 +77,7 @@ export function PlayerCard({ p, onClose }: { p: Player; onClose: () => void }) {
   const runes = p.perks?.perks ?? [];
 
   return (
-    <div className={`pc ${p.side}`} ref={ref} role="dialog" aria-label="选手详情">
+    <div className={`pc ${p.side}`} ref={ref} role="dialog" aria-label={T("选手详情")}>
       <div className="pc-head">
         {p.champion_icon ? (
           <img className="pc-champ" src={p.champion_icon} alt={p.champion ?? ""} />
@@ -86,25 +87,26 @@ export function PlayerCard({ p, onClose }: { p: Player; onClose: () => void }) {
         <div className="pc-who">
           <div className="pc-name">{p.summoner_name ?? "—"}</div>
           <div className="pc-sub">
-            {p.champion ?? "—"} · {ROLE_CN[p.role ?? ""] ?? p.role ?? "—"} · {p.level} 级
+            {p.champion ?? "—"} · {ROLE_CN[p.role ?? ""] ? T(ROLE_CN[p.role ?? ""]!) : (p.role ?? "—")} ·{" "}
+            {T("{n} 级", { n: p.level })}
           </div>
         </div>
-        <button className="pc-x" onClick={onClose} aria-label="关闭">
+        <button className="pc-x" onClick={onClose} aria-label={T("关闭")}>
           ×
         </button>
       </div>
 
       <div className="pc-grid">
         <Cell label="KDA" value={`${p.kills}/${p.deaths}/${p.assists}`} />
-        <Cell label="补刀" value={String(p.cs)} />
-        <Cell label="经济" value={k(p.gold)} />
-        <Cell label="参团率" value={pct(p.kill_participation)} />
-        <Cell label="伤害占比" value={pct(p.damage_share)} />
-        <Cell label="视野" value={`${num(p.wards_placed)} / ${num(p.wards_destroyed)}`} />
+        <Cell label={T("补刀")} value={String(p.cs)} />
+        <Cell label={T("经济")} value={k(p.gold)} />
+        <Cell label={T("参团率")} value={pct(p.kill_participation)} />
+        <Cell label={T("伤害占比")} value={pct(p.damage_share)} />
+        <Cell label={T("视野")} value={`${num(p.wards_placed)} / ${num(p.wards_destroyed)}`} />
       </div>
 
       {st && (
-        <Block title="属性">
+        <Block title={T("属性")}>
           {/* 图标 + 数字。中文名放进 title —— 八个标签摊开占的地方比数字还多,
               而图标本身就分得清 (剑/法球/盾/魔法盾/速度/爆裂/血滴/断链)。 */}
           <div className="pc-stats">
@@ -113,7 +115,7 @@ export function PlayerCard({ p, onClose }: { p: Player; onClose: () => void }) {
               // 暴击和韧性上游给的是 0-1 的比例, 其余是绝对值
               const v = key === "crit" || key === "tenacity" ? pct(raw) : num(raw);
               return (
-                <div className="pc-stat" key={key} title={cn}>
+                <div className="pc-stat" key={key} title={T(cn)}>
                   <Icon className="pc-stat-ico" />
                   <b>{v}</b>
                 </div>
@@ -126,7 +128,7 @@ export function PlayerCard({ p, onClose }: { p: Player; onClose: () => void }) {
       {runes.length > 0 && (
         <Block
           title={
-            "符文" +
+            T("符文") +
             (p.perks?.style?.name
               ? ` · ${p.perks.style.name}${p.perks.sub_style?.name ? " / " + p.perks.sub_style.name : ""}`
               : "")
@@ -149,7 +151,7 @@ export function PlayerCard({ p, onClose }: { p: Player; onClose: () => void }) {
       )}
 
       {!!p.abilities?.length && (
-        <Block title={`技能加点 (${p.abilities.length} 级)`}>
+        <Block title={T("技能加点 ({n} 级)", { n: p.abilities.length })}>
           <div className="pc-abil">
             {p.abilities.map((a, i) => (
               <span className={`ab ab-${a.toLowerCase()}`} key={i}>

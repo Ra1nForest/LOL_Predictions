@@ -1,4 +1,6 @@
 import type { TimelinePoint } from "../api/types";
+// 这个文件里 T 是图表的上边距, 翻译函数换个名字引进来
+import { T as tr } from "../i18n";
 
 interface Props {
   series: TimelinePoint[];
@@ -19,7 +21,7 @@ export function GoldChart({ series, blueName, redName }: Props) {
     return (
       <svg viewBox={`0 0 ${W} ${H}`} className="chart">
         <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="14" fill="var(--ink-3)">
-          还没有经济数据
+          {tr("还没有经济数据")}
         </text>
       </svg>
     );
@@ -79,10 +81,10 @@ export function GoldChart({ series, blueName, redName }: Props) {
       <path d={path} fill="none" stroke="var(--ink-2)" strokeWidth="1.8" strokeLinejoin="round" />
 
       <text x={W - R} y={T + 11} textAnchor="end" fontSize="10.5" fill="var(--blue)">
-        {blueName} 领先
+        {tr("{team} 领先", { team: blueName })}
       </text>
       <text x={W - R} y={H - B - 2} textAnchor="end" fontSize="10.5" fill="var(--red)">
-        {redName} 领先
+        {tr("{team} 领先", { team: redName })}
       </text>
     </svg>
   );

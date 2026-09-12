@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Reason } from "../api/types";
 import { WhyBubbles } from "./WhyBubbles";
+import { T } from "../i18n";
 
 interface Props {
   blueName: string;
@@ -69,10 +70,10 @@ export function ProbabilityScale({
               onClick={() => setWhy((v) => !v)}
               aria-expanded={why}
             >
-              胜率解析
+              {T("胜率解析")}
             </button>
           ) : (
-            <div className="prob-mid">胜率</div>
+            <div className="prob-mid">{T("胜率")}</div>
           )}
           {why && canExplain && (
             <WhyBubbles reasons={reasons!} onClose={() => setWhy(false)} />
@@ -156,14 +157,14 @@ export function ProbabilityScale({
       </svg>
 
       <div className="scale-foot">
-        <span>{(pMin != null || pMax != null) && "斜线区间超出模型输出范围"}</span>
+        <span>{(pMin != null || pMax != null) && T("斜线区间超出模型输出范围")}</span>
         {/* 和刻度本身一样, 按**领先方**口径写。这一条刻度左右两端各是一方的
             胜率, 单写一个 39% 读者无从知道那是谁的 —— 而它旁边那两个大数字
             写的正是两边各自的胜率, 39 哪个都对不上。 */}
         <span>
           {([
-            { lab: "赛前", v: pregame },
-            { lab: "BP 后", v: postdraft ?? null },
+            { lab: T("赛前"), v: pregame },
+            { lab: T("BP 后"), v: postdraft ?? null },
           ] as { lab: string; v: number | null }[])
             .filter((x) => x.v != null)
             .map(

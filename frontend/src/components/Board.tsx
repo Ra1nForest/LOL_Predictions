@@ -8,6 +8,7 @@ import { Scoreboard } from "./Scoreboard";
 import { ThemeToggle } from "./ThemeToggle";
 import { DebatePanel } from "./DebatePanel";
 import { PreMatch } from "./PreMatch";
+import { T } from "../i18n";
 
 const STATE_CN: Record<string, string> = {
   in_game: "进行中",
@@ -140,8 +141,8 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
   }, []);
 
   const teams = data?.match?.teams ?? initial?.teams ?? [];
-  const blueName = teams[0]?.model_name ?? teams[0]?.name ?? "蓝方";
-  const redName = teams[1]?.model_name ?? teams[1]?.name ?? "红方";
+  const blueName = teams[0]?.model_name ?? teams[0]?.name ?? T("蓝方");
+  const redName = teams[1]?.model_name ?? teams[1]?.name ?? T("红方");
 
   const lv = data?.live ?? null;
   const pr = data?.prediction ?? null;
@@ -232,8 +233,8 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
 
   const stateLabel = lv
     ? lv.stalled
-      ? "数据中断"
-      : (STATE_CN[lv.game_state] ?? "状态未知")
+      ? T("数据中断")
+      : T(STATE_CN[lv.game_state] ?? "状态未知")
     : "";
 
   // 局号/分钟已经由局切换标签和 summary 各自表达了, 这里只留**异常**:
@@ -241,7 +242,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
   // "第 4 局 · 第 37 分钟 · 已结束" 只是把三处重复的东西再说一遍。
   const meta: string[] = [];
   if (lv && lv.paused_seconds >= 60) {
-    meta.push(`期间暂停约 ${Math.round(lv.paused_seconds / 60)} 分钟`);
+    meta.push(T("期间暂停约 {n} 分钟", { n: Math.round(lv.paused_seconds / 60) }));
   }
   // 数据有多旧, 在**判死之前**就要说。
   //
@@ -255,9 +256,9 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
   // **依然是事实** —— 这一行只陈述数据有多旧, 不判断比赛在不在打, 所以
   // 不存在误报。判死活是 stalled 的事, 两者分开。
   if (lv?.stalled) {
-    meta.push(`数据停留在 ${Math.round(lv.stale_seconds / 60)} 分钟前`);
+    meta.push(T("数据停留在 {n} 分钟前", { n: Math.round(lv.stale_seconds / 60) }));
   } else if (lv && lv.stale_seconds >= 180) {
-    meta.push(`数据落后约 ${Math.round(lv.stale_seconds / 60)} 分钟`);
+    meta.push(T("数据落后约 {n} 分钟", { n: Math.round(lv.stale_seconds / 60) }));
   }
   // hasEarly 时不写 —— 那一段**已经开打了** (只是局内模型还没启用),
   // 写"尚未开始"是错的, 而"第几分钟"上面那一屏自己会说。
@@ -272,12 +273,12 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
     // 三种情况要分开: 打完了 / 打了一半正在换局 / 真的还没开始。
     // 中间那种以前也会被写成"尚未开始", 而那时系列赛已经打了两局。
     meta.push(
-      seriesOver ? "已结束" : played.length > 0 ? "局间休息" : "尚未开始",
+      T(seriesOver ? "已结束" : played.length > 0 ? "局间休息" : "尚未开始"),
     );
   }
   // 已经开打但局内模型还没启用: 报第几分钟, 让人知道"在等什么"
   if (hasEarly && pr?.minute != null) {
-    meta.push(`第 ${pr.minute} 分钟`);
+    meta.push(T("第 {n} 分钟", { n: pr.minute }));
   }
 
   // 结束/暂停/中断时, 那句 "第 37 分钟 · 势均力敌" 里的局势描述已经没有意义 ——
@@ -289,7 +290,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
   const done = !!lv && (lv.stalled || lv.game_state !== "in_game");
   const summaryText =
     done && pr?.minute != null
-      ? `第 ${pr.minute} 分钟 · ${stateLabel}`
+      ? `${T("第 {n} 分钟", { n: pr.minute })} · ${stateLabel}`
       : (pr?.summary ?? null);
 
   // 走势图末端画什么。**"结束"和"暂停"必须分开** —— 暂停时这一局还没分
@@ -306,7 +307,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
   const footnotes = [
     card?.note,
     card?.range_note,
-    card?.trained_through && `训练数据截至 ${card.trained_through}`,
+    card?.trained_through && T("训练数据截至 {date}", { date: card.trained_through }),
     pr?.disclaimer,
   ].filter(Boolean);
 
@@ -314,7 +315,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
     <div>
       <div className="board-nav rise">
         <button className="btn" onClick={onBack}>
-          ← 返回
+          {T("← 返回")}
         </button>
         {/* 局切换居中放在顶栏。用两侧各一个 spacer 而不是 justify-content,
             这样标签组是相对**整行**居中的, 不会因为左右按钮宽度不同 (中英文
@@ -335,7 +336,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
                 // 新开的一局拽走。
                 onClick={() => setGameId(g.game_id === latestGameId ? null : g.game_id)}
               >
-                第 {g.number} 局
+                {T("第 {n} 局", { n: g.number ?? "?" })}
               </button>
             ))}
           </div>
@@ -380,7 +381,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
           </div>
         )}
         {!hasLive && !hasEarly && !meta.length && loading && (
-          <div className="hero-meta">加载中…</div>
+          <div className="hero-meta">{T("加载中…")}</div>
         )}
 
         {/* Stage 2: BP 后概率。刻度和局内那条**用同一个组件**, 于是从 BP 后
@@ -401,11 +402,11 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
             />
             <div className="summary-row">
               <p className="summary">
-                {earlyIsDraft ? "BP 后 · " : "赛前 · "}
-                {earlyP! >= 0.5 ? blueName : redName} 占优
+                {T(earlyIsDraft ? "BP 后" : "赛前")} ·{" "}
+                {T("{team} 占优", { team: earlyP! >= 0.5 ? blueName : redName })}
               </p>
               <p className="shift">
-                {earlyIsDraft ? "已计入双方阵容, 局内模型尚未启用" : "尚未开打"}
+                {T(earlyIsDraft ? "已计入双方阵容, 局内模型尚未启用" : "尚未开打")}
               </p>
             </div>
           </>
@@ -460,7 +461,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
             的 shift 已经说过同一件事了。 */}
         {!hasLive && !hasEarly && !pre && (
           <div className="panel pad empty">
-            {loading ? "加载中…" : (pr?.note ?? pr?.error ?? "暂无预测数据")}
+            {loading ? T("加载中…") : (pr?.note ?? pr?.error ?? T("暂无预测数据"))}
           </div>
         )}
 
@@ -483,7 +484,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
         {hasLive && data && data.timeline.length > 0 && (
           <>
             <section className="panel pad rise d2">
-              <h3 className="card-title">胜率走势</h3>
+              <h3 className="card-title">{T("胜率走势")}</h3>
               <WinChart
                 series={data.timeline}
                 pMin={card!.p_min}
@@ -496,7 +497,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
               />
             </section>
             <section className="panel pad rise d3">
-              <h3 className="card-title">经济差</h3>
+              <h3 className="card-title">{T("经济差")}</h3>
               <GoldChart series={data.timeline} blueName={blueName} redName={redName} />
             </section>
           </>
@@ -550,12 +551,12 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
         {hasLive && (footnotes.length > 0 || pr!.warnings.length > 0) && (
           <details className="fineprint">
             <summary>
-              准确率约{" "}
+              {T("准确率约")}{" "}
               {card!.overall_accuracy != null
                 ? `${Math.round(card!.overall_accuracy * 100)}%`
                 : "—"}{" "}
-              · 模型说明
-              {pr!.warnings.length > 0 && ` 与 ${pr!.warnings.length} 条提醒`}
+              · {T("模型说明")}
+              {pr!.warnings.length > 0 && T(" 与 {n} 条提醒", { n: pr!.warnings.length })}
             </summary>
             {/* 两类说明合到一处: 上面原本还有一块"N 条模型说明"的折叠框, 和
                 这里讲的是同一件事 (模型的局限), 分成两处只是让人多点一次。

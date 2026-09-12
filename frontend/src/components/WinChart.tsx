@@ -1,5 +1,7 @@
 import { useMemo } from "react";
 import type { TimelinePoint } from "../api/types";
+// 这个文件里 T 是图表的上边距, 翻译函数换个名字引进来
+import { T as tr } from "../i18n";
 
 interface Props {
   series: TimelinePoint[];
@@ -90,7 +92,7 @@ export function WinChart({
           fontSize="15"
           fill="var(--ink-3)"
         >
-          还没有胜率数据
+          {tr("还没有胜率数据")}
         </text>
       </svg>
     );
@@ -121,8 +123,8 @@ export function WinChart({
   const LABEL_GAP = 13;
   const refLines = (() => {
     const rows = [
-      pregame != null ? { p: pregame, label: "赛前", dash: "2 4" } : null,
-      postdraft != null ? { p: postdraft, label: "BP 后", dash: "6 3" } : null,
+      pregame != null ? { p: pregame, label: tr("赛前"), dash: "2 4" } : null,
+      postdraft != null ? { p: postdraft, label: tr("BP 后"), dash: "6 3" } : null,
     ].filter((r): r is { p: number; label: string; dash: string } => r != null);
     if (rows.length < 2 || Math.abs(y(rows[0]!.p) - y(rows[1]!.p)) >= LABEL_GAP) {
       return rows.map((r) => ({ ...r, ty: y(r.p) - 5 }));
@@ -173,7 +175,7 @@ export function WinChart({
             opacity="0.8"
           />
           <text x={L + 6} y={y(1) + 12} fontSize="11" fill="var(--ink-3)">
-            {blueName} 胜率超过 {Math.round(pMax * 100)}% 时只显示到此
+            {tr("{team} 胜率超过 {n}% 时只显示到此", { team: blueName, n: Math.round(pMax * 100) })}
           </text>
         </>
       )}
@@ -188,7 +190,7 @@ export function WinChart({
             opacity="0.8"
           />
           <text x={L + 6} y={y(0) - 5} fontSize="11" fill="var(--ink-3)">
-            {redName} 胜率超过 {Math.round((1 - pMin) * 100)}% 时只显示到此
+            {tr("{team} 胜率超过 {n}% 时只显示到此", { team: redName, n: Math.round((1 - pMin) * 100) })}
           </text>
         </>
       )}
@@ -218,7 +220,7 @@ export function WinChart({
         </g>
       ))}
       <text x={W - R} y={mid - 6} textAnchor="end" fontSize="11" fill="var(--ink-3)">
-        势均力敌
+        {tr("势均力敌")}
       </text>
 
       {xLabels.map((m) => (
@@ -314,7 +316,7 @@ export function WinChart({
         </g>
       ) : endState === "paused" ? (
         <g>
-          <title>暂停 / 数据中断 —— 胜负未定</title>
+          <title>{tr("暂停 / 数据中断 —— 胜负未定")}</title>
           {/* 定住的暂停符号。**刻意不画奖杯**: 暂停时这一局还没分胜负,
               画奖杯就是在宣布一个还没发生的结果, 而这正是本项目最要避免的
               那种"看着很确定的错话"。 */}
@@ -325,7 +327,7 @@ export function WinChart({
         </g>
       ) : (
         <g transform={`translate(${endX - 7} ${endY - 8})`} fill={leadColor}>
-          <title>这一局已结束</title>
+          <title>{tr("这一局已结束")}</title>
           {/* 奖杯: 杯身 + 两只耳 + 杯脚 + 底座 */}
           <path d="M4.2 0h5.6v4.1a2.8 2.8 0 0 1-5.6 0Z" />
           <path
