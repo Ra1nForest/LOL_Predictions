@@ -15,7 +15,7 @@ import type { Draft, Stage2 } from "./stage2.ts";
 import { predictCore } from "./stage2.ts";
 import type { TeamsFile } from "./teams.ts";
 import { knownTeams, mapTeam, norm } from "./teams.ts";
-import type { LiveState, Match, MetaEntry } from "./feed.ts";
+import type { LiveState, Match, MetaEntry, TimelineRow } from "./feed.ts";
 import { DDRAGON, Feed, LEAGUE_IDS, PERSISTED, parseTs19, predictable, toState } from "./feed.ts";
 import { oePlayerName } from "./names.ts";
 import { pyRound } from "./pyfmt.ts";
@@ -239,6 +239,109 @@ export function lanesOf(ps: Json[]): Json[] {
     if (b && r) lanes.push({ lane, gold_diff: b.gold - r.gold, blue_gold: b.gold, red_gold: r.gold });
   }
   return lanes;
+}
+
+/** 走势曲线逐点算胜率要的上下文: 赛前特征只和队伍有关、阵容整局不变, 整条曲线取一次 */
+interface CurveCtx {
+  blue: string;
+  red: string;
+  league: string;
+  preCtx: PreCtx | null;
+  ln: [string[], string[]] | null;
+}
+
+async function curveCtx(
+  feed: Feed,
+  teams: TeamsFile,
+  s1: Stage1,
+  blue: string,
+  red: string,
+  league: string,
+  today: string,
+  gameId: string,
+): Promise<CurveCtx> {
+  let preCtx: PreCtx | null = null;
+  try {
+    preCtx = preContext(s1, teams, blue, red, league, today);
+  } catch (e) {
+    warn("曲线取赛前特征失败, 曲线会偏离头条", e);
+  }
+  let ln: [string[], string[]] | null = null;
+  try {
+    ln = await lineups(feed, gameId);
+  } catch (e) {
+    warn("曲线取阵容失败, 曲线会偏离头条", e);
+  }
+  return { blue, red, league, preCtx, ln };
+}
+
+/** 曲线上一行的胜率, 和看板头条同一个函数。失败给 null, 调用方沿用上一个点 */
+function curveProb(m: Models, teams: TeamsFile, today: string, c: CurveCtx, row: TimelineRow): { p: unknown } | null {
+  try {
+    const res = ingameResponse(
+      m.ingame,
+      m.s1,
+      teams,
+      m.ex,
+      {
+        blue: c.blue,
+        red: c.red,
+        league: c.league,
+        state: {
+          minute: Math.min(60, Math.max(3, row.minute)),
+          golddiff: row.golddiff,
+          csdiff: row.csdiff ?? 0,
+          blueKills: row.blue_kills,
+          redKills: row.red_kills,
+          goldTotal: row.blue_gold,
+        },
+        blueChamps: c.ln ? c.ln[0] : null,
+        redChamps: c.ln ? c.ln[1] : null,
+        preCtx: c.preCtx,
+      },
+      today,
+    );
+    return { p: res.probability_blue };
+  } catch (e) {
+    console.warn(`曲线点 ${row.minute}min 失败: ${e}`);
+    return null;
+  }
+}
+
+/**
+ * 逐秒走势 (静态站的走势图用, 见 feed.fineRows): 每一行配上胜率, 和看板曲线同一套 (curveCtx / curveProb)。
+ * 看板自己的 timeline 不动 —— 它是 test:diff 拿去和 Python 逐字段比的东西。
+ * 每补完一批交一次; 同一行的胜率只算一次。
+ */
+export async function fineTimeline(
+  feed: Feed,
+  teams: TeamsFile,
+  models: Models,
+  today: string,
+  a: { gameId: string; blue: string; red: string; league: string; upto: number },
+  onBatch: (pts: Json[]) => void,
+): Promise<void> {
+  const c = await curveCtx(feed, teams, models.s1, a.blue, a.red, a.league, today, a.gameId);
+  const memo = new Map<string, { p: unknown } | null>();
+  await feed.fineRows(a.gameId, a.upto, (rows) => {
+    let lastP: unknown = null;
+    onBatch(
+      rows.map((row) => {
+        if (row.minute >= 3) {
+          if (!memo.has(row.t)) memo.set(row.t, curveProb(models, teams, today, c, row));
+          const got = memo.get(row.t);
+          if (got) lastP = got.p;
+        }
+        return {
+          minute: row.minute,
+          golddiff: row.golddiff,
+          blue_kills: row.blue_kills,
+          red_kills: row.red_kills,
+          probability_blue: lastP,
+        };
+      }),
+    );
+  });
 }
 
 async function lineups(feed: Feed, gameId: string): Promise<[string[], string[]] | null> {
@@ -531,21 +634,16 @@ export async function buildBoard(
     try {
       const upto = st.frame_time ? parseTs19(st.frame_time) : NaN;
       const rows = Feed.downsample(await feed.goldTimeline(st.game_id, Number.isNaN(upto) ? undefined : upto), points);
-      const b = minfo.teams[0]!.model_name!;
-      const r = minfo.teams[1]!.model_name!;
-      // 赛前特征只和队伍有关, 整条曲线算一次
-      let preCtx: PreCtx | null = null;
-      try {
-        preCtx = preContext(s1, teams, b, r, minfo.league, today);
-      } catch (e) {
-        warn("曲线取赛前特征失败, 曲线会偏离头条", e);
-      }
-      let ln: [string[], string[]] | null = null;
-      try {
-        ln = await lineups(feed, st.game_id);
-      } catch (e) {
-        warn("曲线取阵容失败, 曲线会偏离头条", e);
-      }
+      const c = await curveCtx(
+        feed,
+        teams,
+        s1,
+        minfo.teams[0]!.model_name!,
+        minfo.teams[1]!.model_name!,
+        minfo.league,
+        today,
+        st.game_id,
+      );
       const series: Json[] = [];
       let lastP: unknown = null;
       for (const row of rows) {
@@ -556,34 +654,8 @@ export async function buildBoard(
           red_kills: row.red_kills,
         };
         if (row.minute >= 3) {
-          try {
-            const res = ingameResponse(
-              ingame,
-              s1,
-              teams,
-              ex,
-              {
-                blue: b,
-                red: r,
-                league: minfo.league,
-                state: {
-                  minute: Math.min(60, Math.max(3, row.minute)),
-                  golddiff: row.golddiff,
-                  csdiff: row.csdiff ?? 0,
-                  blueKills: row.blue_kills,
-                  redKills: row.red_kills,
-                  goldTotal: row.blue_gold,
-                },
-                blueChamps: ln ? ln[0] : null,
-                redChamps: ln ? ln[1] : null,
-                preCtx,
-              },
-              today,
-            );
-            lastP = res.probability_blue;
-          } catch (e) {
-            console.warn(`曲线点 ${row.minute}min 失败: ${e}`);
-          }
+          const got = curveProb(models, teams, today, c, row);
+          if (got) lastP = got.p;
         }
         pt.probability_blue = lastP;
         series.push(pt);

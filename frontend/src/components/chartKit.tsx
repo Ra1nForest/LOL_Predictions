@@ -154,6 +154,17 @@ export function useGrowingSeries(series: TimelinePoint[], ms = 750): TimelinePoi
   return out;
 }
 
+/**
+ * 把逐秒走势 (useFineTimeline) 并进看板的走势: 逐秒点覆盖到的时间段用逐秒点, 没覆盖到的
+ * (还没补到的开头、直播时补全之后新走过的部分) 仍用原来的点。直播回放的逐秒轨迹在后者里。
+ */
+export function mergeFine(base: TimelinePoint[], fine: TimelinePoint[] | null): TimelinePoint[] {
+  if (!fine?.length) return base;
+  const from = fine[0]!.minute;
+  const to = fine[fine.length - 1]!.minute;
+  return [...base.filter((p) => p.minute < from || p.minute > to), ...fine].sort((a, b) => a.minute - b.minute);
+}
+
 /** 横轴刻度间隔 (分钟): 两个刻度之间至少留 minGap 像素 */
 export function pickTicks(maxM: number, plotW: number, minGap = 60): number {
   for (const s of [1, 2, 5, 10, 15, 20, 30]) if ((plotW * s) / Math.max(maxM, 1) >= minGap) return s;

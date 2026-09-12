@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, mutations, ApiError, IS_STATIC } from "../api/client";
 import type { BoardResponse, DebateRequestBody, Match, PredictResponse } from "../api/types";
 import { WinChart } from "./WinChart";
@@ -9,7 +9,8 @@ import { ThemeToggle } from "./ThemeToggle";
 import { DebatePanel } from "./DebatePanel";
 import { PreMatch } from "./PreMatch";
 import { T } from "../i18n";
-import { useLivePlayback } from "./useLivePlayback";
+import { useFineTimeline, useLivePlayback } from "./useLivePlayback";
+import { mergeFine } from "./chartKit";
 
 const STATE_CN: Record<string, string> = {
   in_game: "进行中",
@@ -147,6 +148,10 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
   // 比赛进行中 (静态版): 记分板、胜率、走势图末端改用逐帧回放, 见 web/player.ts。
   // 其余情况 shown 就是轮询拿到的那份
   const shown = useLivePlayback(data) ?? data;
+  // 走势图逐秒 (静态版): 历史部分后台补成每秒一个点, 旧局和直播一个样。见 useFineTimeline
+  const fine = useFineTimeline(data);
+  const shownTimeline = shown?.timeline;
+  const timeline = useMemo(() => mergeFine(shownTimeline ?? [], fine), [shownTimeline, fine]);
 
   const teams = data?.match?.teams ?? initial?.teams ?? [];
   const blueName = teams[0]?.model_name ?? teams[0]?.name ?? T("蓝方");
@@ -265,7 +270,8 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
   // 不存在误报。判死活是 stalled 的事, 两者分开。
   if (lv?.stalled) {
     meta.push(T("数据停留在 {n} 分钟前", { n: Math.round(lv.stale_seconds / 60) }));
-  } else if (lv && lv.stale_seconds >= 180) {
+  } else if (lv && lv.game_state !== "finished" && lv.stale_seconds >= 180) {
+    // 打完的局不说: 最后一帧当然越来越旧, 回看第 2 局时写"数据落后约 75 分钟"没有任何意义
     meta.push(T("数据落后约 {n} 分钟", { n: Math.round(lv.stale_seconds / 60) }));
   }
   // hasEarly 时不写 —— 那一段**已经开打了** (只是局内模型还没启用),
@@ -491,12 +497,12 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
           </div>
         )}
 
-        {hasLive && shown && shown.timeline.length > 0 && (
+        {hasLive && shown && timeline.length > 0 && (
           <>
             <section className="panel pad rise d2">
               <h3 className="card-title">{T("胜率走势")}</h3>
               <WinChart
-                series={shown.timeline}
+                series={timeline}
                 pMin={card!.p_min}
                 pMax={card!.p_max}
                 blueName={blueName}
@@ -508,7 +514,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
             </section>
             <section className="panel pad rise d3">
               <h3 className="card-title">{T("经济差")}</h3>
-              <GoldChart series={shown.timeline} blueName={blueName} redName={redName} />
+              <GoldChart series={timeline} blueName={blueName} redName={redName} />
             </section>
           </>
         )}

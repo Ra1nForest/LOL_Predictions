@@ -900,42 +900,109 @@ export class Feed {
     for (const frames of framesets) {
       for (let k = frames.length - 1; k >= 0; k--) {
         const f = frames[k];
-        const b = orObj(f.blueTeam);
-        const r = orObj(f.redTeam);
-        const bg = pget(b, "totalGold", 0);
-        const rg = pget(r, "totalGold", 0);
-        if (!bg && !rg) continue;
+        if (!Feed.hasGold(f)) continue;
         const ts = f.rfc460Timestamp;
         if (!ts || rows.has(ts)) break;
-        const secs = ingameSecs(frameTs(f));
-        const bo = Feed.objectives(b);
-        const ro = Feed.objectives(r);
-        const cs = (t: Json) => pget(t, "participants", []).reduce((s: number, x: Json) => s + pget(x, "creepScore", 0), 0);
-        rows.set(ts, {
-          t: ts,
-          minute: pyRound(secs / 60, 2), // Python 的 round(secs / 60, 2)
-          blue_towers: bo.towers,
-          red_towers: ro.towers,
-          blue_inhibitors: bo.inhibitors,
-          red_inhibitors: ro.inhibitors,
-          blue_barons: bo.barons,
-          red_barons: ro.barons,
-          blue_dragons: bo.dragons,
-          red_dragons: ro.dragons,
-          blue_dragon_types: bo.dragon_types,
-          red_dragon_types: ro.dragon_types,
-          golddiff: bg - rg,
-          blue_gold: bg,
-          red_gold: rg,
-          blue_kills: pget(b, "totalKills", 0),
-          red_kills: pget(r, "totalKills", 0),
-          csdiff: cs(b) - cs(r),
-          state: pget(f, "gameState", ""),
-        });
+        // Python 的 round(secs / 60, 2)
+        rows.set(ts, Feed.timelineRow(f, pyRound(ingameSecs(frameTs(f)) / 60, 2)));
         break;
       }
     }
     return [...rows.values()].sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
+  }
+
+  /** 开局前的空帧两边经济都是 0, 不算数 */
+  private static hasGold(f: Json): boolean {
+    return !!(pget(orObj(f.blueTeam), "totalGold", 0) || pget(orObj(f.redTeam), "totalGold", 0));
+  }
+
+  /** 一帧 → 一行走势 (goldTimeline 和 fineRows 共用) */
+  private static timelineRow(f: Json, minute: number): TimelineRow {
+    const b = orObj(f.blueTeam);
+    const r = orObj(f.redTeam);
+    const bg = pget(b, "totalGold", 0);
+    const rg = pget(r, "totalGold", 0);
+    const bo = Feed.objectives(b);
+    const ro = Feed.objectives(r);
+    const cs = (t: Json) => pget(t, "participants", []).reduce((s: number, x: Json) => s + pget(x, "creepScore", 0), 0);
+    return {
+      t: f.rfc460Timestamp,
+      minute,
+      blue_towers: bo.towers,
+      red_towers: ro.towers,
+      blue_inhibitors: bo.inhibitors,
+      red_inhibitors: ro.inhibitors,
+      blue_barons: bo.barons,
+      red_barons: ro.barons,
+      blue_dragons: bo.dragons,
+      red_dragons: ro.dragons,
+      blue_dragon_types: bo.dragon_types,
+      red_dragon_types: ro.dragon_types,
+      golddiff: bg - rg,
+      blue_gold: bg,
+      red_gold: rg,
+      blue_kills: pget(b, "totalKills", 0),
+      red_kills: pget(r, "totalKills", 0),
+      csdiff: cs(b) - cs(r),
+      state: pget(f, "gameState", ""),
+    };
+  }
+
+  /**
+   * 逐秒的走势行 —— 静态站的走势图用 (board.fineTimeline); 看板本身和 Python 对照的仍是 goldTimeline。
+   *
+   * goldTimeline 每分钟取一个 10 秒窗口、每个窗口只留最后一帧。这里**每个**窗口都取, 窗口里
+   * 每一局内秒留一帧 (上游内容本来就约 1Hz 才变)。35 分钟一局约 210 个窗口, 压缩后每个约 2.3 KB。
+   * 横轴和 goldTimeline 同一个口径: 开局零点起、扣掉暂停 (pauseSpans, 它取的每分钟窗口已在缓存里)。
+   * 从最近的窗口往前一批批取, 每批取完交一次 onBatch —— 图先细化最近那段, 往前慢慢补。
+   */
+  async fineRows(
+    gameId: string,
+    upto: number,
+    onBatch?: (rows: TimelineRow[]) => void,
+    batch = 48,
+  ): Promise<TimelineRow[]> {
+    const start = await this.gameStart(gameId);
+    if (start === null) return [];
+    const now = Date.now();
+    const end = Math.min(upto, now, start + 120 * 60_000);
+    if (!(end > start)) return [];
+    const spans = await this.pauseSpans(gameId, end);
+    const ingameSecs = (ts: number) => {
+      let paused = 0;
+      for (const [b, e] of spans) if (b < ts) paused += Math.max(0, (Math.min(e, ts) - b) / 1000);
+      return (ts - start) / 1000 - paused;
+    };
+
+    const times: number[] = [];
+    for (let t = Math.floor(start / 10_000) * 10_000; t <= end; t += 10_000) times.push(t);
+    const bySec = new Map<number, TimelineRow>();
+    const sorted = () => [...bySec.entries()].sort((a, b) => a[0] - b[0]).map(([, r]) => r);
+    for (let hi = times.length; hi > 0; hi -= batch) {
+      const part = times.slice(Math.max(0, hi - batch), hi);
+      const framesets = await pool(part, POOL, async (tt) => {
+        const settled = (now - tt) / 1000 > 600;
+        // 单个窗口失败只少那 10 秒, 不拖垮整条
+        const p = await this.rawWindow(gameId, Feed.lagged(0, tt), settled ? 3600 : this.windowTtl, this.windowTtl).catch(
+          () => null,
+        );
+        return orArr(orObj(p).frames);
+      });
+      for (const frames of framesets) {
+        for (const f of frames) {
+          if (!Feed.hasGold(f)) continue;
+          const ts = Date.parse(String(f.rfc460Timestamp)); // 毫秒精度, frameTs 只到秒
+          if (!Number.isFinite(ts) || ts > end) continue;
+          const secs = ingameSecs(ts);
+          const k = Math.floor(secs);
+          // 暂停期间局内时间不走, 同一秒的冻结帧只留第一帧
+          if (secs < 0 || bySec.has(k)) continue;
+          bySec.set(k, Feed.timelineRow(f, secs / 60));
+        }
+      }
+      onBatch?.(sorted());
+    }
+    return sorted();
   }
 
   static downsample<T>(rows: T[], n = 60): T[] {

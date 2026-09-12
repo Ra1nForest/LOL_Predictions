@@ -11,9 +11,15 @@
  * 数据直连 lolesports: 两个主机都回 Access-Control-Allow-Origin: *, 流量摊在每个访客
  * 自己的 IP 上 —— 不像服务器版那样, 所有人的请求都从一台机器、一把 key 发出去。
  */
-import type { BoardResponse, MatchListResponse, PredictRequestBody, PredictResponse } from "../api/types.ts";
+import type {
+  BoardResponse,
+  MatchListResponse,
+  PredictRequestBody,
+  PredictResponse,
+  TimelinePoint,
+} from "../api/types.ts";
 import type { Models } from "./board.ts";
-import { buildBoard, liveList, upcomingList } from "./board.ts";
+import { buildBoard, fineTimeline, liveList, upcomingList } from "./board.ts";
 import type { ExplainFile } from "./explain.ts";
 import { Feed } from "./feed.ts";
 import type { IngameModelFile } from "./ingame.ts";
@@ -38,6 +44,8 @@ async function getJSON<T>(name: string): Promise<T> {
 let teamsP: Promise<TeamsFile> | null = null;
 let modelsP: Promise<Models> | null = null;
 let feedP: Promise<Feed> | null = null;
+/** 打完的局的逐秒走势, 按 game_id */
+const fineCache = new Map<string, TimelinePoint[]>();
 
 function teams(): Promise<TeamsFile> {
   teamsP ??= getJSON<TeamsFile>("teams.json").catch((e) => {
@@ -111,6 +119,38 @@ export const staticApi = {
     });
     void player.start();
     return () => player.stop();
+  },
+
+  /**
+   * 逐秒走势 (见 board.fineTimeline): 后台一批批补全, 每补完一批交一次 onPts。
+   * 打完的局整局缓存 —— 局号标签来回切不重取; 直播的局每次重新补到看板最新那一帧。
+   */
+  async fine(board: BoardResponse, onPts: (pts: TimelinePoint[]) => void): Promise<void> {
+    const lv = board.live;
+    const m = board.match;
+    const blue = m?.teams[0]?.model_name;
+    const red = m?.teams[1]?.model_name;
+    if (!lv || !m || !blue || !red || !lv.frame_time) return;
+    const done = lv.game_state === "finished";
+    const hit = done ? fineCache.get(lv.game_id) : undefined;
+    if (hit) {
+      onPts(hit);
+      return;
+    }
+    const [f, t, mo] = await Promise.all([feed(), teams(), models()]);
+    let last: TimelinePoint[] = [];
+    await fineTimeline(
+      f,
+      t,
+      mo,
+      localToday(),
+      { gameId: lv.game_id, blue, red, league: m.league, upto: Date.parse(lv.frame_time) },
+      (pts) => {
+        last = pts as unknown as TimelinePoint[];
+        onPts(last);
+      },
+    );
+    if (done && last.length) fineCache.set(lv.game_id, last);
   },
 
   async predict(body: PredictRequestBody): Promise<PredictResponse> {
