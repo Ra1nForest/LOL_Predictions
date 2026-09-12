@@ -575,10 +575,21 @@ button {
      auto 边距两种情况都靠右。 */
   margin-left: auto;
   text-align: right;
-  flex: none;
+  /* 可以收缩、在自己的宽度里折行。原来是 flex: none —— 宽度锁死在一整行,
+     320px 的屏上 "相比赛前, 局势已向 … 移动 12 个百分点" 有 363px, 把整页撑宽 */
+  flex: 0 1 auto;
+  min-width: 0;
   color: var(--ink-2);
   font-size: 15px;
   letter-spacing: -0.01em;
+}
+/* 手机上两句必然折成上下两行, 这时右对齐会在左边留一大块空 (像缩进了一截),
+   和上一行的结论对不齐 —— 改成跟它一样左对齐 */
+@media (max-width: 620px) {
+  .shift {
+    margin-left: 0;
+    text-align: left;
+  }
 }
 
 /* ── 提示 ─────────────────────────────────────────────────── */
@@ -1436,8 +1447,16 @@ a.cmeta:hover {
   overscroll-behavior-x: contain;
   -webkit-overflow-scrolling: touch;
 }
+/* 宽度取**内容本身要的宽度**, 至少占满容器。
+   早先写死 min-width: 680px —— 按桌面字号估的, 手机上字体和图标一大, 每侧要
+   三百五十来像素, 分到的 1fr 只有 290, 装不下的战绩和饰品就压进了中间那栏,
+   和经济差叠在一起 (2026-09-12 手机截图)。max-content 让每一栏按实际内容撑开,
+   放不下就滑, 永远不会叠。
+   五路各自是独立的 grid, 但都撑满同一个 .sb-body, 模板又相同 (1fr 6em 1fr),
+   所以中轴仍然上下对齐。 */
 .sb-body {
-  min-width: 680px;
+  width: max-content;
+  min-width: 100%;
 }
 /* "可以滑"的提示只在真的放不下时出现 */
 .sb-hint {
@@ -1459,20 +1478,23 @@ a.cmeta:hover {
    它会把名字列压到几十像素, 名字直接截成 "JDG…"。1280px 下量到名字列
    还有 217px、完全放得开, 所以只在**窄屏**收一档。
    断点取 900: 800px 实测就是名字被压没的那个宽度。 */
+/* 选择器都多带一层 .sb: 装备格的基础样式写在这个文件**更后面**, 同样的优先级
+   下后写的赢 —— 不加这一层, 这整段在手机上从来没生效过, 装备一直是 25px
+   (2026-09-12 量到: 每侧 403px 里装备占 200)。 */
 @media (max-width: 900px) {
-  .sb-items img,
-  .sb-items .slot {
+  .sb .sb-items img,
+  .sb .sb-items .slot {
     width: 20px;
     height: 20px;
     border-radius: 4px;
   }
-  .sb-items {
+  .sb .sb-items {
     gap: 2px;
   }
-  .sb-items .trinket {
+  .sb .sb-items .trinket {
     margin-left: 5px;
   }
-  .sb-cell.red .sb-items .trinket {
+  .sb .sb-cell.red .sb-items .trinket {
     margin-right: 5px;
   }
   .sb-who {
@@ -1486,6 +1508,10 @@ a.cmeta:hover {
   margin-bottom: 0;
   flex: none;
 }
+/* "第 1 局"绝不折成两行 —— 折了之后标签变成两层高的胶囊, 很难看 */
+.tab {
+  white-space: nowrap;
+}
 @media (max-width: 620px) {
   /* 挤不下就让顶栏换行, 标签占满第二行 —— 强行同行会把返回按钮压变形 */
   .board-nav {
@@ -1495,6 +1521,14 @@ a.cmeta:hover {
     order: 3;
     width: 100%;
     justify-content: center;
+  }
+  /* 标签平分整行, 内边距和字号跟着屏宽缩: BO5 的五个标签在 320px 宽的屏上
+     每个也有五十来像素, 放得下"第 5 局"一行 */
+  .nav-tabs .tab {
+    flex: 1 1 0;
+    min-width: 0;
+    padding: 6px clamp(2px, 1.5vw, 12px);
+    font-size: clamp(12px, 3.6vw, 13.5px);
   }
 }
 
