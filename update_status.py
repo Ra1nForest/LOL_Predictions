@@ -81,13 +81,39 @@ def record(outcome: str, *, stage: str | None = None, reason: str | None = None,
         "consecutive_failures": 0 if ok else int(prev.get("consecutive_failures") or 0) + 1,
         "last_failure": ({"time": now, "stage": stage, "reason": reason}
                          if not ok else prev.get("last_failure")),
+        # 网站发布那一步在整轮结束之前就记过了 (record_web), 这里原样带上 ——
+        # 不带的话每轮都会把它冲掉
+        "web_publish": prev.get("web_publish"),
     }
+    _write(cur)
+    return cur
+
+
+def record_web(outcome: str, detail: str | None = None) -> dict:
+    """记网站 (GitHub Pages) 那一步: "ok" 或 "failed"。
+
+    和整轮的结局分开记: 它是旁路, 失败不算日更失败 (服务已经在用新模型)。但必须看得见 ——
+    否则网站悄悄停在旧模型上, 而日更每一轮都报成功。
+    """
+    prev = read()
+    now = _now()
+    old = prev.get("web_publish") or {}
+    prev["web_publish"] = {
+        "last_run": now,
+        "outcome": outcome,
+        "detail": detail,
+        "last_success": now if outcome == "ok" else old.get("last_success"),
+    }
+    _write(prev)
+    return prev["web_publish"]
+
+
+def _write(obj: dict) -> None:
     try:
-        STATUS_FILE.write_text(json.dumps(cur, ensure_ascii=False, indent=1),
+        STATUS_FILE.write_text(json.dumps(obj, ensure_ascii=False, indent=1),
                                encoding="utf-8")
     except Exception as e:                        # 写不进去也不能中断日更
         print(f"  (留档写入失败, 不影响更新: {type(e).__name__}: {e})")
-    return cur
 
 
 def _hours_since(ts: str | None) -> float | None:
@@ -133,6 +159,12 @@ def summary() -> dict:
         msg = (f"{msg + ' ' if msg else ''}"
                f"连续失败 {fails} 次, 最近一次停在「{where}」: {why}")
 
+    # 网站发布失败不影响判级 (服务本身是好的), 但要写进提示, 否则没人会知道网站停在旧模型上
+    web = s.get("web_publish") or {}
+    if web.get("outcome") == "failed":
+        msg = (f"{msg + ' ' if msg else ''}"
+               f"网站模型发布失败 ({web.get('last_run')}): {web.get('detail') or '原因未记录'}")
+
     return {
         "level": level,
         "message": msg,
@@ -144,4 +176,5 @@ def summary() -> dict:
         "consecutive_failures": fails,
         # 失败详情始终带上 —— 成功之后也留着, 用来回答"上次是怎么坏的"
         "last_failure": s.get("last_failure"),
+        "web_publish": s.get("web_publish"),
     }

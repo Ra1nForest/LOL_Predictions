@@ -703,6 +703,10 @@ button {
 }
 .stack {
   display: grid;
+  /* 列宽必须显式给 minmax(0, 1fr)。不写的话隐式列是 auto, 会按子元素的最小内容
+     宽度撑开 —— 记分板有 680px 的最小宽度 (手机上靠它横向滑动), 整页于是被撑到
+     七百多像素, 滑动区自己反而不滚。 */
+  grid-template-columns: minmax(0, 1fr);
   gap: clamp(12px, 1.6vw, 20px);
 }
 
@@ -1421,50 +1425,40 @@ a.cmeta:hover {
   color: var(--red);
 }
 
-/* 窄屏: 镜像布局挤不下, 退回上下堆叠, 路名做分隔 */
-@media (max-width: 720px) {
-  .sb-lane {
-    grid-template-columns: 1fr;
-    gap: 6px;
-  }
-  /* 上下堆叠时两行都按同一个方向读, 红方不再镜像 */
-  .sb-cell.red {
-    flex-direction: row;
-  }
-  .sb-cell.red .sb-who,
-  .sb-cell.red .sb-nums {
-    text-align: left;
-  }
-  /* 竖线是给"左中右"三栏用的; 堆叠之后中间那栏横跨整行, 竖线变成了
-     两条突兀的短杠, 改成上下细线当分隔。 */
-  .sb-mid {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    border-left: 0;
-    border-right: 0;
-    border-top: 1px solid var(--hair-2);
-    border-bottom: 1px solid var(--hair-2);
-    margin: 0;
-    padding: 4px 0;
-  }
-  /* 两端对齐用了 nowrap, 挤不下时不能换行 (换行会把落单那项拉到行首,
-     镜像就散了)。所以窄屏改成缩字号和图标, 让五项仍然排得下。 */
-  .sb-team-stats {
-    font-size: 11px;
-    gap: 2px;
-  }
-  .sb-ico {
-    width: 15px;
-    height: 15px;
+/* 窄屏 (手机): **不改布局, 整块左右滑**。
+   早先这里是把镜像的三栏退成上下堆叠 —— 手机上实测挤成一团: 头像、名字、
+   七格装备、战绩全压在三百来像素里, 镜像也没了。现在记分板保持桌面版的布局
+   和一个最小宽度, 放不下就在 .sb-scroll 里横向滚动, 信息和对位关系都不丢。
+   最小宽度按 900px 以下那一档 (20px 装备格, 见下一条) 量的: 两侧各一个头像 +
+   5.5em 名字 + 七格装备 + 战绩, 加中间 6em。 */
+.sb-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+.sb-body {
+  min-width: 680px;
+}
+/* "可以滑"的提示只在真的放不下时出现 */
+.sb-hint {
+  display: none;
+}
+@media (max-width: 760px) {
+  .sb-hint {
+    display: inline;
+    margin-left: 8px;
+    font-size: 11.5px;
+    font-weight: 400;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--ink-3);
   }
 }
 
 /* 七格装备 (六件 + 饰品) 在 25px 下要占 200px。一行只有三百来像素时,
    它会把名字列压到几十像素, 名字直接截成 "JDG…"。1280px 下量到名字列
    还有 217px、完全放得开, 所以只在**窄屏**收一档。
-   断点取 900 而不是跟着上面那条 720: 800px 恰好落在两档中间, 实测就是
-   名字被压没的那个宽度。 */
+   断点取 900: 800px 实测就是名字被压没的那个宽度。 */
 @media (max-width: 900px) {
   .sb-items img,
   .sb-items .slot {

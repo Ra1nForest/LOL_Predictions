@@ -48,68 +48,78 @@ export function Scoreboard({ players, lanes, blue, red, blueName, redName }: Pro
 
   return (
     <section className="panel pad sb">
-      <h3 className="card-title">记分板</h3>
+      <h3 className="card-title">
+        记分板<span className="sb-hint">左右滑动看全部</span>
+      </h3>
 
-      {/* 队伍总览: 资源点分列两边, 中间只留人头比分和经济差。
-          中间那一栏是全场唯一的"合并读数" —— 比分和经济差本来就是双方共有的
-          一个数, 摊到两边反而要自己做减法。 */}
-      <div className="sb-head">
-        <TeamSide o={blue} name={blueName} side="blue" />
-        <div className="sb-head-mid">
-          <div className="sb-score">
-            <b className="blue">{blue.kills}</b>
-            <KillIcon className="sb-kill-ico" />
-            <b className="red">{red.kills}</b>
+      {/* 手机上放不下时**整块左右滑**, 不改布局: 镜像的三栏、七格装备、战绩都保留。
+          早先窄屏会退成上下堆叠, 实测挤成一团、对位关系也没了。
+          队伍总览和五路对位放在同一个滚动区里, 中轴才能一起滑、保持对齐;
+          选手详情浮窗留在滚动区外面, 否则会被 overflow 裁掉。 */}
+      <div className="sb-scroll">
+        <div className="sb-body">
+          {/* 队伍总览: 资源点分列两边, 中间只留人头比分和经济差。
+              中间那一栏是全场唯一的"合并读数" —— 比分和经济差本来就是双方共有的
+              一个数, 摊到两边反而要自己做减法。 */}
+          <div className="sb-head">
+            <TeamSide o={blue} name={blueName} side="blue" />
+            <div className="sb-head-mid">
+              <div className="sb-score">
+                <b className="blue">{blue.kills}</b>
+                <KillIcon className="sb-kill-ico" />
+                <b className="red">{red.kills}</b>
+              </div>
+              {/* 队伍总经济差用 "+xxxx", 颜色是领先方的。这里和下面每一路的
+                  箭头写法**故意不同**: 这一处只有一个数、位置固定在正中,
+                  加号已经够清楚; 而逐路那五行要在一眼之内分辨方向, 箭头比
+                  正负号快。 */}
+              <div
+                className={`sb-golddiff${
+                  blue.gold > red.gold ? " blue" : red.gold > blue.gold ? " red" : ""
+                }`}
+              >
+                {blue.gold === red.gold
+                  ? "经济持平"
+                  : `+${Math.abs(blue.gold - red.gold).toLocaleString()}`}
+              </div>
+            </div>
+            <TeamSide o={red} name={redName} side="red" />
           </div>
-          {/* 队伍总经济差用 "+xxxx", 颜色是领先方的。这里和下面每一路的
-              箭头写法**故意不同**: 这一处只有一个数、位置固定在正中,
-              加号已经够清楚; 而逐路那五行要在一眼之内分辨方向, 箭头比
-              正负号快。 */}
-          <div
-            className={`sb-golddiff${
-              blue.gold > red.gold ? " blue" : red.gold > blue.gold ? " red" : ""
-            }`}
-          >
-            {blue.gold === red.gold
-              ? "经济持平"
-              : `+${Math.abs(blue.gold - red.gold).toLocaleString()}`}
+
+          {/* 五路对位 */}
+          <div className="sb-lanes">
+            {LANE_ORDER.map((lane) => {
+              const b = bs.find((p) => norm(p.role) === lane);
+              const r = rs.find((p) => norm(p.role) === lane);
+              if (!b && !r) return null;
+              const gap = laneOf.get(lane);
+              const d = gap?.gold_diff ?? 0;
+              return (
+                <div className="sb-lane" key={lane}>
+                  <PlayerCell p={b} side="blue" onOpen={setOpenPid} openPid={openPid} />
+                  {/* 中间只留经济差。位置名 (上单/打野…) 删掉了 —— 五行的顺序
+                      本来就是固定的上中野下辅, 而两边头像和英雄名已经说明了是谁。
+                      箭头**指向领先的一方**: 蓝方领先就 "‹ 1,751", 红方就
+                      "1,751 ›"。方向 + 颜色两重编码同一件事, 扫一眼就知道
+                      这一路是谁在压制, 不用先读符号再想正负是谁。 */}
+                  <div className="sb-mid">
+                    {gap &&
+                      (d === 0 ? (
+                        <div className="sb-gap">持平</div>
+                      ) : (
+                        <div className={`sb-gap ${d > 0 ? "blue" : "red"}`}>
+                          {d > 0 && <i className="arw">‹</i>}
+                          {Math.abs(d).toLocaleString()}
+                          {d < 0 && <i className="arw">›</i>}
+                        </div>
+                      ))}
+                  </div>
+                  <PlayerCell p={r} side="red" onOpen={setOpenPid} openPid={openPid} />
+                </div>
+              );
+            })}
           </div>
         </div>
-        <TeamSide o={red} name={redName} side="red" />
-      </div>
-
-      {/* 五路对位 */}
-      <div className="sb-lanes">
-        {LANE_ORDER.map((lane) => {
-          const b = bs.find((p) => norm(p.role) === lane);
-          const r = rs.find((p) => norm(p.role) === lane);
-          if (!b && !r) return null;
-          const gap = laneOf.get(lane);
-          const d = gap?.gold_diff ?? 0;
-          return (
-            <div className="sb-lane" key={lane}>
-              <PlayerCell p={b} side="blue" onOpen={setOpenPid} openPid={openPid} />
-              {/* 中间只留经济差。位置名 (上单/打野…) 删掉了 —— 五行的顺序
-                  本来就是固定的上中野下辅, 而两边头像和英雄名已经说明了是谁。
-                  箭头**指向领先的一方**: 蓝方领先就 "‹ 1,751", 红方就
-                  "1,751 ›"。方向 + 颜色两重编码同一件事, 扫一眼就知道
-                  这一路是谁在压制, 不用先读符号再想正负是谁。 */}
-              <div className="sb-mid">
-                {gap &&
-                  (d === 0 ? (
-                    <div className="sb-gap">持平</div>
-                  ) : (
-                    <div className={`sb-gap ${d > 0 ? "blue" : "red"}`}>
-                      {d > 0 && <i className="arw">‹</i>}
-                      {Math.abs(d).toLocaleString()}
-                      {d < 0 && <i className="arw">›</i>}
-                    </div>
-                  ))}
-              </div>
-              <PlayerCell p={r} side="red" onOpen={setOpenPid} openPid={openPid} />
-            </div>
-          );
-        })}
       </div>
 
       {/* 详情**覆盖在计分板上**, 不再往下顶开一块。

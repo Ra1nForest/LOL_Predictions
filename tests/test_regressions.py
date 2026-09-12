@@ -456,8 +456,95 @@ class TestClockCalibration(unittest.TestCase):
             "blueTeam": {"totalGold": 9999}, "redTeam": {"totalGold": 9999}}]}
         f._lagged = EsportsFeed._lagged
         f._ts = EsportsFeed._ts
+        # 不设的话 grab 里读 window_ttl 抛 AttributeError, 被 _calibrate_start 的
+        # except 吞成 None —— 测试照样绿, 测的却不是合理性闸
+        f.window_ttl = 3
         got = f._calibrate_start("g", raw)
         self.assertIsNone(got, "零点算到 frames[0] 之后 9 分钟, 必须拒绝")
+
+
+class TestGameStartRetry(unittest.TestCase):
+    """坑: 第一次看到一局就校准开局零点, 那时要用的窗口还没发布, 校准失败退回
+    frames[0] —— 而这个退回值和成功结果一样进了长缓存, 整局分钟数偏 8~20 秒,
+    采集快照的分钟标签跟着偏 (2026-09-12: 在跑的服务说第 36 分钟, 全新进程说 35)。
+    浏览器版 frontend/src/web/feed.ts 的 gameStart 是同一套逻辑, 改一边要改另一边。
+    """
+
+    def _feed(self, raw, result):
+        import threading
+        from esports_feed import EsportsFeed
+        f = EsportsFeed.__new__(EsportsFeed)
+        f._starts, f._start_retry, f._obs = {}, {}, {"g": {0: ("旧零点下的观测",)}}
+        f._lock = threading.Lock()
+        f._window = lambda *a, **k: {"frames": [
+            {"rfc460Timestamp": raw.strftime("%Y-%m-%dT%H:%M:%S.000Z")}]}
+        f._ts = EsportsFeed._ts
+        calls = []
+
+        def cal(gid, r):
+            calls.append(r)
+            return result[0]
+        f._calibrate_start = cal
+        return f, calls
+
+    def test_young_game_failed_calibration_is_retried_not_cached(self):
+        raw = (datetime.now(timezone.utc) - timedelta(seconds=90)).replace(microsecond=0)
+        result = [None]
+        f, calls = self._feed(raw, result)
+        self.assertEqual(f._game_start("g"), raw, "失败时先用 frames[0] 顶着")
+        self.assertNotIn("g", f._starts, "开局才 90 秒, 校准失败只说明窗口还没发布, 不能进长缓存")
+        f._game_start("g")
+        self.assertEqual(len(calls), 1, "失败后 START_RETRY_SEC 之内不该重算")
+
+        f._start_retry["g"] = 0                    # 快进到可以重试
+        result[0] = raw - timedelta(seconds=19)
+        self.assertEqual(f._game_start("g"), raw - timedelta(seconds=19))
+        self.assertEqual(f._starts["g"], raw - timedelta(seconds=19))
+        self.assertNotIn("g", f._obs, "按旧零点分桶的暂停观测必须作废")
+
+    def test_settled_game_failed_calibration_is_cached(self):
+        raw = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0)
+        f, calls = self._feed(raw, [None])
+        self.assertEqual(f._game_start("g"), raw)
+        self.assertEqual(f._starts.get("g"), raw, "窗口早已定型还校不了, 就认定这一局校不了")
+        f._game_start("g")
+        self.assertEqual(len(calls), 1)
+
+
+class TestChildProcessEncoding(unittest.TestCase):
+    """坑: 子进程的 stdout 是管道时, 中文 Windows 上按 GBK 写, daily_update 按 UTF-8 读 ——
+    fetch_data 打印的"已更新"读回来是乱码, 于是每次都判成"数据没有变化"。本机日更
+    2026-09-04 起一次没重训过, 日志每轮都是成功。
+    """
+
+    def test_child_chinese_output_reads_back(self):
+        enc = getattr(sys.stdout, "encoding", None)
+        import daily_update                         # 导入时会把本进程 stdout 改成 UTF-8
+        if enc and hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding=enc)    # 改回来, 别弄乱测试输出
+        rc, out = daily_update.run([sys.executable, "-c", "print('已更新')"], timeout=60)
+        self.assertEqual(rc, 0)
+        self.assertIn("已更新", out, "子进程的中文输出读回来必须还是中文")
+
+
+class TestWebPublishStatus(unittest.TestCase):
+    """坑: 网站发布是日更的旁路, 它的结果如果被整轮的 record() 冲掉, 网站停在旧模型上
+    就又成了静默故障。"""
+
+    def test_record_keeps_web_publish(self):
+        import tempfile
+        import update_status
+        old = update_status.STATUS_FILE
+        with tempfile.TemporaryDirectory() as d:
+            update_status.STATUS_FILE = Path(d) / "s.json"
+            try:
+                update_status.record_web("failed", "对账没过")
+                update_status.record("ok", fetch_ok=True, exit_code=0)
+                s = update_status.summary()
+                self.assertEqual((s.get("web_publish") or {}).get("outcome"), "failed")
+                self.assertIn("网站", s.get("message") or "", "网站发布失败必须出现在 /health 的提示里")
+            finally:
+                update_status.STATUS_FILE = old
 
 
 class TestBackfillJoin(unittest.TestCase):

@@ -45,7 +45,15 @@ npm --prefix frontend run test:golden     # browser models vs Python, bit-for-bi
 npm --prefix frontend run test:diff       # browser board vs a fresh Python process, finished games
 npm --prefix frontend run dev:pages       # :5174
 npm --prefix frontend run build:pages     # -> dist-pages/
+python tools/publish_web.py               # export + test:golden + commit/push frontend/public/web only
 ```
+
+The site is https://ra1nforest.github.io/LOL_Predictions/ (repo `Ra1nForest/LOL_Predictions`,
+public). `.github/workflows/pages.yml` rebuilds it on every push that touches `frontend/`. The local
+`LoL-Update` scheduled task runs `daily_update.py --publish-web`, which calls `tools/publish_web.py`
+after a successful model swap; the outcome lands in `update_status.json` → `web_publish` and in
+`/health`. It only ever commits `frontend/public/web/`, and refuses to push if any other local
+commit is unpushed or the remote is ahead — it is an unattended push to a public repo.
 
 One class or one test (test method names are Chinese, so `-k` on the class is usually easier):
 
@@ -190,6 +198,15 @@ guards. If one goes red, work out whether that trap is back before changing the 
   score the model. A diff run against the live service wrote four such rows on 2026-09-12
   (removed; backup `log.jsonl.bak-before-cleanup-*`). `tools/board_oracle.py` replaces
   `log_prediction` with a no-op for exactly this reason.
+- **`daily_update.run()` forces `PYTHONIOENCODING=utf-8` on its children.** On Chinese Windows a
+  piped child writes GBK; read back as UTF-8, `fetch_data.py`'s "已更新" never matched, so every
+  local run from 2026-09-04 reported "数据没有变化" and never retrained — and every run logged
+  success. The same garbling makes the `games` / `个快照` parse fail, which silently skips the
+  gate's minimum-count checks.
+- **A failed start calibration is not a result.** `_game_start` (and `gameStart` in
+  `frontend/src/web/feed.ts`) retries every `START_RETRY_SEC` until the calibration windows have
+  settled; only then does it accept `frames[0]`. Caching the first-sight failure put every live
+  minute and every collected snapshot label 8–20 s off for the whole game.
 
 ## Conventions
 

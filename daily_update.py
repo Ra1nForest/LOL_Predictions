@@ -6,6 +6,8 @@
     python daily_update.py            完整流程
     python daily_update.py --dry-run  只拉数据和训练, 不换不重启
     python daily_update.py --force    数据没变也强制重训
+    python daily_update.py --publish-web   换上新模型后顺带更新 GitHub Pages 网站 (本机用,
+                                           见 tools/publish_web.py)
 
 设计前提: 没有人会看日志
 -------------------------
@@ -74,6 +76,12 @@ def log(msg=""):
 
 def run(cmd, env=None, timeout=3600) -> tuple[int, str]:
     e = dict(os.environ)
+    # 子进程的 stdout 是管道时, Python 按系统 ANSI 编码写 —— 中文 Windows 上是 GBK。
+    # 而这里按 UTF-8 读, 于是 fetch_data 打印的"已更新"读回来是乱码, `"已更新" in out`
+    # 永远不成立, 每次都判成"数据没有变化"。本机日更 2026-09-04 起就这样一次没重训过,
+    # 日志上每一轮都是成功。train.py 的"N games"/"个快照"同样解析不出来 —— 那会让
+    # 过闸里的场次下限检查悄悄跳过。所以子进程一律强制 UTF-8 输出。
+    e["PYTHONIOENCODING"] = "utf-8"
     if env:
         e.update(env)
     # Windows: 不加 CREATE_NO_WINDOW 的话, 每个子进程 (train.py /
@@ -218,12 +226,41 @@ def _tail_reason(out: str, n: int = 2) -> str:
     return " / ".join(lines[-n:])[:400] if lines else "无输出"
 
 
+def _publish_web(a) -> None:
+    """新模型上线后, 把网站 (GitHub Pages) 用的那一份也更新掉。
+
+    旁路: 失败不改变日更的结局 —— 服务已经在用新模型了。但结果必须留档
+    (update_status 的 web_publish, /health 里看得见), 否则网站会悄悄停在旧模型上,
+    而日志每一轮都写着成功 —— 正是 update_status 模块注释里说的那种静默故障。
+    """
+    if not a.publish_web:
+        return
+    log("[+] 发布网站模型 (tools/publish_web.py)")
+    try:
+        rc, out = run([PY, "tools/publish_web.py"], timeout=3600)
+    except subprocess.TimeoutExpired:
+        rc, out = 1, "结果: 失败 —— 一小时没跑完"
+    for line in out.strip().splitlines():
+        log(f"      {line}")
+    said = next((l.split("结果:", 1)[1].strip() for l in reversed(out.splitlines())
+                 if l.startswith("结果:")), None)
+    try:
+        import update_status
+        update_status.record_web("ok" if rc == 0 else "failed", said or _tail_reason(out))
+    except Exception as e:
+        log(f"      (网站发布留档失败: {type(e).__name__}: {e})")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="不换不重启")
     ap.add_argument("--force", action="store_true", help="数据没变也重训")
     ap.add_argument("--service", default="lol-predict", help="systemd 单元名 (Windows 上是计划任务名)")
     ap.add_argument("--no-restart", action="store_true", help="换了但不重启服务")
+    ap.add_argument("--no-fetch", action="store_true",
+                    help="不拉数据, 直接用本地现有 CSV 重训 (Drive 配额满 / OAuth 失效时用)")
+    ap.add_argument("--publish-web", action="store_true",
+                    help="换上新模型后导出网站模型并推到 GitHub Pages (只在本机用)")
     a = ap.parse_args()
 
     code, stage, reason, fetch_ok = _pipeline(a)
@@ -253,19 +290,26 @@ def _pipeline(a) -> tuple[int, str | None, str | None, bool]:
     log("=" * 66)
 
     # 1. 拉数据
-    log("[1/5] 拉取数据")
-    rc, out = run([PY, "fetch_data.py", "--retry", "3"], timeout=7200)
-    for line in out.strip().splitlines():
-        log(f"      {line}")
-    if rc != 0 and "已更新" not in out:
-        log("      拉取失败, 且没有任何文件更新 —— 本次到此为止, 线上不动")
-        return 1, "拉取数据", (_oauth_hint(out) or _tail_reason(out)), False
-    changed = "已更新" in out
-    if not changed and not a.force:
-        log("      数据没有变化, 不需要重训。")
-        # 拉取本身是成功的 —— 这一点必须记下来, 它是判断"连不连得上上游"的
-        # 唯一证据。上游没有新数据和我们连不上上游, 结局都是"不重训"。
-        return 0, None, None, True
+    fetched = True
+    if a.no_fetch:
+        # Drive 配额被打满、OAuth token 失效 (每 7 天一次) 时, 仍能用本地已有的 CSV
+        # 重训。但**不能记成拉取成功** —— 那是判断"连不连得上上游"的唯一证据。
+        log("[1/5] 跳过拉取 (--no-fetch), 用本地现有 CSV 重训")
+        fetched = False
+    else:
+        log("[1/5] 拉取数据")
+        rc, out = run([PY, "fetch_data.py", "--retry", "3"], timeout=7200)
+        for line in out.strip().splitlines():
+            log(f"      {line}")
+        if rc != 0 and "已更新" not in out:
+            log("      拉取失败, 且没有任何文件更新 —— 本次到此为止, 线上不动")
+            return 1, "拉取数据", (_oauth_hint(out) or _tail_reason(out)), False
+        changed = "已更新" in out
+        if not changed and not a.force:
+            log("      数据没有变化, 不需要重训。")
+            # 拉取本身是成功的 —— 这一点必须记下来, 它是判断"连不连得上上游"的
+            # 唯一证据。上游没有新数据和我们连不上上游, 结局都是"不重训"。
+            return 0, None, None, fetched
 
     # 2. 训到暂存
     log("[2/5] 训练到暂存目录 (不碰线上 artifacts/)")
@@ -282,7 +326,7 @@ def _pipeline(a) -> tuple[int, str | None, str | None, bool]:
             log(f"      {script} 失败 (rc={rc}), 线上保持不变:")
             for line in out.strip().splitlines()[-15:]:
                 log(f"        {line}")
-            return 1, f"训练 ({script})", _tail_reason(out), True
+            return 1, f"训练 ({script})", _tail_reason(out), fetched
         for line in out.splitlines():
             s = line.strip()
             if s.endswith("games"):
@@ -303,12 +347,12 @@ def _pipeline(a) -> tuple[int, str | None, str | None, bool]:
         for r in reasons:
             log(f"        · {r}")
         log(f"      新模型留在 {STAGING.name}/ 供人工查看, 没有被丢弃。")
-        return 2, "指标过闸", "; ".join(reasons)[:400], True
+        return 2, "指标过闸", "; ".join(reasons)[:400], fetched
     log("      ✓ 过闸")
 
     if a.dry_run:
         log("[4/5] --dry-run: 不替换, 不重启")
-        return 0, None, None, True
+        return 0, None, None, fetched
 
     # 4. 原子替换
     # 预测留档的结果回填 —— 必须放在数据刷新之后: 比赛打完当天 OE 还没收录,
@@ -334,7 +378,8 @@ def _pipeline(a) -> tuple[int, str | None, str | None, bool]:
     # 5. 重启 + 探活
     if a.no_restart:
         log("[5/5] --no-restart: 跳过")
-        return 0, None, None, True
+        _publish_web(a)
+        return 0, None, None, fetched
 
     # 服务可能压根没装 (本项目就有过这种状态: unit 文件不存在、8000 端口
     # 无监听)。那不算失败 —— 新模型已经就位, 下次服务起来自然会加载。
@@ -342,7 +387,8 @@ def _pipeline(a) -> tuple[int, str | None, str | None, bool]:
         log(f"[5/5] 系统里没有 {a.service} 这个服务/任务, 跳过重启。")
         log("      新模型已就位; 服务启动时会加载它。")
         log("      注意: 服务此刻仍在用旧模型, 直到它下次启动。")
-        return 0, None, None, True
+        _publish_web(a)
+        return 0, None, None, fetched
 
     log(f"[5/5] 重启 {a.service} 并探活")
     rc, out = service_restart(a.service)
@@ -350,14 +396,15 @@ def _pipeline(a) -> tuple[int, str | None, str | None, bool]:
         log(f"      重启失败: {out.strip()[:300]}")
         # 这一条格外要紧: artifacts 已经换了, 进程内存里还是旧的 —— 服务器上
         # 就这么静默跑了十天旧模型 (见文件上方"重启与探活"那段注释)。
-        return 3, "重启服务", f"{_tail_reason(out)} —— artifacts 已替换但服务没重启, 线上仍在用旧模型", True
+        return 3, "重启服务", f"{_tail_reason(out)} —— artifacts 已替换但服务没重启, 线上仍在用旧模型", fetched
 
     for i in range(60):
         time.sleep(5)
         if health_ok():
             log(f"      服务已就绪 (约 {(i+1)*5} 秒)")
+            _publish_web(a)
             log("完成。")
-            return 0, None, None, True
+            return 0, None, None, fetched
     # 起不来 -> 回滚
     log("      探活超时, 回滚到上一版 artifacts")
     for f in ARTIFACT_FILES:
@@ -365,7 +412,7 @@ def _pipeline(a) -> tuple[int, str | None, str | None, bool]:
             shutil.copy2(backup / f, ART / f)
     service_restart(a.service)
     log("      已回滚并重启。请人工检查。")
-    return 4, "重启后探活", "新模型换上后服务起不来, 已回滚到上一版 artifacts", True
+    return 4, "重启后探活", "新模型换上后服务起不来, 已回滚到上一版 artifacts", fetched
 
 
 if __name__ == "__main__":

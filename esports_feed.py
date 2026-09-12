@@ -268,6 +268,7 @@ class EsportsFeed:
         self.retries = retries
         self._cache: dict[str, tuple[float, object]] = {}
         self._starts: dict[str, datetime] = {}      # gameId -> 开局时刻
+        self._start_retry: dict[str, float] = {}    # gameId -> 校准失败后何时再试 (见 _game_start)
         # gameId -> {第几分钟 -> (窗口时刻, 首帧时刻, 末帧时刻, 是否冻结)}
         # 缓存**逐窗观测**而不是算完的暂停区间: 观测一旦定型就不会再变, 于是
         # 每次只需补扫新增的那几分钟, 区间由观测现算 (纯 CPU, 几十项而已)。
@@ -463,6 +464,15 @@ class EsportsFeed:
         (实测: 已结束的比赛也一样, 拿到的是 20:08 开局帧、经济 0/0、
         gameState 还停在当时的 in_game)。所以取 frames[0] 即开局时刻,
         一个请求就够 —— 早先那版在这里做了七次二分, 属于白费。
+
+        **校准失败不能当成结果长缓存。** 服务第一次看到一局通常在开打后一两分钟,
+        校准要用的那批窗口 (开局后 0~CALIB_SPAN_SEC 秒) 那时多半还没发布完, 校准
+        失败、退回 frames[0]。早先这个退回值和成功的结果一样进了 _starts, 整局就
+        一直按 frames[0] 算: 分钟数偏 8~20 秒, collect_live 采到的快照分钟标签跟着
+        偏 (2026-09-12 差分测试查出: 在跑的服务说 GX vs NAVI 第 3 局第 36 分钟,
+        全新进程说第 35 分钟)。
+        现在失败时先用 frames[0] 顶着但不缓存, 每 START_RETRY_SEC 秒再试一次;
+        那批窗口全部定型之后还失败, 才认定这一局确实校不了, 缓存 frames[0]。
         """
         if game_id in self._starts:
             return self._starts[game_id]
@@ -471,8 +481,20 @@ class EsportsFeed:
         if not frames:
             return None
         raw = self._ts(frames[0])
-        start = self._calibrate_start(game_id, raw) or raw
+        now = time.time()
+        if now < self._start_retry.get(game_id, 0):
+            return raw                     # 刚试过没成, 先用 frames[0] 顶着
+        start = self._calibrate_start(game_id, raw)
+        if start is None:
+            if now - raw.timestamp() <= self.CALIB_SPAN_SEC + self.OBS_SETTLE_SEC:
+                self._start_retry[game_id] = now + self.START_RETRY_SEC
+                return raw
+            start = raw                    # 窗口都定型了还算不出来: 这一局确实校不了
         self._starts[game_id] = start
+        if self._start_retry.pop(game_id, None) is not None:
+            # 此前一直按 frames[0] 算, 暂停观测是按旧零点分的桶, 作废重扫
+            with self._lock:
+                self._obs.pop(game_id, None)
         return start
 
     # 队伍累计金币: 开局 5×500 = 2500, 之后第一次超过 2500 的时刻记作
@@ -487,6 +509,10 @@ class EsportsFeed:
     # 校准本身仍然只用金币, 因为直播时拿不到局长; 局长只用来定这个常数。
     START_GOLD = 2500
     FIRST_INCOME_SEC = 33
+    # 校准扫开局后 0~CALIB_SPAN_SEC 秒的窗口。这批窗口全部定型 (落后现在超过
+    # OBS_SETTLE_SEC) 之前, 校准失败只说明"还没发布", 不说明"校不了"。
+    CALIB_SPAN_SEC = 180
+    START_RETRY_SEC = 30       # 还没定型时, 失败后隔多久再试
 
     def _calibrate_start(self, game_id: str,
                          raw: datetime) -> Optional[datetime]:
@@ -501,14 +527,20 @@ class EsportsFeed:
         窗口本身只能按 10 秒对齐请求, 但**一个窗口里有三四十帧、间隔 0.2 秒**,
         所以命中的时刻是亚秒级精度, 不受 10 秒粒度限制。
 
-        整局只算一次 (结果进 _starts 长缓存), 并行发出。算不出来就返回 None,
-        由调用方退回 frames[0] —— 宁可沿用旧口径, 不要瞎调。
+        算成功一次就进 _starts 长缓存, 并行发出。算不出来就返回 None, 由调用方
+        决定是稍后重试还是退回 frames[0] (见 _game_start) —— 宁可沿用旧口径,
+        不要瞎调。
         """
-        times = [raw + timedelta(seconds=s) for s in range(0, 180, 10)]
+        times = [raw + timedelta(seconds=s) for s in range(0, self.CALIB_SPAN_SEC, 10)]
+        now = datetime.now(timezone.utc)
 
         def grab(t):
+            # 还没定型的窗口只短缓存: 看得太早时它是空的或帧不全, 按一小时缓存的话,
+            # _game_start 之后每次重试拿回的都是同一批空结果, 重试形同虚设
+            settled = (now - t).total_seconds() > self.OBS_SETTLE_SEC
             return (self._window(game_id, self._lagged(0, t),
-                                 ttl=3600) or {}).get("frames") or []
+                                 ttl=3600 if settled else self.window_ttl,
+                                 empty_ttl=self.window_ttl) or {}).get("frames") or []
 
         try:
             with ThreadPoolExecutor(max_workers=min(8, len(times))) as ex:

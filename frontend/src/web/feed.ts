@@ -37,6 +37,9 @@ const LAG_STEPS = [20, 30, 40, 50, 60, 90, 120, 150, 210, 300];
 const FALLBACK_LAGS = [60, 90, 120, 150, 210, 300];
 const START_GOLD = 2500;
 const FIRST_INCOME_SEC = 33;
+// 见 esports_feed.CALIB_SPAN_SEC / START_RETRY_SEC: 那批窗口定型前, 校准失败只说明"还没发布"
+const CALIB_SPAN_SEC = 180;
+const START_RETRY_SEC = 30;
 const FREEZE_SLACK = 5;
 const PLAY_GOLD_BASE = 1000;
 const PLAY_GOLD_PER_MIN = 800;
@@ -234,6 +237,7 @@ export class Feed {
   private inflight = new Map<string, Promise<Json>>();
   private writes = 0;
   private starts = new Map<string, number>();
+  private startRetry = new Map<string, number>();
   private obs = new Map<string, Map<number, Obs>>();
   private meta = new Map<string, Map<number, MetaEntry>>();
   private noFrames = new Map<string, number>();
@@ -391,7 +395,11 @@ export class Feed {
     };
   }
 
-  /** _game_start: 开局时刻。赛程的 startTime 是转播时间, 不能用。 */
+  /**
+   * _game_start: 开局时刻。赛程的 startTime 是转播时间, 不能用。
+   * 校准失败而那批窗口还没定型时, 先用 frames[0] 顶着但不缓存, 隔 START_RETRY_SEC
+   * 再试 —— 失败的退回值进长缓存会让整局分钟数偏 8~20 秒 (见 esports_feed._game_start)。
+   */
   async gameStart(gameId: string): Promise<number | null> {
     const cached = this.starts.get(gameId);
     if (cached !== undefined) return cached;
@@ -399,19 +407,34 @@ export class Feed {
     const frames = orArr(orObj(p).frames);
     if (!frames.length) return null;
     const raw = frameTs(frames[0]);
-    const start = (await this.calibrateStart(gameId, raw)) ?? raw;
+    const now = Date.now();
+    if (now < (this.startRetry.get(gameId) ?? 0)) return raw;
+    let start = await this.calibrateStart(gameId, raw);
+    if (start === null) {
+      if ((now - raw) / 1000 <= CALIB_SPAN_SEC + OBS_SETTLE_SEC) {
+        this.startRetry.set(gameId, now + START_RETRY_SEC * 1000);
+        return raw;
+      }
+      start = raw; // 窗口都定型了还算不出来: 这一局确实校不了
+    }
     this.starts.set(gameId, start);
+    // 此前一直按 frames[0] 算, 暂停观测是按旧零点分的桶, 作废重扫
+    if (this.startRetry.delete(gameId)) this.obs.delete(gameId);
     return start;
   }
 
   /** _calibrate_start: 零点校到游戏内 0:00 —— 靠"队伍金币第一次超过 2500"的那一帧 */
   private async calibrateStart(gameId: string, raw: number): Promise<number | null> {
-    const times = Array.from({ length: 18 }, (_, i) => raw + i * 10_000);
+    const times = Array.from({ length: CALIB_SPAN_SEC / 10 }, (_, i) => raw + i * 10_000);
+    const now = Date.now();
     let batches: Json[][];
     try {
-      batches = await pool(times, POOL, async (t) =>
-        orArr(orObj(await this.rawWindow(gameId, Feed.lagged(0, t), 3600)).frames),
-      );
+      batches = await pool(times, POOL, async (t) => {
+        // 还没定型的窗口只短缓存, 否则重试拿回的都是同一批空结果
+        const settled = (now - t) / 1000 > OBS_SETTLE_SEC;
+        const p = await this.rawWindow(gameId, Feed.lagged(0, t), settled ? 3600 : this.windowTtl, this.windowTtl);
+        return orArr(orObj(p).frames);
+      });
     } catch {
       return null;
     }
