@@ -7,6 +7,10 @@
     <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
     <title>胜率预测 · LoL</title>
+    <!-- 标签页图标: 圆角方块按胜率条的样子斜分蓝红两方, 叠一条白色走势线。
+         内嵌成 data URI 而不是放进 public/ —— 服务器版构建不带 public 目录 (见 vite.config.ts),
+         内嵌才能两种构建都有。颜色取 styles.css 的 --blue / --red, 深色模式换成深色版那两个值。 -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cstyle%3E.b%7Bfill:%230071e3%7D.r%7Bfill:%23d92b1c%7D@media (prefers-color-scheme:dark)%7B.b%7Bfill:%232997ff%7D.r%7Bfill:%23ff453a%7D%7D%3C/style%3E%3CclipPath id='t'%3E%3Crect width='32' height='32' rx='7'/%3E%3C/clipPath%3E%3Cg clip-path='url(%23t)'%3E%3Crect class='r' width='32' height='32'/%3E%3Cpath class='b' d='M0 0h20l-8 32H0z'/%3E%3C/g%3E%3Cpath d='M5.5 22.5 11 17l4.5 3L26.5 8.5' fill='none' stroke='%23fff' stroke-width='3.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
   </head>
   <body>
     <div id="root"></div>
