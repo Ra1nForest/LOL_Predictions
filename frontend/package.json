@@ -1,0 +1,29 @@
+{
+  "name": "lol-predict-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "node scripts/check-css-vars.mjs && tsc -b && node scripts/clean-assets.mjs && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit",
+    "check:css": "node scripts/check-css-vars.mjs",
+    "test:golden": "node scripts/golden.mjs",
+    "dev:pages": "vite --mode pages",
+    "build:pages": "node scripts/check-css-vars.mjs && tsc -b && vite build --mode pages",
+    "test:diff": "node scripts/diff-board.mjs"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^7.0.0"
+  }
+}

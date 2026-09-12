@@ -1,0 +1,17 @@
+[Unit]
+Description=Sample live LoL games every 2 minutes for late-game training data
+
+[Timer]
+# 每 2 分钟一轮。比赛时长中位数 32 分钟, 这个频率每局能采到十几个点,
+# 足够覆盖 25 分钟之后的空白; 再密就是在同一分钟里重复采。
+OnBootSec=3min
+OnUnitActiveSec=2min
+
+# 没有比赛时一轮只是两三个 HTTP 请求, 空跑代价很小, 不做时段限制 ——
+# 四个赛区分布在不同时区, 掐时段反而会漏。
+AccuracySec=20s
+
+Unit=lol-collect.service
+
+[Install]
+WantedBy=timers.target

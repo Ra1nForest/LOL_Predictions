@@ -1,0 +1,54 @@
+# 仓库是公开的。凡是"不小心推上去就收不回来"的东西都挡在这里 ——
+# git 历史是永久的, 事后删文件只删得掉最新版本。
+
+# Google 凭据 —— 绝不能进版本库
+google_credentials.json
+google_token.json
+
+# 服务端环境变量 (NVIDIA / Tavily key) 和任何密钥文件
+service.env
+.env
+*.key
+*.pem
+
+# 数据, 不是代码, 而且太大 (data/ 近 400 MB)。
+# 静态站要的只是 frontend/public/web/ 下导出的那几个 JSON, 它们照常提交
+data/
+collected/
+backfill/
+predictions/
+logs/
+_server_sync/
+research/*.jsonl
+
+# 模型产物: 服务器自己训练、daily_update.py 自己换, 不经仓库部署
+artifacts/
+artifacts_staging/
+artifacts_prev/
+artifacts_prev_leaguemix/
+
+# 运行时状态和临时文件 (update_status.json 由日更每天改写两次)
+update_status.json
+_sync_plan.json
+lp.json
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.tmp
+
+# 前端依赖和构建产物
+frontend/node_modules/
+frontend/dist/
+dist-pages/
+static/index.html
+static/assets/
+*.tsbuildinfo
+
+# 黄金测试样本 (~6 MB, 每次导出都整份重写): 在本机导出时比对, 不进仓库
+frontend/scripts/golden/
+
+# 个人工具配置
+.claude/

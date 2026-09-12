@@ -1,0 +1,26 @@
+[Unit]
+Description=Run the LoL prediction data refresh twice a day
+
+[Timer]
+# 一天两次: 正午和午夜 (UTC)。
+#
+# Oracle's Elixir 的文件一天只更新一次, 所以两次里必有一次是白跑 —— 但代价
+# 很小 (下载 + 重训约五分钟), 换来的是"哪次更新赶上了就早半天用上新数据",
+# 而不是固定要等到第二天中午。
+#
+# 时间点的选择和四大赛区的比赛时间错开:
+#   LCK/LPL 的比赛在 UTC 白天, LEC/LCS 在 UTC 夜里 —— 12:00 和 00:00 都是
+#   两边的空档, 重训时不会和实时跟播抢资源。
+OnCalendar=*-*-* 00:00:00 UTC
+OnCalendar=*-*-* 12:00:00 UTC
+
+# 服务器关机错过了的话, 开机后补一次
+Persistent=true
+
+# 和全机其他定时任务错开, 别同时惊群; 顺带避免两次更新卡在同一分钟
+RandomizedDelaySec=1800
+
+Unit=lol-update.service
+
+[Install]
+WantedBy=timers.target

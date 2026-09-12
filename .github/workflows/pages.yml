@@ -1,0 +1,60 @@
+# 把 frontend 的静态版 (vite --mode pages) 发布到 GitHub Pages。
+#
+# 模型文件 frontend/public/web/*.json 是在本机导出后提交进来的 —— 训练数据 (~400 MB)
+# 不在仓库里, CI 没法重新导出。所以这里只负责构建和发布; 逐位一致的黄金测试
+# (npm run test:golden) 在本机导出时跑, 那几 MB 的比对样本不进仓库。
+#
+# 只有 frontend/ 变了才重新发布 —— 改 Python 代码不影响网页。
+name: Deploy Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 连着推两次只发布最后那次, 但不打断已经在发布的那次
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # 24 和本机一致; build:pages 里的 tsc -b 用的是锁文件里的 TypeScript, 不依赖这个版本
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+        working-directory: frontend
+
+      # 含 CSS 变量检查和 TypeScript 类型检查, 任何一个不过就不发布
+      - run: npm run build:pages
+        working-directory: frontend
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist-pages
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

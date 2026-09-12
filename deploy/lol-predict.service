@@ -1,0 +1,57 @@
+[Unit]
+# 注意: systemd 的 unit 文件不支持行尾注释, 注释必须独占一行。
+Description=LoL Match Prediction API
+# network-online 而不是 network —— 后者只保证网卡起来了, 不保证路由可用。
+# 服务启动时要连 NVIDIA / Tavily, 差别是真实的。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/lol/service
+
+# 环境变量必须走这里。改 .bashrc 对 systemd 启动的进程无效 ——
+# 进程的环境是启动那一刻的快照, 而 systemd 不读你的登录 shell。
+EnvironmentFile=/home/ubuntu/lol/service.env
+
+ExecStart=/home/ubuntu/lol/venv312/bin/uvicorn api:app --host 127.0.0.1 --port 8000 --workers 1
+
+# 只绑 127.0.0.1, **不直接对公网开放**。/esports/board 每次调用会向上游发
+# 好几个请求, 用的是那个公共 API key —— 被扫到刷起来, key 可能被限流甚至
+# 封掉, 整个项目的数据源就断了。
+# 要从外面访问, 走 nginx 反代 (端口 80 本来就开着) 并加上认证, 或者用
+# ssh -L 8000:127.0.0.1:8000 隧道。
+
+# 只能单 worker: FeatureStore 常驻内存 2-4GB, 每个 worker 一份。
+# 4 核 24GB 的机器开 4 个 worker 会吃掉 16GB 换来单人使用毫无意义的并发。
+
+Restart=on-failure
+RestartSec=5
+# 启动要加载五年 CSV 建索引, 冷启动几十秒到一分多钟。默认 90 秒不够。
+TimeoutStartSec=300
+# uvicorn 认 SIGINT 才会优雅退出; 默认的 SIGTERM 会让它硬断连接
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lol-predict
+
+# 内存兜底: 超过 12G 先施压回收, 20G 直接杀。防止某次改动引入的
+# 内存泄漏把整机拖死 —— 这台机器还跑着别的东西。
+MemoryHigh=12G
+MemoryMax=20G
+
+# 适度加固。没用 ProtectHome —— 工作目录和 venv 都在 /home/ubuntu 下,
+# 开了会直接起不来。
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

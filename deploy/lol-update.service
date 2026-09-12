@@ -1,0 +1,50 @@
+[Unit]
+# 注意: systemd 的 unit 文件不支持行尾注释, 注释必须独占一行。
+Description=LoL Match Prediction — daily data refresh and retrain
+# 要连 Google Drive 和 lolesports, network 起来不够, 得等路由可用
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/lol/service
+
+# Google 凭据在 service 目录下, 不走 EnvironmentFile
+ExecStart=/home/ubuntu/lol/venv312/bin/python /home/ubuntu/lol/service/daily_update.py
+
+# 下载 + 两次训练。五年数据的训练本身就要几分钟, 加上配额重试要留足。
+TimeoutStartSec=7200
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lol-update
+
+# 训练会吃内存, 但比服务进程少 —— 它不常驻
+MemoryMax=8G
+
+# **不能让 no-new-privs 生效** —— 这个单元最后一步要 `sudo systemctl restart
+# lol-predict` 把新 artifacts 装进内存, 而 sudo 靠 setuid 提权, no-new-privs
+# 恰好禁止 setuid 生效。2026-08-20 加了 NoNewPrivileges=yes 之后, 日更连续 19
+# 次走到最后一步才失败: 数据拉了、模型训了、闸过了、artifacts 也换了,
+# **就是没重启** —— 线上一直用着磁盘上早已被替换掉的旧模型, 且不报任何错。
+#
+# 2026-08-20 删掉那一行**并没有真正修好**。ProtectKernelTunables /
+# ProtectControlGroups / RestrictSUIDSGID **每一个都会隐式打开 no-new-privs**,
+# 而这个隐式值不反映在属性上 —— `systemctl show -p NoNewPrivileges` 照样显示
+# no, 于是从任何地方都看不出问题, sudo 却依然被挡死。2026-09-09 又栽了一次,
+# 这次是 09-09 那轮日更: 前四步全成功, 第五步 sudo 失败。
+#
+# 所以这三行必须一起去掉。权限本身收在 /etc/sudoers.d/50-lol-restart, 只放行
+# `systemctl restart lol-predict` 一条命令, 因此并没有把口子开大:
+#
+#     ubuntu ALL=(root) NOPASSWD: /usr/bin/systemctl restart lol-predict
+#     ubuntu ALL=(root) NOPASSWD: /usr/bin/systemctl restart lol-predict.service
+#
+# 验证必须在 unit 的执行环境里做 —— 交互式 ssh 本来就能 sudo, 试不出问题:
+#     sudo systemd-run --uid=ubuntu --property=ProtectKernelTunables=no #          --property=ProtectControlGroups=no --property=RestrictSUIDSGID=no #          --wait --collect /usr/bin/sudo -n /usr/bin/systemctl restart lol-predict
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+[Unit]
+# 注意: systemd 的 unit 文件不支持行尾注释, 注释必须独占一行。
+Description=LoL Match Prediction — live late-game snapshot collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/lol/service
+ExecStart=/home/ubuntu/lol/venv312/bin/python /home/ubuntu/lol/service/collect_live.py
+
+# 一轮只是几个 HTTP 请求, 正常十几秒。卡住就放弃, 下一轮再来。
+TimeoutStartSec=300
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lol-collect
+
+MemoryMax=1G
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

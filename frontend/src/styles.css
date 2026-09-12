@@ -1,0 +1,2073 @@
+/* ══════════════════════════════════════════════════════════════════
+   发布会式版面。
+
+   四条规矩, 其余都是它们的推论:
+     1. 排版对比拉到极致 —— 巨大的标题配克制的小字, 中间不留温吞的档位
+     2. 留白按屏幕比例走, 不是固定像素
+     3. 颜色只在**有信息**的地方出现, 其余一律中性
+     4. 材质是薄的: 半透明 + 模糊 + 一根细边, 不用重阴影
+
+   数据密度不能为了好看牺牲 —— 英雄区可以戏剧化, 表格区必须老实。
+   ══════════════════════════════════════════════════════════════════ */
+
+:root {
+  color-scheme: light dark;
+
+  /* ── 浅色是主调 ────────────────────────────────────────────
+     底色**必须比卡片深一档**。旧版单文件前端在这里踩过坑, 注释原话:
+     "之前 #fbfbfd 对 #ffffff 几乎无差, 卡片边界看不出来"。
+     白底设计靠的是层次而不是描边, 所以 #f5f5f7 的底 + 纯白卡片 + 一层
+     极淡的投影, 三者缺一就会糊成一片。 */
+  --bg: #f5f5f7;
+  --bg-2: #ececf0;
+  --panel: rgba(255, 255, 255, 0.86);
+  --panel-strong: #ffffff;
+  --hair: rgba(0, 0, 0, 0.11);
+  --hair-2: rgba(0, 0, 0, 0.065);
+
+  --ink: #1d1d1f;
+  --ink-2: #4b4b50;
+  --ink-3: #86868b;
+
+  --blue: #0071e3;
+  --blue-soft: rgba(0, 113, 227, 0.12);
+  --red: #d92b1c;
+  --red-soft: rgba(217, 43, 28, 0.11);
+  --dead: rgba(0, 0, 0, 0.14);
+
+  --warn-bg: #fff8ed;
+  --warn-line: #ffdcab;
+  --warn-ink: #8a4b00;
+
+  /* 白底上层次靠投影, 不靠边框 —— 边框重了就显廉价 */
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 10px 30px rgba(0, 0, 0, 0.045);
+  --shadow-hover: 0 2px 4px rgba(0, 0, 0, 0.05), 0 18px 46px rgba(0, 0, 0, 0.08);
+  /* 顶部光晕在白底上必须极淡, 否则像脏了一块 */
+  --glow: 7%;
+
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+
+  --radius: 18px;
+  --radius-lg: 26px;
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* 暗色。
+   token 在下面写了两遍, 是有意的 —— CSS 没有 mixin, 而这两个入口的条件
+   互不包含: 手动切到暗色 (data-theme=dark) 必须无视系统偏好, 而没手动
+   选过时又要跟随系统。用 :is() 合并会让 @media 那条失去 not() 的语义。
+   改的时候两块要一起改。 */
+:root[data-theme="dark"] {
+  --bg: #000000;
+  --bg-2: #0a0a0c;
+  --panel: rgba(255, 255, 255, 0.045);
+  --panel-strong: rgba(255, 255, 255, 0.07);
+  --hair: rgba(255, 255, 255, 0.1);
+  --hair-2: rgba(255, 255, 255, 0.055);
+  --ink: #f5f5f7;
+  --ink-2: #a1a1a6;
+  --ink-3: #6e6e73;
+  --blue: #2997ff;
+  --blue-soft: rgba(41, 151, 255, 0.16);
+  --red: #ff453a;
+  --red-soft: rgba(255, 69, 58, 0.16);
+  --dead: rgba(255, 255, 255, 0.16);
+  --warn-bg: rgba(255, 159, 10, 0.09);
+  --warn-line: rgba(255, 159, 10, 0.28);
+  --warn-ink: #ffb454;
+  --shadow: none;
+  --shadow-hover: none;
+  --glow: 14%;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not([data-theme="dark"]) {
+    --bg: #000000;
+    --bg-2: #0a0a0c;
+    --panel: rgba(255, 255, 255, 0.045);
+    --panel-strong: rgba(255, 255, 255, 0.07);
+    --hair: rgba(255, 255, 255, 0.1);
+    --hair-2: rgba(255, 255, 255, 0.055);
+    --ink: #f5f5f7;
+    --ink-2: #a1a1a6;
+    --ink-3: #6e6e73;
+    --blue: #2997ff;
+    --blue-soft: rgba(41, 151, 255, 0.16);
+    --red: #ff453a;
+    --red-soft: rgba(255, 69, 58, 0.16);
+    --dead: rgba(255, 255, 255, 0.16);
+    --warn-bg: rgba(255, 159, 10, 0.09);
+    --warn-line: rgba(255, 159, 10, 0.28);
+    --warn-ink: #ffb454;
+    --shadow: none;
+    --shadow-hover: none;
+    --glow: 14%;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 顶部一层极淡的光晕。白底上强度靠 --glow 压到 7%, 再多就像脏了一块 */
+body::before {
+  content: "";
+  position: fixed;
+  inset: -30% 0 auto 0;
+  height: 70vh;
+  background: radial-gradient(
+    60% 55% at 50% 0%,
+    color-mix(in srgb, var(--blue) var(--glow), transparent),
+    transparent 70%
+  );
+  pointer-events: none;
+  z-index: 0;
+}
+
+.wrap {
+  position: relative;
+  z-index: 1;
+  max-width: 1180px;
+  margin: 0 auto;
+  /* 顶部留得薄, 让返回/主题那一排贴近页面顶端;
+     标题的呼吸交给 .masthead 自己的 padding */
+  padding: clamp(16px, 2.4vw, 30px) clamp(18px, 4vw, 40px) 140px;
+}
+
+/* ── 入场 ─────────────────────────────────────────────────── */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rise {
+  animation: rise 0.7s var(--ease) both;
+}
+.d1 { animation-delay: 0.05s; }
+.d2 { animation-delay: 0.12s; }
+.d3 { animation-delay: 0.19s; }
+.d4 { animation-delay: 0.26s; }
+
+@media (prefers-reduced-motion: reduce) {
+  .rise {
+    animation: none;
+  }
+  * {
+    transition: none !important;
+  }
+}
+
+/* ── 首屏 ─────────────────────────────────────────────────── */
+.masthead {
+  /* 这里曾经写 max-width: 20ch —— ch 是 "0" 字符的宽度, 按**父元素**
+     字号 (15px) 算, 于是容器只有约 150px; 而 h1 是 104px, 一个汉字就
+     104px 宽, 一行放不下两个字, 标题直接排成了竖的。
+     中文下一个字约等于 1em, 要限宽就用 em 并挂在**自身**字号上。 */
+  padding: clamp(30px, 6vw, 80px) 0 clamp(36px, 6vw, 76px);
+}
+.masthead h1 {
+  margin: 0 0 clamp(14px, 2vw, 22px);
+  max-width: 11em;
+  font-size: clamp(44px, 8.5vw, 104px);
+  line-height: 0.98;
+  letter-spacing: -0.045em;
+  font-weight: 680;
+  background: linear-gradient(
+    180deg,
+    var(--ink) 30%,
+    color-mix(in srgb, var(--ink) 62%, transparent)
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.masthead p {
+  margin: 0;
+  max-width: 24em;
+  font-size: clamp(16px, 1.5vw, 21px);
+  line-height: 1.45;
+  color: var(--ink-2);
+  letter-spacing: -0.01em;
+}
+
+/* ── 区块 ─────────────────────────────────────────────────── */
+.section {
+  margin-top: clamp(48px, 7vw, 96px);
+}
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: clamp(16px, 2vw, 26px);
+}
+.section-head h2 {
+  margin: 0;
+  font-size: clamp(22px, 2.6vw, 34px);
+  font-weight: 640;
+  letter-spacing: -0.028em;
+}
+.count {
+  font-size: 13px;
+  color: var(--ink-3);
+  padding: 2px 10px;
+  border: 1px solid var(--hair-2);
+  border-radius: 999px;
+}
+.spacer {
+  flex: 1;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--hair-2);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  backdrop-filter: saturate(160%) blur(22px);
+  -webkit-backdrop-filter: saturate(160%) blur(22px);
+}
+.pad {
+  padding: clamp(18px, 2.4vw, 30px);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.btn {
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: 999px;
+  padding: 7px 17px;
+  font-size: 13.5px;
+  color: var(--ink-2);
+  backdrop-filter: blur(14px);
+  transition: all 0.25s var(--ease);
+}
+.btn:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--ink-3);
+  transform: translateY(-1px);
+}
+.btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.card-title {
+  margin: 0 0 clamp(14px, 1.6vw, 20px);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+/* ── 比赛卡片 ─────────────────────────────────────────────── */
+.cards {
+  display: grid;
+  gap: 12px;
+}
+.card {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: clamp(12px, 2vw, 28px);
+  width: 100%;
+  text-align: left;
+  padding: clamp(16px, 2vw, 24px) clamp(18px, 2.4vw, 30px);
+  background: var(--panel);
+  border: 1px solid var(--hair-2);
+  border-radius: var(--radius);
+  backdrop-filter: saturate(160%) blur(22px);
+  -webkit-backdrop-filter: saturate(160%) blur(22px);
+  overflow: hidden;
+  box-shadow: var(--shadow);
+  transition: all 0.35s var(--ease);
+}
+.card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    100deg,
+    transparent 30%,
+    color-mix(in srgb, var(--blue) 8%, transparent)
+  );
+  opacity: 0;
+  transition: opacity 0.35s var(--ease);
+  pointer-events: none;
+}
+.card:hover:not([disabled]) {
+  border-color: var(--hair);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-hover);
+}
+.card:hover:not([disabled])::after {
+  opacity: 1;
+}
+.card[disabled] {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.side {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+.side.right {
+  flex-direction: row-reverse;
+  text-align: right;
+}
+.crest {
+  width: 40px;
+  height: 40px;
+  flex: none;
+  border-radius: 11px;
+  object-fit: contain;
+  padding: 4px;
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+}
+.crest-fallback {
+  display: grid;
+  place-items: center;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--ink-2);
+}
+.team-name {
+  font-size: clamp(15px, 1.5vw, 18px);
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.team-sub {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.mid {
+  text-align: center;
+  min-width: 122px;
+}
+.mid .when {
+  font-size: 14px;
+  color: var(--ink-2);
+  letter-spacing: -0.01em;
+}
+.mid .score {
+  font-size: clamp(24px, 3vw, 34px);
+  font-weight: 660;
+  letter-spacing: -0.04em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.05;
+}
+.mid .tags {
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+  margin-top: 7px;
+  flex-wrap: wrap;
+}
+.tag {
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+  border: 1px solid var(--hair-2);
+  border-radius: 999px;
+  padding: 2px 9px;
+}
+.tag.live {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 45%, transparent);
+  font-weight: 600;
+}
+.tag.live::before {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--red);
+  margin-right: 5px;
+  vertical-align: 1px;
+  animation: pulse 2s ease-in-out infinite;
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* ── 看板首屏 ─────────────────────────────────────────────── */
+.board-nav {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: clamp(26px, 4vw, 48px);
+}
+
+.hero {
+  /* 底部留白收窄: 原来是 26-44px, 记分板离"第 XX 分钟"那行太远, 中间一段
+     空白让两块看着不相干。它们其实是同一件事的两层 —— 一句话的结论, 和
+     支撑它的场上数字。 */
+  padding: 0 0 clamp(14px, 2vw, 22px);
+}
+.hero-teams {
+  display: flex;
+  align-items: baseline;
+  gap: clamp(10px, 1.6vw, 18px);
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.hero-teams h2 {
+  margin: 0;
+  font-size: clamp(30px, 5.4vw, 62px);
+  line-height: 1.02;
+  letter-spacing: -0.042em;
+  font-weight: 660;
+}
+.hero-teams .vs {
+  font-size: clamp(16px, 2vw, 24px);
+  color: var(--ink-3);
+  font-weight: 400;
+  letter-spacing: -0.01em;
+}
+.hero-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  color: var(--ink-2);
+  font-size: 14.5px;
+  letter-spacing: -0.008em;
+}
+.dot {
+  color: var(--ink-3);
+}
+
+/* 概率 —— 页面的英雄元素 */
+.prob {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: end;
+  gap: clamp(12px, 3vw, 40px);
+  margin: clamp(20px, 3vw, 34px) 0 clamp(14px, 2vw, 22px);
+}
+.prob-side {
+  min-width: 0;
+}
+.prob-side.right {
+  text-align: right;
+}
+.prob-label {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.prob-num {
+  font-size: clamp(46px, 9vw, 108px);
+  line-height: 0.92;
+  font-weight: 640;
+  letter-spacing: -0.055em;
+  font-variant-numeric: tabular-nums;
+}
+.prob-num small {
+  font-size: 0.42em;
+  font-weight: 560;
+  letter-spacing: -0.02em;
+  margin-left: 0.06em;
+}
+.prob-blue {
+  background: linear-gradient(
+    180deg,
+    var(--blue),
+    color-mix(in srgb, var(--blue) 58%, transparent)
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.prob-red {
+  background: linear-gradient(
+    180deg,
+    var(--red),
+    color-mix(in srgb, var(--red) 58%, transparent)
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.prob-mid {
+  padding-bottom: 8px;
+  font-size: 12px;
+  color: var(--ink-3);
+  text-align: center;
+  white-space: nowrap;
+}
+
+.scale-foot {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: var(--ink-3);
+  margin-top: 9px;
+  letter-spacing: -0.005em;
+}
+
+/* 局势结论 + 相对赛前的位移, 同一行左右对齐。窄屏退回上下堆叠。 */
+.summary-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: clamp(14px, 2vw, 20px);
+}
+.summary {
+  margin-top: 0;
+  font-size: clamp(17px, 1.9vw, 23px);
+  line-height: 1.35;
+  letter-spacing: -0.022em;
+  color: var(--ink);
+  max-width: 17em;
+  font-weight: 560;
+}
+.shift {
+  margin-top: 0;
+  /* margin-left:auto 而不是只靠 space-between: 结论那句是可选的 (赛前视图里
+     summary 可能为空), 只剩一个子元素时 space-between 会把它推到**左边**。
+     auto 边距两种情况都靠右。 */
+  margin-left: auto;
+  text-align: right;
+  flex: none;
+  color: var(--ink-2);
+  font-size: 15px;
+  letter-spacing: -0.01em;
+}
+
+/* ── 提示 ─────────────────────────────────────────────────── */
+.warn {
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-line);
+  color: var(--warn-ink);
+  border-radius: 13px;
+  padding: 12px 15px;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+.notes {
+  margin-top: clamp(16px, 2vw, 24px);
+  display: grid;
+  gap: 9px;
+}
+.mono {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ink-3);
+}
+
+/* ── 依据 ─────────────────────────────────────────────────── */
+/* 主要依据 —— 横向标签。原来每条配一根进度条, 五六根排下来像跑分榜, 而
+   权重是模型内部的相对量、没有可读单位, 画成长度会诱导人去比差值。
+   现在只用**顺序**表达重要性 (已按权重降序), 前两条加重。 */
+.reasons {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.reason {
+  padding: 6px 13px;
+  border-radius: 999px;
+  border: 1px solid var(--hair-2);
+  background: var(--bg-2);
+  font-size: 13.5px;
+  letter-spacing: -0.01em;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+/* 最重的两条: 实心底 + 主色, 一眼看得出主次 */
+.reason.key {
+  border-color: transparent;
+  background: var(--blue-soft);
+  color: var(--blue);
+  font-weight: 560;
+}
+/* 依据里常有长句 (带阵容说明那种), 窄屏允许折行, 否则会把面板撑破 */
+@media (max-width: 640px) {
+  .reason {
+    white-space: normal;
+  }
+}
+
+/* 合并后的模型说明里, 针对本次预测的提醒 */
+.fine-warns {
+  margin: 4px 0 10px;
+  padding-left: 1.1em;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.fine-warns li {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--warn-ink);
+}
+
+/* 大比分, 摆在两队名之间 */
+.series-score {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: clamp(26px, 3.4vw, 44px);
+  font-weight: 660;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+}
+.series-score b {
+  font-weight: 660;
+}
+.series-score b.lead {
+  color: var(--ink);
+}
+.series-score i {
+  font-style: normal;
+  font-size: 0.6em;
+  color: var(--ink-3);
+}
+@keyframes grow {
+  from {
+    transform: scaleX(0);
+    transform-origin: left;
+  }
+}
+
+/* ── 图表 ─────────────────────────────────────────────────── */
+.chart {
+  display: block;
+  width: 100%;
+  height: auto;
+  font-family: var(--sans);
+  overflow: visible;
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: clamp(12px, 1.6vw, 20px);
+}
+@media (max-width: 940px) {
+  .grid-2 {
+    grid-template-columns: 1fr;
+  }
+}
+.stack {
+  display: grid;
+  gap: clamp(12px, 1.6vw, 20px);
+}
+
+/* ── 局切换 ───────────────────────────────────────────────── */
+.tabs {
+  display: inline-flex;
+  gap: 3px;
+  padding: 3px;
+  background: var(--panel);
+  border: 1px solid var(--hair-2);
+  border-radius: 999px;
+  margin-bottom: clamp(18px, 2.5vw, 28px);
+  backdrop-filter: blur(14px);
+}
+.tab {
+  border: none;
+  background: transparent;
+  border-radius: 999px;
+  padding: 6px 16px;
+  font-size: 13.5px;
+  color: var(--ink-2);
+  transition: all 0.3s var(--ease);
+  letter-spacing: -0.01em;
+}
+.tab:hover:not(:disabled):not(.on) {
+  color: var(--ink);
+}
+.tab.on {
+  background: var(--ink);
+  color: var(--bg);
+  font-weight: 560;
+}
+.tab:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* ── 目标资源 ─────────────────────────────────────────────── */
+.obj-row {
+  display: grid;
+  grid-template-columns: 1fr 84px 1fr;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 0;
+  font-variant-numeric: tabular-nums;
+}
+.obj-row + .obj-row {
+  border-top: 1px solid var(--hair-2);
+}
+.obj-label {
+  text-align: center;
+  font-size: 11px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.obj-val {
+  font-size: clamp(18px, 2vw, 23px);
+  font-weight: 580;
+  letter-spacing: -0.028em;
+  color: var(--ink-2);
+  transition: color 0.4s var(--ease);
+}
+.obj-val.right {
+  text-align: right;
+}
+.obj-val.lead {
+  color: var(--ink);
+}
+.obj-head {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.dragons {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.dragons.right {
+  justify-content: flex-end;
+}
+.drake {
+  font-size: 10.5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--hair-2);
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+/* ── 选手表 ───────────────────────────────────────────────── */
+.roster {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.roster th {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  text-align: right;
+  padding: 0 0 12px;
+}
+.roster th:first-child,
+.roster td:first-child {
+  text-align: left;
+}
+.roster td {
+  padding: 9px 0;
+  border-top: 1px solid var(--hair-2);
+  text-align: right;
+  font-size: 14px;
+  letter-spacing: -0.01em;
+}
+.who {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.champ-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  flex: none;
+  background: var(--hair-2);
+}
+.who-name {
+  font-weight: 560;
+  letter-spacing: -0.012em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.who-champ {
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+.blue-row td:first-child {
+  box-shadow: inset 2px 0 0 var(--blue);
+  padding-left: 12px;
+}
+.red-row td:first-child {
+  box-shadow: inset 2px 0 0 var(--red);
+  padding-left: 12px;
+}
+.lane-gap {
+  font-size: 11px;
+  color: var(--ink-3);
+  border-top: none !important;
+  padding: 2px 0 14px !important;
+  letter-spacing: 0.01em;
+}
+
+/* ── 状态 ─────────────────────────────────────────────────── */
+.empty {
+  color: var(--ink-3);
+  padding: clamp(28px, 4vw, 44px) 4px;
+  font-size: 15px;
+  text-align: center;
+}
+.err {
+  color: var(--red);
+  font-size: 14px;
+}
+
+/* ── 主题切换 ─────────────────────────────────────────────── */
+.theme-toggle {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--panel);
+  border: 1px solid var(--hair-2);
+  border-radius: 999px;
+  backdrop-filter: blur(14px);
+}
+.theme-toggle button {
+  border: none;
+  background: transparent;
+  border-radius: 999px;
+  width: 30px;
+  height: 26px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--ink-3);
+  transition: all 0.3s var(--ease);
+}
+.theme-toggle button.on {
+  background: color-mix(in srgb, var(--ink) 12%, transparent);
+  color: var(--ink);
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: -14px;
+}
+
+/* ── AI 复核 ──────────────────────────────────────────────── */
+.debate-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.db-hint {
+  margin: 12px 0 0;
+  color: var(--ink-2);
+  font-size: 13.5px;
+  line-height: 1.6;
+  max-width: 46em;
+}
+.db-err {
+  margin: 12px 0 0;
+  color: var(--red);
+  font-size: 13.5px;
+}
+.db-consensus {
+  margin-top: 16px;
+  padding: 16px 18px;
+  border-radius: 14px;
+  background: var(--blue-soft);
+  font-size: 15.5px;
+  line-height: 1.55;
+  letter-spacing: -0.012em;
+}
+.db-sec {
+  margin-top: 20px;
+}
+.db-sec h4 {
+  margin: 0 0 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.claim {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 11px;
+  align-items: start;
+  padding: 9px 0;
+  font-size: 14.5px;
+  line-height: 1.5;
+}
+.claim + .claim {
+  border-top: 1px solid var(--hair-2);
+}
+.cst {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 3px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.cst.survived {
+  color: #00875a;
+  background: rgba(0, 135, 90, 0.11);
+}
+.cst.contested {
+  color: var(--warn-ink);
+  background: var(--warn-bg);
+  border-color: var(--warn-line);
+}
+.cst.conceded,
+.cst.refuted {
+  color: var(--ink-3);
+  background: var(--hair-2);
+}
+:root[data-theme="dark"] .cst.survived {
+  color: #41d392;
+  background: rgba(65, 211, 146, 0.14);
+}
+.cmeta {
+  display: block;
+  font-size: 12px;
+  color: var(--ink-3);
+  margin-top: 3px;
+}
+a.cmeta {
+  color: var(--blue);
+  text-decoration: none;
+}
+a.cmeta:hover {
+  text-decoration: underline;
+}
+
+/* ── 手动输入 ─────────────────────────────────────────────── */
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 14px;
+}
+.field {
+  display: grid;
+  gap: 6px;
+}
+.field label {
+  font-size: 11.5px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.field input,
+.field select {
+  font: inherit;
+  font-size: 14.5px;
+  color: var(--ink);
+  background: var(--panel-strong);
+  border: 1px solid var(--hair);
+  border-radius: 11px;
+  padding: 9px 12px;
+  min-width: 0;
+  transition: border-color 0.25s var(--ease);
+}
+.field input:focus,
+.field select:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.form-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 18px;
+  flex-wrap: wrap;
+}
+.btn-primary {
+  background: var(--ink);
+  color: var(--bg);
+  border-color: var(--ink);
+  font-weight: 560;
+  padding: 9px 22px;
+}
+.btn-primary:hover:not(:disabled) {
+  opacity: 0.88;
+  color: var(--bg);
+}
+.draft-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+  margin-top: 18px;
+}
+@media (max-width: 760px) {
+  .draft-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.draft-col h4 {
+  margin: 0 0 10px;
+  font-size: 11.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.draft-row {
+  display: grid;
+  grid-template-columns: 52px 1fr 1fr;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.draft-row span {
+  font-size: 12.5px;
+  color: var(--ink-3);
+}
+.draft-row input {
+  font: inherit;
+  font-size: 13.5px;
+  color: var(--ink);
+  background: var(--panel-strong);
+  border: 1px solid var(--hair);
+  border-radius: 9px;
+  padding: 7px 10px;
+  min-width: 0;
+}
+.draft-row input:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.stage-result {
+  display: grid;
+  gap: 12px;
+  margin-top: 20px;
+}
+.stage-card {
+  border: 1px solid var(--hair-2);
+  border-radius: 14px;
+  padding: 16px 18px;
+  background: var(--panel-strong);
+}
+.stage-card h4 {
+  margin: 0 0 8px;
+  font-size: 11.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.stage-num {
+  font-size: clamp(30px, 4.5vw, 44px);
+  font-weight: 640;
+  letter-spacing: -0.04em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.05;
+}
+.stage-sub {
+  margin: 6px 0 0;
+  color: var(--ink-2);
+  font-size: 14px;
+  letter-spacing: -0.01em;
+}
+
+/* ── 细则 (默认收起) ──────────────────────────────────────────
+   模型的准确率和局限**不删掉, 只是不糊在脸上**。这个项目的立身之本是
+   把不确定性讲清楚 (见 README), 但 2C 界面一上来就堆术语只会把人吓走。
+   想看的人点开就有, 不看的人也不会被误导成"这个数字很确定"。 */
+.fineprint {
+  margin-top: 6px;
+}
+.fineprint > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 12.5px;
+  color: var(--ink-3);
+  padding: 4px 0;
+  user-select: none;
+  transition: color 0.25s var(--ease);
+}
+.fineprint > summary::-webkit-details-marker {
+  display: none;
+}
+.fineprint > summary::before {
+  content: "ⓘ ";
+  opacity: 0.75;
+}
+.fineprint > summary:hover {
+  color: var(--ink-2);
+}
+.fineprint[open] > summary {
+  color: var(--ink-2);
+  margin-bottom: 6px;
+}
+
+/* ── 记分板 ────────────────────────────────────────────────
+   照 LoL 观战界面: 蓝左红右, 数值向中线镜像, 中间是路名和该路经济差。
+   红方那一侧用 row-reverse 整体翻转 —— 比给每个元素单独写一套右对齐规则
+   省事, 也保证两侧的间距天然对称。 */
+/* 队伍总览: 资源点分列两边, 中间只留人头比分和经济差。
+   中间列宽度和下面五行**取同一个值** (6em), 于是那两条竖线正好落在人头
+   比分的两侧, 整块记分板是一条贯通的中轴。 */
+.sb-head {
+  display: grid;
+  grid-template-columns: 1fr 6em 1fr;
+  align-items: start;
+  gap: clamp(10px, 2vw, 24px);
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--hair-2);
+}
+.sb-team {
+  min-width: 0;
+}
+.sb-team.red {
+  text-align: right;
+}
+.sb-team-name {
+  font-size: 13px;
+  font-weight: 620;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sb-team-name.blue {
+  color: var(--blue);
+}
+.sb-team-name.red {
+  color: var(--red);
+}
+.sb-team-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 6px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+/* 两侧各自贴外沿: 蓝方左对齐、红方右对齐, 中间不留大空档。
+   排列顺序仍是镜像的 (蓝方 水晶→…→经济, 红方 经济→…→水晶), 所以两栏
+   读起来是对称的, 只是**紧凑排列**而不是撑满整栏。
+   nowrap: 一旦换行, 落单的那项会跑到行首, 镜像就散了。窄屏靠缩字号
+   和图标塞下, 见文件末尾的 media query。 */
+.sb-team-stats {
+  flex-wrap: nowrap;
+  justify-content: flex-start;
+}
+.sb-team.red .sb-team-stats {
+  justify-content: flex-end;
+}
+.sb-team.red .sb-drakes {
+  justify-content: flex-end;
+}
+/* 按**取值**上色而不是按领先: 0 保持墨色, 非 0 才染成己方颜色。
+   不加粗 —— 一排里两三个粗体反而看不出重点。 */
+.sb-team.blue .sb-team-stats .on {
+  color: var(--blue);
+}
+.sb-team.red .sb-team-stats .on {
+  color: var(--red);
+}
+.sb-sep {
+  color: var(--ink-3);
+}
+.sb-drakes {
+  display: flex;
+  gap: 4px;
+  margin-top: 7px;
+  flex-wrap: wrap;
+}
+.drake-ico {
+  width: 20px;
+  height: 20px;
+  flex: none;
+}
+/* 宽度同样由 .sb-head 的 grid 模板给死。比分和经济差都可能比 6em 宽
+   ("10 ⚔ 22"、"+11,295"), 允许它们溢出到两侧的留白里 —— 那一片本来就是
+   空的, 而列宽一变竖线就对不齐了。 */
+.sb-head-mid {
+  text-align: center;
+  overflow: visible;
+  white-space: nowrap;
+}
+.sb-score {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 7px;
+  font-size: clamp(20px, 2.6vw, 28px);
+  font-weight: 660;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+/* 两侧各预留两位数字的宽度。不留的话 "9 ⚔ 12" 会把剑图标推离中线,
+   而这一行是整块记分板的中轴 —— 它一歪, 上下的镜像看着就都不对。
+   ch 跟着字号走, 比写死 px 稳。 */
+.sb-score .blue,
+.sb-score .red {
+  min-width: 2ch;
+}
+.sb-score .blue {
+  color: var(--blue);
+  text-align: right;
+}
+.sb-score .red {
+  color: var(--red);
+  text-align: left;
+}
+/* 两个人头数之间放交叉双剑, 不是一个破折号 —— 破折号在这个位置读起来
+   像"到", 而这里表达的是"对战"。 */
+.sb-kill-ico {
+  width: 0.62em;
+  height: 0.62em;
+  color: var(--ink-3);
+  flex: none;
+  align-self: center;
+}
+/* 经济差跟着领先方变色 —— 一个数字同时回答"差多少"和"谁领先"。
+   持平时不上色, 保持中性灰。 */
+.sb-golddiff {
+  margin-top: 2px;
+  font-size: 15px;
+  font-weight: 640;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 3px;
+}
+.sb-golddiff .arw {
+  font-style: normal;
+  font-size: 1.05em;
+  line-height: 1;
+}
+.sb-golddiff.blue {
+  color: var(--blue);
+}
+.sb-golddiff.red {
+  color: var(--red);
+}
+
+.sb-lanes {
+  display: flex;
+  flex-direction: column;
+}
+/* 中间列**必须是固定宽度**, 不能用 auto。
+   每个 .sb-lane 是独立的 grid, auto 会让中间列跟着**那一行**的内容走 ——
+   实测 "1,751›" (4 位) 是 77px 而 "399›" (3 位) 是 69px, 差 8px, 于是那两条
+   竖线在数字位数不同的行上左右错开, 看起来像"某一行拐了一下"。
+   min-width 挡不住: 内容更宽时照样撑开。 */
+.sb-lane {
+  display: grid;
+  grid-template-columns: 1fr 6em 1fr;
+  align-items: center;
+  gap: clamp(8px, 1.6vw, 20px);
+  padding: 9px 0;
+  border-bottom: 1px solid var(--hair-2);
+}
+.sb-lane:last-child {
+  border-bottom: none;
+}
+.sb-cell {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+.sb-cell.red {
+  flex-direction: row-reverse;
+}
+.sb-cell.empty {
+  min-height: 30px;
+}
+.sb-who {
+  min-width: 0;
+  flex: 1;
+}
+.sb-cell.red .sb-who {
+  text-align: right;
+}
+.sb-name {
+  font-size: 13.5px;
+  font-weight: 560;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sb-champ {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sb-nums {
+  text-align: right;
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+.sb-cell.red .sb-nums {
+  text-align: left;
+}
+.sb-kda {
+  font-size: 13.5px;
+  letter-spacing: -0.01em;
+}
+.sb-sub {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+/* 中间只剩经济差, 所以窄很多 (原来还要放"上单/打野"两个字)。
+   两侧各一条竖线: 五行的经济差本来就该读成独立的一列, 没有分隔时它会
+   和左右两边的数字糊成一片。 */
+.sb-mid {
+  text-align: center;
+  /* 宽度由 .sb-lane 的 grid 模板给死, 这里不能再设 min-width ——
+     那正是让它跟着内容变宽、把竖线挤歪的原因。 */
+  flex: none;
+  /* 用 --hair 而不是 --hair-2: 后者 (0.067 透明度) 在 1px 竖线上几乎看不见,
+     它是给大块面积的分隔用的。 */
+  border-left: 1px solid var(--hair);
+  border-right: 1px solid var(--hair);
+  /* 负外边距抵掉 .sb-lane 的 9px 上下内边距, 让竖线**顶满整行** ——
+     只到内容高度的话, 两条短杠悬在中间反而更乱。 */
+  margin: -9px 0;
+  padding: 9px 12px;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.sb-gap {
+  font-size: 16px;
+  font-weight: 660;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.015em;
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 3px;
+}
+/* 箭头指向领先的一方。方向和颜色两重编码同一件事 —— 扫一眼就知道
+   这一路谁在压制, 不用先读符号再想正负属于谁。 */
+.sb-gap .arw {
+  font-style: normal;
+  font-size: 1.05em;
+  line-height: 1;
+}
+.sb-gap.blue {
+  color: var(--blue);
+}
+.sb-gap.red {
+  color: var(--red);
+}
+
+/* 窄屏: 镜像布局挤不下, 退回上下堆叠, 路名做分隔 */
+@media (max-width: 720px) {
+  .sb-lane {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+  /* 上下堆叠时两行都按同一个方向读, 红方不再镜像 */
+  .sb-cell.red {
+    flex-direction: row;
+  }
+  .sb-cell.red .sb-who,
+  .sb-cell.red .sb-nums {
+    text-align: left;
+  }
+  /* 竖线是给"左中右"三栏用的; 堆叠之后中间那栏横跨整行, 竖线变成了
+     两条突兀的短杠, 改成上下细线当分隔。 */
+  .sb-mid {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    border-left: 0;
+    border-right: 0;
+    border-top: 1px solid var(--hair-2);
+    border-bottom: 1px solid var(--hair-2);
+    margin: 0;
+    padding: 4px 0;
+  }
+  /* 两端对齐用了 nowrap, 挤不下时不能换行 (换行会把落单那项拉到行首,
+     镜像就散了)。所以窄屏改成缩字号和图标, 让五项仍然排得下。 */
+  .sb-team-stats {
+    font-size: 11px;
+    gap: 2px;
+  }
+  .sb-ico {
+    width: 15px;
+    height: 15px;
+  }
+}
+
+/* 七格装备 (六件 + 饰品) 在 25px 下要占 200px。一行只有三百来像素时,
+   它会把名字列压到几十像素, 名字直接截成 "JDG…"。1280px 下量到名字列
+   还有 217px、完全放得开, 所以只在**窄屏**收一档。
+   断点取 900 而不是跟着上面那条 720: 800px 恰好落在两档中间, 实测就是
+   名字被压没的那个宽度。 */
+@media (max-width: 900px) {
+  .sb-items img,
+  .sb-items .slot {
+    width: 20px;
+    height: 20px;
+    border-radius: 4px;
+  }
+  .sb-items {
+    gap: 2px;
+  }
+  .sb-items .trinket {
+    margin-left: 5px;
+  }
+  .sb-cell.red .sb-items .trinket {
+    margin-right: 5px;
+  }
+  .sb-who {
+    min-width: 5.5em;
+  }
+}
+
+/* 局切换标签放进顶栏, 和返回按钮同一行居中。两侧各一个 spacer 撑开,
+   所以它是相对整行居中的, 不受左右按钮宽度影响。 */
+.nav-tabs {
+  margin-bottom: 0;
+  flex: none;
+}
+@media (max-width: 620px) {
+  /* 挤不下就让顶栏换行, 标签占满第二行 —— 强行同行会把返回按钮压变形 */
+  .board-nav {
+    flex-wrap: wrap;
+  }
+  .nav-tabs {
+    order: 3;
+    width: 100%;
+    justify-content: center;
+  }
+}
+
+/* 目标资源图标: 跟着 currentColor, 明暗主题都不用另做一套 */
+/* 官方图标自带深色描边和配色, **不能再压透明度** —— 原来那个 0.75 是给
+   单色内联 SVG 用的, 套在彩色图标上只会让它发灰。 */
+.sb-ico {
+  width: 19px;
+  height: 19px;
+  flex: none;
+  display: block;
+}
+/* 兜底的内联 SVG 是单色的, 单独给它压一点, 免得比官方图标还抢眼 */
+svg.sb-ico {
+  opacity: 0.7;
+}
+.sb-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+.sb-stat.gold .sb-ico {
+  opacity: 0.85;
+}
+.sb-team.blue .sb-ico {
+  color: var(--blue);
+}
+.sb-team.red .sb-ico {
+  color: var(--red);
+}
+.sb-team-stats .lead .sb-ico {
+  opacity: 1;
+}
+
+/* ── 选手浮窗 ──────────────────────────────────────────────
+   头像做成按钮 + 底下一条血量。血条本身没有边框, 靠底色露出剩余量,
+   死了整条变灰 —— current_health=0 是帧里唯一直说"他倒了"的信号。 */
+.champ-btn {
+  position: relative;
+  border: 0;
+  padding: 0;
+  background: none;
+  cursor: pointer;
+  border-radius: 9px;
+  flex: none;
+  line-height: 0;
+  outline-offset: 2px;
+}
+.champ-btn.on .champ-icon,
+.champ-btn:hover .champ-icon {
+  box-shadow: 0 0 0 2px var(--blue);
+}
+/* 等级角标。压在头像下角, 位置跟着阵营走 —— 蓝方右下、红方左下,
+   于是它总落在**靠中线**那一侧, 不会被旁边的名字挤到。
+   translate 让它骑在边缘上而不是完全缩在里面, 小图上更清楚。 */
+.champ-lv {
+  position: absolute;
+  bottom: -3px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
+  border-radius: 8px;
+  background: var(--ink);
+  color: var(--bg);
+  font-size: 10px;
+  font-weight: 680;
+  line-height: 15px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 0 0 1.5px var(--panel-strong);
+}
+.sb-cell.blue .champ-lv {
+  right: -4px;
+}
+.sb-cell.red .champ-lv {
+  left: -4px;
+}
+
+/* 阵亡遮罩。头像是这一行视觉上最重的元素, 它一灰整行就"暗"下去了。 */
+.champ-btn.dead .champ-icon {
+  filter: grayscale(1) brightness(0.45);
+}
+.champ-dead {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: 0.06em;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
+}
+
+/* 行内血条。13px 才放得下 当前/上限 —— 只画长度看不出还剩多少血。
+   它和名字共占一列, 装备已经挪到右边独立成列, 所以这里铺满该列即可。 */
+.sb-hp {
+  position: relative;
+  height: 13px;
+  margin-top: 4px;
+  border-radius: 4px;
+  background: var(--dead);
+  overflow: hidden;
+}
+.sb-hp i {
+  display: block;
+  height: 100%;
+  background: #35c759;
+  transition: width 0.4s ease;
+}
+.sb-hp b {
+  position: absolute;
+  inset: 0;
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 13px;
+  text-align: center;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  /* 白描边: 血条走到哪, 数字都要看得清 —— 绿色段上和灰底上对比度不同 */
+  text-shadow:
+    0 0 2px var(--panel-strong),
+    0 0 2px var(--panel-strong);
+}
+.sb-hp.dead {
+  background: var(--hair-2);
+}
+.sb-hp.dead b {
+  color: var(--ink-3);
+}
+
+/* 装备是**独立的一列**, 排在血条右边、战绩左边 (红方整行 row-reverse,
+   自动镜像成血条左边、战绩右边)。 */
+.sb-items {
+  display: flex;
+  gap: 3px;
+  flex: none;
+}
+.sb-items img,
+.sb-items .slot {
+  width: 25px;
+  height: 25px;
+  border-radius: 5px;
+  flex: none;
+  display: block;
+}
+.sb-items .slot {
+  background: var(--hair-2);
+}
+/* 饰品单独隔开一段, 并做成圆的 —— 它不占正经装备位, 形状不同就不会被
+   当成第七件装备去数。 */
+.sb-items .trinket {
+  border-radius: 50%;
+  margin-left: 7px;
+}
+.sb-cell.red .sb-items .trinket {
+  margin-left: 0;
+  margin-right: 7px;
+  order: -1;
+}
+
+.sb-cs {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  margin-top: 1px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* 战绩列: 装备右边那一栏。给个下限宽度, 免得 "0/3/14" 和 "12/4/7" 两行
+   宽度不同, 装备栏跟着左右晃。 */
+.sb-nums {
+  min-width: 4.2em;
+}
+
+/* 详情覆盖层。计分板本身是 position: relative 的容器 (见 .sb),
+   所以这里按它的边框定位, 天然不会超出面板。
+   max-width 90%: 蓝方从左往右、红方从右往左展开时, 另一端仍留一条缝,
+   让人看得见底下压着的是计分板而不是换了一屏。 */
+.sb {
+  position: relative;
+}
+.pc-wrap {
+  position: absolute;
+  top: 44px;
+  bottom: 8px;
+  width: min(760px, calc(100% - 16px));
+  max-width: calc(100% - 16px);
+  overflow-y: auto;
+  z-index: 5;
+  animation: pc-in 0.16s ease-out;
+}
+.pc-wrap.blue {
+  left: 8px;
+  transform-origin: left center;
+}
+.pc-wrap.red {
+  right: 8px;
+  transform-origin: right center;
+}
+@keyframes pc-in {
+  from {
+    opacity: 0;
+    transform: scaleX(0.96);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pc-wrap {
+    animation: none;
+  }
+}
+
+.pc {
+  position: relative;
+  border: 1px solid var(--hair);
+  background: var(--panel-strong);
+  border-radius: 14px;
+  padding: 14px 16px 16px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.16);
+}
+.pc-head {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+.pc-champ {
+  width: 38px;
+  height: 38px;
+  border-radius: 9px;
+  flex: none;
+  background: var(--hair-2);
+}
+.pc-who {
+  min-width: 0;
+  flex: 1;
+}
+.pc-name {
+  font-weight: 600;
+  font-size: 15.5px;
+  letter-spacing: -0.01em;
+}
+.pc-sub {
+  font-size: 12.5px;
+  color: var(--ink-3);
+  margin-top: 1px;
+}
+.pc-x {
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+  flex: none;
+}
+.pc-x:hover {
+  color: var(--ink);
+}
+
+.pc-hp {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+.pc-hp-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--dead);
+  overflow: hidden;
+}
+.pc-hp-bar span {
+  display: block;
+  height: 100%;
+  background: #35c759;
+  transition: width 0.4s ease;
+}
+.pc-hp-txt {
+  font-size: 12px;
+  color: var(--ink-3);
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* auto-fit 而不是固定列数: 浮窗在窄屏上会被压到一半宽, 固定四列会溢出 */
+.pc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(74px, 1fr));
+  gap: 9px 12px;
+  margin-top: 12px;
+}
+.pc-cell-l {
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+.pc-cell-v {
+  font-size: 14.5px;
+  font-weight: 560;
+  font-variant-numeric: tabular-nums;
+  margin-top: 1px;
+}
+
+.pc-block {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--hair-2);
+}
+.pc-block-t {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  letter-spacing: 0.02em;
+}
+.pc-items,
+.pc-runes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.pc-items img {
+  width: 32px;
+  height: 32px;
+  border-radius: 7px;
+  background: var(--hair-2);
+}
+.pc-runes img {
+  width: 27px;
+  height: 27px;
+  border-radius: 50%;
+  background: var(--hair-2);
+}
+.pc-shard {
+  font-size: 11.5px;
+  color: var(--ink-2);
+  background: var(--bg-2);
+  border-radius: 20px;
+  padding: 4px 9px;
+  align-self: center;
+}
+
+/* 属性: 图标 + 数字, 不写属性名。八个中文标签占的地方比数字还多, 而这些
+   基础装备图标 LoL 玩家一眼就认; 名字在 title 里, 悬停可查。 */
+.pc-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(66px, 1fr));
+  gap: 8px 10px;
+  margin-top: 9px;
+}
+.pc-stat {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* 内联 SVG, 跟 currentColor —— 明暗主题不用另做一套 */
+.pc-stat-ico {
+  width: 19px;
+  height: 19px;
+  flex: none;
+  color: var(--ink-3);
+}
+.pc-stat b {
+  font-size: 14.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.pc-abil {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+/* ── 胜率解析 ──────────────────────────────────────────────
+   "主要依据"从常驻区块搬进这个按需弹窗。 */
+.prob-mid.link {
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+  color: var(--ink-3);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  padding: 0;
+}
+.prob-mid.link:hover {
+  color: var(--ink);
+}
+
+/* 气泡从"胜率解析"这四个字**原地**长出来, 所以要一个定位锚点 */
+.prob-mid-wrap {
+  position: relative;
+  display: flex;
+  justify-content: center;
+}
+.prob-mid.link.on {
+  color: var(--ink);
+}
+
+/* 气泡面板。宽度写死并居中在锚点上, 于是不论刻度多宽都从同一个位置冒出。
+   两端用 max-width 兜底, 窄屏不会溢出屏幕。 */
+/* **居中靠 translateX(-50%), 不是负 margin**。
+   原来写的是 margin-left: min(-170px, -46vw) —— min() 取的是更"负"的那个,
+   在 1280px 宽下算出 -588px, 面板直接飞出去 419px。
+   而且定位一旦进了 transform, 入场动画就必须**显式写全 from/to**:
+   动画被浏览器节流卡在首帧时 (页面在后台就会), 靠隐式回到静止值那套
+   会把面板永久留在缩小状态。 */
+/* **圆形, 而且直接盖在原位上** —— 不是掉到下面去。
+   以"胜率解析"那四个字为圆心向四周张开, 视线不用挪, 也不会把下面的
+   局势描述顶开。 */
+.wb {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  /* 直径由 React 按内容算好后内联给出 —— 依据多/权重分布不同, 该占的
+     地方本来就不一样, 写死一个值要么挤要么空。 */
+  max-width: 92vw;
+  z-index: 20;
+  border: 1px solid var(--hair);
+  background: var(--panel-strong);
+  border-radius: 50%;
+  box-shadow: 0 16px 50px rgba(0, 0, 0, 0.2);
+  transform-origin: center;
+  transform: translate(-50%, -50%);
+  /* 悬停时圆盘要胀开给大球让地方 —— 和气泡用同一条曲线, 看起来是一件事 */
+  transition:
+    width 0.24s cubic-bezier(0.2, 0.8, 0.3, 1),
+    height 0.24s cubic-bezier(0.2, 0.8, 0.3, 1);
+  animation: wb-in 0.2s cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+@keyframes wb-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.3);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+/* 气泡舞台。所有气泡绝对定位在正中, 各自靠 transform 移到位 ——
+   交互只改 transform, 不动布局, 于是跟手也不会触发重排。 */
+/* 舞台铺满整个圆, 气泡以圆心为原点排布 */
+.wb-stage {
+  position: absolute;
+  inset: 0;
+}
+/* 外层只管**定位** —— transform 由 React 内联给出, CSS 不碰它。
+   两层分开是因为定位和呼吸都要用 transform, 写在同一个元素上后者会盖掉
+   前者, 气泡会全叠回正中。 */
+.wb-bub {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  padding: 0;
+  /* 尺寸也要过渡 —— 悬停时气泡要涨大到能装下整句话, 突变会很跳 */
+  transition:
+    transform 0.24s cubic-bezier(0.2, 0.8, 0.3, 1),
+    width 0.24s cubic-bezier(0.2, 0.8, 0.3, 1),
+    height 0.24s cubic-bezier(0.2, 0.8, 0.3, 1),
+    margin 0.24s cubic-bezier(0.2, 0.8, 0.3, 1),
+    opacity 0.2s ease;
+  animation: wb-pop 0.3s backwards ease-out;
+}
+@keyframes wb-pop {
+  from {
+    opacity: 0;
+  }
+}
+
+/* 内层是看得见的那个球, 呼吸动画在这一层 */
+.wb-ball {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  border-radius: 50%;
+  background: var(--blue-soft);
+  color: var(--blue);
+  font-variant-numeric: tabular-nums;
+  font-weight: 620;
+  font-size: 12px;
+  pointer-events: none;
+  transition:
+    transform 0.16s ease,
+    background 0.15s ease,
+    box-shadow 0.15s ease,
+    color 0.15s ease;
+  animation: wb-breathe 3.4s ease-in-out infinite alternate;
+}
+@keyframes wb-breathe {
+  from {
+    transform: scale(0.96);
+  }
+  to {
+    transform: scale(1.04);
+  }
+}
+.wb-bub.on {
+  z-index: 2;
+}
+.wb-bub.on .wb-ball {
+  background: var(--blue);
+  color: #fff;
+  box-shadow: 0 6px 22px var(--blue-soft);
+  /* 悬停时停掉呼吸 —— 一边跳一边读字很难受。也不再 scale:
+     气泡本身已经涨大了, 再缩放会把里面的文字一起糊掉。 */
+  animation: none;
+  transform: none;
+  /* 文字在圆里排版: 留出足够内边距, 免得贴到圆弧上 */
+  flex-direction: column;
+  gap: 5px;
+  padding: 0 26px;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.42;
+  text-align: center;
+}
+.wb-bub.on {
+  opacity: 1 !important;
+  z-index: 3;
+}
+/* 依据本身 */
+.wb-ball em {
+  font-style: normal;
+  font-weight: 600;
+}
+/* **写"相对权重", 不写"贡献几个百分点"** —— 后者模型给不出, 写出来就是编 */
+.wb-ball i {
+  font-style: normal;
+  font-size: 11px;
+  opacity: 0.72;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wb,
+  .wb-bub,
+  .wb-ball {
+    animation: none;
+  }
+  .wb-bub,
+  .wb-ball {
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+}
+/* 四个技能各一个色, 让加点顺序一眼能看出主升哪个 */
+.ab {
+  width: 21px;
+  height: 21px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 620;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: var(--ink-3);
+}
+.ab-q { background: #0071e3; }
+.ab-w { background: #34a853; }
+.ab-e { background: #f0a020; }
+.ab-r { background: #d92b1c; }

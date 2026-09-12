@@ -1,0 +1,2292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#fbfbfd" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<title>LoL 赛果预测</title>
+<style>
+/* ══════════════════════════════════════════════════════════════
+   编辑式版面: 大字号、大留白、克制用色、极少装饰。
+   字体走系统栈 (Apple 平台拿到 SF Pro), 不加载外部字体。
+   ══════════════════════════════════════════════════════════════ */
+:root{
+  /* 底色比卡片深一档 —— 之前 #fbfbfd 对 #ffffff 几乎无差, 卡片边界看不出来 */
+  --bg:#f0f0f3; --panel:#ffffff; --tint:#ececf0; --crest-bg:#2e2e33;
+  --ink:#1d1d1f; --ink-2:#5c5c61; --ink-3:#86868b;
+  --line:rgba(0,0,0,.12); --line-2:rgba(0,0,0,.07);
+  --accent:#0071e3;
+  --blue:#0071e3; --red:#e0301e; --green:#00875a; --amber:#b25000;
+  --dead:#d2d2d7;
+  --warn-bg:#fff4e5; --warn-line:#ffd9a8; --warn-ink:#8a4b00;
+  --sans:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text",
+         "PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#000000; --panel:#1c1c1e; --tint:#2c2c2e; --crest-bg:#38383d;
+    --ink:#f5f5f7; --ink-2:#a1a1a6; --ink-3:#86868b;
+    --line:rgba(255,255,255,.16); --line-2:rgba(255,255,255,.09);
+    --accent:#2997ff;
+    --blue:#2997ff; --red:#ff6259; --green:#41d392; --amber:#ffa93c;
+    --dead:#3a3a3c;
+    --warn-bg:#3a2a12; --warn-line:#5c4520; --warn-ink:#ffc880;
+  }
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%; scroll-behavior:smooth}
+body{
+  margin:0; background:var(--bg); color:var(--ink); font-family:var(--sans);
+  font-size:17px; line-height:1.5; letter-spacing:-.012em;
+  -webkit-font-smoothing:antialiased;
+}
+button,input{font:inherit; color:inherit}
+.hidden{display:none !important}
+.wrap{max-width:980px; margin:0 auto; padding:0 22px}
+
+/* ── 顶栏 ── */
+/* 高度不写死: 没有分局按钮时就是一行 48px, 有按钮时自己长高。
+   所以 BO1 / 还没开打的比赛不会白占一截。 */
+.nav{
+  position:sticky; top:0; z-index:40;
+  background:color-mix(in srgb, var(--bg) 72%, transparent);
+  -webkit-backdrop-filter:saturate(180%) blur(20px);
+  backdrop-filter:saturate(180%) blur(20px);
+  border-bottom:1px solid var(--line-2);
+}
+.nav .wrap{display:flex; flex-direction:column; align-items:center}
+/* 三列: 返回 | 标题 | 新鲜度。两侧都是 1fr, 所以标题永远落在真正的中线上,
+   不会因为左边有没有返回按钮、右边文字多长而偏。 */
+.navrow{
+  width:100%; height:54px; display:grid; align-items:center;
+  grid-template-columns:1fr auto 1fr; gap:10px;
+}
+.navrow > .back{justify-self:start}
+.navrow > .fresh{justify-self:end}
+/* 详情页标题是"C9 VS FLY", 窄屏上截断而不是把两侧挤走 */
+.brand{
+  font-size:22px; font-weight:640; letter-spacing:-.022em; margin:0;
+  min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  text-align:center;
+}
+.back{
+  display:inline-flex; align-items:center; gap:5px; border:0; background:none;
+  color:var(--accent); font-size:15px; cursor:pointer; padding:6px 4px 6px 0;
+  margin-left:-4px;
+}
+.back::before{
+  content:""; width:8px; height:8px; border-left:2px solid currentColor;
+  border-bottom:2px solid currentColor; transform:rotate(45deg);
+}
+.fresh{
+  font-size:12px; color:var(--ink-3);
+  display:inline-flex; align-items:center; gap:6px; white-space:nowrap;
+  min-width:0; overflow:hidden;
+}
+.dot{width:6px; height:6px; border-radius:50%; background:var(--ink-3)}
+.dot.fresh{background:var(--green)} .dot.stale{background:var(--amber)}
+.dot.very_stale{background:var(--red)}
+
+/* ── 版面节奏 ── */
+.hero{padding:64px 0 34px; text-align:center}
+.hero h1{
+  font-size:clamp(38px,6.4vw,60px); font-weight:640; letter-spacing:-.028em;
+  line-height:1.06; margin:0 0 12px;
+}
+.hero p{font-size:clamp(17px,2.1vw,21px); color:var(--ink-2); margin:0; line-height:1.42}
+.sec{padding:14px 0 40px}
+.sec-hd{
+  display:flex; align-items:baseline; gap:12px; margin:0 0 16px; padding:0 2px;
+}
+.sec-hd h2{font-size:24px; font-weight:620; letter-spacing:-.022em; margin:0}
+.sec-hd .n{font-size:15px; color:var(--ink-3)}
+.sec-hd button{
+  margin-left:auto; border:0; background:none; color:var(--accent);
+  font-size:15px; cursor:pointer; padding:4px;
+}
+.sec-hd button[disabled]{color:var(--ink-3); cursor:default}
+
+/* ── 比赛卡 ── */
+.cards{display:grid; gap:12px}
+.card{
+  display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:26px;
+  width:100%; padding:34px 30px; border:0; border-radius:22px;
+  background:var(--panel); cursor:pointer; font:inherit; color:inherit;
+  transition:transform .22s cubic-bezier(.25,.9,.3,1), box-shadow .22s ease;
+  box-shadow:0 1px 2px rgba(0,0,0,.05);
+}
+.card:hover{transform:translateY(-2px); box-shadow:0 10px 30px rgba(0,0,0,.1)}
+.card:active{transform:translateY(0)}
+.card[disabled]{opacity:.4; cursor:default; transform:none; box-shadow:none}
+/* 队标向中间靠: 队名在外侧, 队标贴着中列 —— [名 标] VS [标 名] */
+.side{
+  display:flex; align-items:center; gap:16px; min-width:0;
+  flex-direction:row-reverse; justify-content:flex-start; text-align:right;
+}
+.side.right{flex-direction:row; text-align:left}
+/* 队标底色用深色, 浅色模式下也一样。
+   上游给的资源本来就是为深底设计的 —— 文件名直接写着:
+   TLAlienware_Minimal_Bug-White.png / DIG-FullonDark.png / LGD-FullonDark-1.png。
+   白色图案放浅底上无论怎么调深一档都还是看不清, 必须换深底。 */
+.crest{
+  position:relative; width:68px; height:68px; flex:none; border-radius:17px;
+  background:var(--crest-bg); overflow:hidden;
+}
+.crest img{position:absolute; inset:9px; width:calc(100% - 18px);
+           height:calc(100% - 18px); object-fit:contain}
+.crest .fb{
+  position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  font-family:var(--mono); font-size:13px; font-weight:700;
+  color:rgba(255,255,255,.62);      /* 深底上的缩写兜底 */
+}
+.tname{
+  font-size:25px; font-weight:640; letter-spacing:-.022em; min-width:0;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+/* 中列自上而下: 时间 / VS / 赛区 / BO几 */
+.card-mid{
+  display:flex; flex-direction:column; align-items:center; gap:5px; flex:none;
+  min-width:96px;
+}
+.c-time{font-size:14px; color:var(--ink-2); white-space:nowrap}
+.vsmark{
+  font-size:22px; font-weight:700; letter-spacing:.07em; color:var(--ink-3);
+  margin:1px 0;
+}
+.c-lg{
+  font-size:12px; font-weight:700; letter-spacing:.04em; color:var(--ink-2);
+  background:var(--tint); border-radius:20px; padding:2px 9px;
+}
+.c-bo{font-size:12.5px; color:var(--ink-3)}
+/* 只有"队伍不在历史数据里"的禁用卡片还用它 */
+.card-sub{font-size:13px; color:var(--ink-2); text-align:center; max-width:190px}
+@media(max-width:620px){
+  .card{grid-template-columns:1fr auto 1fr; gap:10px; padding:20px 12px}
+  .side{flex-direction:column; gap:8px; text-align:center; justify-content:center}
+  .side.right{flex-direction:column}
+  .crest{width:52px; height:52px; border-radius:14px}
+  .crest img{inset:7px; width:calc(100% - 14px); height:calc(100% - 14px)}
+  .tname{font-size:16px; white-space:normal; overflow-wrap:anywhere}
+  .card-mid{min-width:72px; gap:3px}
+  .vsmark{font-size:17px}
+  .c-time{font-size:12px}
+}
+.tag{
+  font-size:11px; font-weight:600; letter-spacing:.03em; padding:2px 7px;
+  border-radius:20px; background:var(--tint); color:var(--ink-2);
+}
+.tag.live{background:var(--red); color:#fff}
+.tag.pause{background:var(--amber); color:#fff}
+.tag.demo{background:var(--amber); color:#fff}
+.pulse{
+  display:inline-block; width:6px; height:6px; border-radius:50%; background:#fff;
+  margin-right:5px; animation:pulse 1.7s ease-in-out infinite; vertical-align:1px;
+}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+@media(prefers-reduced-motion:reduce){
+  .pulse{animation:none} .card{transition:none}
+}
+.sc{font-family:var(--mono); font-size:15px; font-weight:700; color:var(--ink);
+    flex:none}
+/* 卡片里的比分是顶替 VS 的, 要和 VS 一样重 */
+.card .sc{font-size:23px; margin:1px 0}
+.go{
+  width:9px; height:9px; flex:none; border-right:2px solid var(--ink-3);
+  border-bottom:2px solid var(--ink-3); transform:rotate(-45deg);
+}
+.empty{
+  padding:40px 20px; text-align:center; color:var(--ink-2); font-size:16px;
+  background:var(--panel); border-radius:18px;
+}
+
+/* ── 详情: 一整块主模块 (对阵 + 战况 + 阵容) ── */
+.board{
+  background:var(--panel); border-radius:22px; overflow:hidden;
+  margin:20px 0 16px; box-shadow:0 1px 3px rgba(0,0,0,.05);
+}
+.mhero{padding:0; text-align:center}
+/* 渐变铺满整块 (队标 + 战况 + 经济条), 左蓝右红, 中间自然淡出不断开 */
+.tint{
+  /* 上边距放在带渐变的容器里, 留出的是底色不是白 */
+  padding:22px 0 16px;
+  background:linear-gradient(90deg,
+    color-mix(in srgb, var(--blue) 17%, transparent) 0%,
+    transparent 46%, transparent 54%,
+    color-mix(in srgb, var(--red) 17%, transparent) 100%);
+}
+.mhero .lead{
+  font-size:13px; font-weight:600; letter-spacing:.05em; text-transform:uppercase;
+  color:var(--ink-3); margin:0 0 14px;
+}
+/* 两侧渐变一直铺到中间, 中间靠背景自然过渡, 不留缝 */
+.faceoff{
+  display:grid; grid-template-columns:1fr auto 1fr; align-items:center;
+  gap:0; margin-bottom:20px;
+}
+/* 顶部对阵也按本局选边: 左边永远蓝方, 右边永远红方, 换的是哪支队站哪边 */
+/* 渐变已经在 .tint 上, 这里不再各自带背景 */
+.team{display:flex; flex-direction:column; align-items:center; gap:9px; min-width:0;
+      padding:0 8px 6px}
+.team .sidetag{
+  font-size:10px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;
+}
+.team.b .sidetag{color:var(--blue)} .team.r .sidetag{color:var(--red)}
+.team.b .tn{color:var(--blue)} .team.r .tn{color:var(--red)}
+/* 队标顶头, 上方不留白 */
+.team .crest{width:96px; height:96px; border-radius:22px; margin-top:0}
+.team .crest img{inset:13px; width:calc(100% - 26px); height:calc(100% - 26px)}
+@media(max-width:640px){
+  .team .crest{width:66px; height:66px; border-radius:16px}
+  .team .crest img{inset:9px; width:calc(100% - 18px); height:calc(100% - 18px)}
+}
+.team .tn{font-size:19px; font-weight:600; letter-spacing:-.02em; text-align:center}
+.team .tp{font-family:var(--mono); font-size:34px; font-weight:660; letter-spacing:-.03em}
+.team.b .tp{color:var(--blue)} .team.r .tp{color:var(--red)}
+.mid-sc{text-align:center; padding:0 22px}
+.mid-sc .v{font-family:var(--mono); font-size:46px; font-weight:700;
+           letter-spacing:-.03em; line-height:1.05}
+.mid-sc .l{font-size:12px; color:var(--ink-3); margin-top:4px}
+.mid-sc .st{font-weight:600; color:var(--ink-2)}
+@media(max-width:640px){ .mid-sc{padding:0 8px} .mid-sc .v{font-size:32px} }
+.headline{
+  font-size:clamp(26px,4vw,38px); font-weight:640; letter-spacing:-.026em;
+  margin:0 0 8px;
+}
+.subline{font-size:17px; color:var(--ink-2); margin:0}
+.demo-note{
+  display:inline-block; margin-top:14px; padding:7px 15px; border-radius:20px;
+  background:var(--amber); color:#fff; font-size:13px; font-weight:600;
+}
+
+/* ── 局切换 (放在导航栏, 滚到哪都能切) ── */
+.navgames{
+  display:inline-flex; gap:2px; padding:2px; border-radius:10px;
+  background:var(--tint); align-self:center; margin:0 0 9px;
+}
+.navgames.hidden{display:none}
+.navgames button{
+  border:0; background:none; border-radius:8px; padding:5px 12px;
+  font-size:13px; font-weight:500; cursor:pointer; color:var(--ink-2);
+  white-space:nowrap; transition:background .2s ease, color .2s ease;
+}
+.navgames button[aria-selected=true]{
+  background:var(--panel); color:var(--ink); font-weight:600;
+  box-shadow:0 1px 3px rgba(0,0,0,.12);
+}
+.navgames button[disabled]{opacity:.3; cursor:default}
+/* 换局要向上游回填整条时间线, 没缓存过的一局约两秒。这两秒里把面板压暗,
+   明确表示"在更新", 而不是让人以为点击没生效。轮询触发的刷新是热路径
+   (约 60ms), 快到看不出这个状态。 */
+/* G1/G2 这排按钮在导航栏里, 不是 #scMatch 的后代, 所以压暗内容时它照常
+   是亮的 —— 正好, 选中态要立刻看得见。 */
+#scMatch.busy .wrap{opacity:.45; transition:opacity .15s ease}
+#scMatch.busy{cursor:progress}
+@media(prefers-reduced-motion:reduce){ #scMatch.busy .wrap{transition:none} }
+@media(max-width:560px){
+  .navgames button{padding:5px 9px; font-size:12px}
+  .fresh{display:none}
+}
+
+/* ── 面板 ── */
+.panel{background:var(--panel); border-radius:20px; overflow:hidden; margin-bottom:16px}
+.panel-hd{
+  padding:20px 22px 4px; font-size:19px; font-weight:620; letter-spacing:-.02em;
+}
+.panel-hd .sub{
+  display:block; font-size:13px; font-weight:400; color:var(--ink-3);
+  margin-top:3px; letter-spacing:0;
+}
+.chart{display:block; width:100%; height:auto; padding:8px 10px 4px}
+.chart text{font-family:var(--mono); font-size:10px; fill:var(--ink-3)}
+.grid{stroke:var(--line-2); stroke-width:1}
+/* 50% 那条是整张图的基准线, 要比普通网格线明显 —— 之前和网格线几乎一样,
+   得凑近了看才知道哪条是中线。 */
+.mid-line{stroke:var(--ink-3); stroke-width:1.6; stroke-dasharray:none; opacity:.55}
+.axmid{fill:var(--ink-2); font-weight:700}
+.deadband{fill:url(#hatch)}
+.deadlab{font-size:9px; fill:var(--ink-3)}
+.pline{fill:none; stroke:var(--ink); stroke-width:2.5; stroke-linejoin:round;
+       stroke-linecap:round}
+.pfill.up{fill:var(--blue); opacity:.16}
+.pfill.dn{fill:var(--red); opacity:.16}
+.axb{fill:var(--blue)} .axr{fill:var(--red)}
+.refpre{stroke:var(--ink-3); stroke-width:1.4; stroke-dasharray:6 4; fill:none}
+.refpost{stroke:var(--teal); stroke-width:1.4; stroke-dasharray:2 3; fill:none}
+.reflab{font-family:var(--sans); font-size:10.5px; font-weight:600}
+text.refpre{fill:var(--ink-3); stroke:none}
+text.refpost{fill:var(--teal); stroke:none}
+.gpos{fill:var(--blue); opacity:.16} .gneg{fill:var(--red); opacity:.16}
+.gline{fill:none; stroke-width:2; stroke-linejoin:round}
+.gline.pos{stroke:var(--blue)} .gline.neg{stroke:var(--red)}
+.kline{fill:none; stroke:var(--ink-3); stroke-width:1.6; stroke-dasharray:4 3;
+       stroke-linejoin:round}
+.klab{font-family:var(--sans); font-size:11px; font-weight:600; fill:var(--ink-3)}
+.nowdot.b{fill:var(--blue)} .nowdot.r{fill:var(--red)}
+.nowlab{font-family:var(--sans); font-size:13px; font-weight:700}
+.nowlab.b{fill:var(--blue)} .nowlab.r{fill:var(--red)}
+
+/* ── 统计条 ── */
+.stats{
+  display:grid; grid-template-columns:repeat(4,1fr); border-top:1px solid var(--line-2);
+}
+@media(max-width:600px){.stats{grid-template-columns:repeat(2,1fr)}}
+.stat{padding:16px 12px; text-align:center; border-right:1px solid var(--line-2)}
+.stat:last-child{border-right:0}
+@media(max-width:600px){
+  .stat:nth-child(2n){border-right:0}
+  .stat:nth-child(-n+2){border-bottom:1px solid var(--line-2)}
+}
+.stat .k{font-size:12px; color:var(--ink-3)}
+.stat .v{font-family:var(--mono); font-size:22px; font-weight:620; margin-top:3px;
+         letter-spacing:-.02em}
+.stat .v.pos{color:var(--blue)} .stat .v.neg{color:var(--red)}
+.stat .v.na{color:var(--ink-3); font-size:15px; font-weight:500}
+
+/* ── 阵容 ── */
+.roster-hd{
+  padding:14px 22px 10px; font-size:13px; font-weight:600; color:var(--ink-2);
+  display:flex; align-items:baseline; gap:9px;
+  border-top:1px solid var(--line-2); margin-top:18px;
+}
+.roster-hd span{font-weight:400; color:var(--ink-3); font-size:12.5px}
+
+/* 对位排布: 一行 = 一个位置, 蓝方在左红方在右, 中间是位置名。
+   之前是上下两段各五人, 要比同位置选手得来回翻。 */
+.lane{
+  display:grid; grid-template-columns:1fr 74px 1fr; align-items:stretch;
+  border-top:1px solid var(--line-2);
+}
+/* 中间栏是对位经济差, 不是位置名 —— 位置从头像和阵型顺序已经看得出来,
+   而经济差是这一栏唯一能提供的新信息。 */
+.lane-gap{
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:1px; background:var(--tint); padding:4px 2px;
+}
+.lane-gap .g{
+  font-family:var(--mono); font-size:18px; font-weight:700; white-space:nowrap;
+  letter-spacing:-.02em;
+}
+.lane-gap .g.b{color:var(--blue)} .lane-gap .g.r{color:var(--red)}
+.lane-gap .g.even{color:var(--ink-3); font-weight:500}
+
+/* ── 战况条: 图标式, 参照官方观战 HUD ── */
+.objbar{padding:2px 22px 4px; max-width:760px; margin:0 auto}
+.ico{width:15px; height:15px; fill:currentColor; flex:none; display:block}
+.ico.gi{width:15px; height:15px}
+/* 人头: 居中放大的比分式 "1 × 8" */
+.killrow{
+  display:flex; align-items:center; justify-content:center; gap:16px;
+  font-family:var(--mono); margin:2px 0 10px;
+}
+.killrow .kv{font-size:40px; font-weight:700; letter-spacing:-.03em; line-height:1}
+.killrow .kv.b{color:var(--blue)} .killrow .kv.r{color:var(--red)}
+.killrow .kx{color:var(--ink-3); display:flex}
+.killrow .kx .ico{width:22px; height:22px}
+@media(max-width:640px){ .killrow .kv{font-size:29px} .killrow{gap:11px} }
+/* 经济: 数字在横条两端 */
+.goldrow{
+  display:grid; grid-template-columns:auto 1fr auto; align-items:center; gap:12px;
+  font-family:var(--mono); margin:10px 0 9px;
+}
+.goldrow .gv{font-size:18px; font-weight:700; letter-spacing:-.02em}
+.goldrow .gv.b{color:var(--blue)} .goldrow .gv.r{color:var(--red)}
+.goldbar{
+  display:flex; height:6px; border-radius:4px; overflow:hidden;
+  background:var(--tint);
+}
+.goldbar .b{background:var(--blue)} .goldbar .r{background:var(--red)}
+/* 小龙在最下面两侧, 中间放经济差 */
+.drakerow{
+  display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:12px;
+}
+.drakerow .oi.drakes{gap:3px}
+.drakerow .oi:first-child{justify-content:flex-start; color:var(--blue)}
+.drakerow .oi:last-child{justify-content:flex-end; color:var(--red)}
+.drakerow .gdiff{
+  display:inline-flex; align-items:center; gap:5px; font-family:var(--mono);
+  font-size:13px; font-weight:700;
+}
+.drakerow .gdiff.b{color:var(--blue)} .drakerow .gdiff.r{color:var(--red)}
+/* 小龙按元素着色。图标本身是同一个, 颜色区分属性 —— 拿了哪几条比拿了几条
+   信息量大。用高饱和、色相分得开的一组: 原来那组偏灰, 在浅色底上几乎看不出
+   是哪一条。 */
+.drake{display:inline-flex}
+.drake.infernal{color:#ff3b30} .drake.ocean   {color:#0a84ff}
+.drake.mountain{color:#ff9500} .drake.cloud   {color:#32ade6}
+.drake.chemtech{color:#2fbf4f} .drake.hextech {color:#bf5af2}
+.drake.elder   {color:#e8b100}
+.oi.drakes{gap:5px}
+.oi.drakes .ico{width:27px; height:27px}
+@media(max-width:640px){ .oi.drakes .ico{width:21px; height:21px} .oi.drakes{gap:3px} }
+/* 每队的数据在自己那一侧 */
+/* 其余数据两端对齐: 蓝方靠左端, 红方靠右端 */
+.osides{display:grid; grid-template-columns:1fr 1fr; gap:18px; align-items:center}
+.oside{display:flex; flex-wrap:wrap; gap:6px 20px; align-items:center}
+.oside.b{justify-content:flex-start; color:var(--blue)}
+.oside.r{justify-content:flex-end; color:var(--red)}
+.oi{display:inline-flex; align-items:center; gap:7px; font-family:var(--mono)}
+.oi b{font-size:24px; font-weight:700; letter-spacing:-.02em}
+.oi.dim{color:var(--ink-3); opacity:.5}
+.oside .ico{width:23px; height:23px}
+@media(max-width:640px){
+  .osides{gap:8px}
+  .oside{gap:5px 11px}
+  .oi b{font-size:17px}
+  .oside .ico{width:17px; height:17px}
+  .goldrow .gv{font-size:16px}
+}
+/* 左半永远是蓝色方, 右半永远是红色方; 换的是哪支队站哪边 */
+.half{display:flex; gap:11px; padding:12px 16px; min-width:0;
+      border-left:3px solid transparent}
+.half.b{border-left-color:var(--blue)}
+.half.r{flex-direction:row-reverse; text-align:right;
+        border-left:0; border-right:3px solid var(--red)}
+.half.b .pn{color:var(--blue)} .half.r .pn{color:var(--red)}
+.champ{position:relative; width:44px; height:44px; flex:none}
+/* 头像盖在兜底文字上 —— 靠层叠顺序, 不靠 onload 改 display。
+   onload 那套在元素重建时会先露出文字再被盖掉, 本身就是一次闪;
+   加载失败时 onerror 把 <img> 摘掉, 文字自然露出来。 */
+.champ img{
+  position:absolute; inset:0; width:100%; height:100%;
+  border-radius:12px; background:var(--tint); object-fit:cover; display:block;
+}
+.champ .fb{
+  position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  border-radius:12px; background:var(--tint); font-size:9px; font-weight:700;
+  color:var(--ink-3); text-align:center; padding:2px; line-height:1.1;
+}
+/* 阵亡: 头像去色压暗, 盖一个标。复活时间数据源里没有, 所以不写倒计时。 */
+.champ.dead img{filter:grayscale(1) brightness(.45); transition:filter .35s ease}
+.champ img{transition:filter .35s ease}
+.champ .dtag{
+  position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+  font-size:10px; font-weight:700; letter-spacing:.04em; white-space:nowrap;
+  color:#fff; background:rgba(0,0,0,.62); border-radius:5px; padding:2px 5px;
+  pointer-events:none;
+}
+.champ .dtag[hidden]{display:none}
+.champ.dead .fb{color:var(--ink-3)}
+.champ .lv{
+  position:absolute; right:-5px; bottom:-5px; min-width:20px; height:20px;
+  border-radius:10px; background:var(--ink); color:var(--panel);
+  font-family:var(--mono); font-size:11px; font-weight:700; padding:0 5px;
+  display:flex; align-items:center; justify-content:center;
+  border:2.5px solid var(--panel);
+}
+.half.r .champ .lv{right:auto; left:-5px}
+.pbody{min-width:0; flex:1; display:flex; flex-direction:column; gap:3px}
+.pn{font-size:16px; font-weight:600; letter-spacing:-.015em;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+/* 名单还没同步出来时的占位 —— 弱化, 一眼看出是"还没有"而不是"出错了" */
+.unk{color:var(--ink-3); font-weight:400}
+
+/* ── AI 复核 (Stage 3) ── */
+.dbtn{
+  border:0; border-radius:12px; padding:12px 22px; font-size:15px; font-weight:600;
+  background:var(--accent); color:#fff; cursor:pointer; margin:14px 22px 4px;
+  transition:opacity .2s;
+}
+.dbtn:disabled{opacity:.45; cursor:default}
+.sidewarn{margin:10px 22px 0; padding:8px 12px; border-radius:8px;
+          background:var(--warn-bg); color:var(--warn-ink); border:1px solid
+          var(--warn-line); font-size:13px; line-height:1.6}
+.dbnote{font-size:13px; color:var(--ink-3); margin:6px 22px 16px}
+.dbraw{margin:0 22px 12px; border-left:3px solid var(--line); padding-left:12px}
+.dbrawhd{font-size:12px; color:var(--ink-3); margin-bottom:4px}
+.dbrawtx{font-size:13px; line-height:1.65; color:var(--ink-2);
+         white-space:pre-wrap; max-height:340px; overflow-y:auto}
+.dbspin{
+  width:22px; height:22px; margin:18px 22px 0; border-radius:50%;
+  border:2.5px solid var(--line); border-top-color:var(--accent);
+  animation:dbspin .8s linear infinite;
+}
+@keyframes dbspin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){ .dbspin{animation-duration:2.4s} }
+.dbsec{padding:14px 22px 4px}
+.dbsec h4{font-size:13px; font-weight:700; color:var(--ink-3); margin:0 0 8px;
+          letter-spacing:.04em}
+/* 一条主张。状态用左边的色条区分 —— 比彩色文字更容易扫。 */
+.claim{
+  display:flex; gap:10px; align-items:flex-start; padding:9px 0;
+  border-top:1px solid var(--line-2); font-size:14.5px; line-height:1.5;
+}
+.claim:first-of-type{border-top:0}
+.cst{
+  flex:none; font-size:11px; font-weight:700; padding:3px 8px; border-radius:6px;
+  white-space:nowrap; margin-top:1px;
+}
+.cst.survived{background:rgba(47,191,79,.14); color:#1e8f38}
+.cst.contested{background:rgba(255,149,0,.16); color:#a35f00}
+.cst.conceded{background:var(--tint); color:var(--ink-3)}
+.cst.refuted{background:rgba(224,48,30,.12); color:var(--red)}
+.claim a{color:var(--accent); font-size:12.5px; text-decoration:none}
+.claim .cmeta{display:block; color:var(--ink-3); font-size:12.5px; margin-top:2px}
+.dbcons{
+  margin:0 22px 4px; padding:12px 14px; border-radius:12px;
+  background:var(--tint); font-size:14.5px; line-height:1.55;
+}
+.dberr{margin:8px 22px 14px; font-size:13px; color:var(--ink-3)}
+/* 血条。红方那一侧从右往左长, 和阵营朝向一致。
+   width:100% 不能省 —— .pbody 是纵向 flex, 靠 stretch 撑宽的项一旦加上
+   margin-left:auto 就退化成 shrink-to-fit, 里面那条按百分比定宽的 span
+   就变成了 0 宽。红方整排血条消失就是这么来的。 */
+.hp{height:5px; border-radius:3px; background:var(--line-2); overflow:hidden;
+    display:flex; width:100%; max-width:150px}
+.half.r .hp{justify-content:flex-end; margin-left:auto}
+/* 宽度由 rAF 驱动 (见 tween), 这里不能再挂 CSS transition —— 两套动画叠在
+   一起会互相拖拽, 血条反而更黏。 */
+.hp span{background:#2fbf4f; border-radius:3px}
+.hp.low span{background:#ff9500}
+.hp.dead{background:var(--line-2); opacity:.45}
+.pk{font-family:var(--mono); font-size:14px}
+.pk .d{color:var(--red)}
+.pd{font-size:12px; color:var(--ink-3); display:flex; gap:7px; flex-wrap:wrap}
+.half.r .pd{justify-content:flex-end}
+.gear{display:flex; gap:3px; flex-wrap:wrap}
+.half.r .gear{justify-content:flex-end}
+/* 六个格子常驻, 空的就是底色。<img> 元素一直在, 只换 src ——
+   不再每轮销毁重建, 所以不会闪。 */
+.gear .slot{
+  position:relative; width:23px; height:23px; border-radius:6px;
+  background:var(--tint); display:block; flex:none; overflow:hidden;
+}
+.gear .slot img{
+  position:absolute; inset:0; width:100%; height:100%;
+  object-fit:cover; display:block;
+}
+.gear .slot img[hidden]{display:none}
+@media(max-width:640px){
+  .lane{grid-template-columns:1fr 46px 1fr}
+  .half{padding:10px 9px; gap:8px; flex-direction:column; align-items:center;
+        text-align:center}
+  .half.r{flex-direction:column}
+  .pd{display:none}
+  .pn{font-size:14px}
+  .gear img,.gear span{width:19px; height:19px}
+  .half.r .gear,.half.r .pd{justify-content:center}
+}
+
+/* ── 文字块 ── */
+.rlist{margin:0; padding:0; list-style:none; counter-reset:r}
+.rlist li{
+  counter-increment:r; position:relative; font-size:16.5px; line-height:1.45;
+  padding:14px 22px 14px 54px; border-top:1px solid var(--line-2);
+}
+.rlist li::before{
+  content:counter(r); position:absolute; left:22px; top:15px;
+  width:21px; height:21px; border-radius:50%; background:var(--tint);
+  font-family:var(--mono); font-size:11px; font-weight:700; color:var(--ink-3);
+  display:flex; align-items:center; justify-content:center;
+}
+.wlist{margin:0; padding:0; list-style:none}
+.wlist li{
+  display:flex; gap:11px; font-size:15.5px; line-height:1.45; color:var(--ink-2);
+  padding:13px 22px; border-top:1px solid var(--line-2);
+}
+.wlist li::before{content:"—"; color:var(--amber); flex:none; font-weight:700}
+.note{padding:18px 22px; font-size:15.5px; color:var(--ink-2)}
+.note p{margin:0 0 9px} .note p:last-child{margin:0}
+.fine{
+  font-size:12.5px; color:var(--ink-3); line-height:1.55; margin:22px 2px 0;
+  padding-bottom:10px;
+}
+
+/* ── 手动输入 ── */
+.form{background:var(--panel); border-radius:20px; overflow:hidden; margin-bottom:16px}
+.frow{
+  display:flex; align-items:center; gap:14px; padding:13px 22px;
+  border-top:1px solid var(--line-2);
+}
+.frow:first-child{border-top:0}
+.frow label{font-size:16px; min-width:64px; flex:none}
+.frow input:not([type=checkbox]){
+  flex:1; min-width:0; border:0; background:none; text-align:right;
+  font-size:16px; outline:none;
+}
+.frow input::placeholder{color:var(--ink-3)}
+.frow.col{flex-direction:column; align-items:stretch; gap:9px}
+.seg{display:flex; gap:3px; padding:3px; background:var(--tint); border-radius:11px}
+.seg button{
+  flex:1; border:0; background:none; border-radius:8px; padding:8px 4px;
+  font-size:14px; font-weight:500; cursor:pointer; color:var(--ink-2);
+}
+.seg button[aria-selected=true]{background:var(--panel); color:var(--ink);
+  font-weight:600; box-shadow:0 1px 3px rgba(0,0,0,.1)}
+.sw{position:relative; width:50px; height:30px; flex:none; margin-left:auto}
+.sw input{position:absolute; opacity:0; width:100%; height:100%; margin:0; cursor:pointer; z-index:2}
+.sw span{position:absolute; inset:0; border-radius:100px; background:var(--tint);
+         transition:background .22s}
+.sw span::after{content:""; position:absolute; top:2px; left:2px; width:26px; height:26px;
+  border-radius:50%; background:#fff; box-shadow:0 1px 4px rgba(0,0,0,.25);
+  transition:transform .22s cubic-bezier(.3,1.3,.5,1)}
+.sw input:checked + span{background:var(--green)}
+.sw input:checked + span::after{transform:translateX(20px)}
+.psec{padding:14px 22px 4px; font-size:12px; font-weight:700; letter-spacing:.05em}
+.psec.b{color:var(--blue)} .psec.r{color:var(--red)}
+.pick{display:grid; grid-template-columns:52px 1fr 1fr; gap:9px;
+      align-items:center; padding:5px 22px}
+.pick span{font-size:14px; color:var(--ink-3)}
+.pick input{border:0; background:var(--tint); border-radius:9px; padding:9px 11px;
+            font-size:15px; min-width:0; outline:none}
+.pick:last-child{padding-bottom:14px}
+.cta{
+  display:block; width:100%; padding:15px; border:0; border-radius:980px;
+  background:var(--accent); color:#fff; font-size:17px; font-weight:500;
+  cursor:pointer; transition:opacity .2s;
+}
+.cta:active{opacity:.82}
+.cta:disabled{opacity:.45; cursor:progress}
+.linkline{text-align:center; margin:26px 0 8px}
+.linkline button{border:0; background:none; color:var(--accent); font-size:16px;
+                 cursor:pointer; padding:10px}
+.err{
+  background:var(--panel); border-radius:18px; padding:22px; margin-bottom:16px;
+  border-left:3px solid var(--red);
+}
+.err b{display:block; font-size:18px; font-weight:600; margin-bottom:5px}
+.err p{margin:0; color:var(--ink-2); font-size:15.5px}
+</style>
+</head>
+<body>
+
+<nav class="nav"><div class="wrap">
+  <div class="navrow">
+    <button class="back hidden" id="btnBack">比赛</button>
+    <p class="brand" id="brand">赛果预测</p>
+    <span class="fresh" id="fresh"><span class="dot"></span>读取中</span>
+  </div>
+  <div class="navgames hidden" id="navGames"></div>
+</div></nav>
+
+<!-- ══ 列表 ══ -->
+<main id="scList">
+  <header class="hero wrap">
+    <h1>看得见依据的胜率</h1>
+    <p>四大赛区的实时对局与赛程。每一个数字都附带它的来源、限制与不确定性。</p>
+  </header>
+
+  <section class="sec wrap">
+    <div class="sec-hd"><h2>正在进行</h2><span class="n" id="nLive"></span>
+      <button id="rLive">刷新</button></div>
+    <div class="cards" id="liveList"><div class="empty">读取中…</div></div>
+  </section>
+
+  <section class="sec wrap">
+    <div class="sec-hd"><h2>即将开赛</h2><span class="n" id="nSched"></span>
+      <button id="rSched">刷新</button></div>
+    <div class="cards" id="schedList"><div class="empty">读取中…</div></div>
+    <p class="linkline"><button id="toManual">手动输入不在列表里的对阵</button></p>
+  </section>
+</main>
+
+<!-- ══ 详情 ══ -->
+<main id="scMatch" class="hidden">
+  <div class="wrap">
+   <!-- 对阵 + 战况 + 阵容 是一个整体, 合成一张大卡 -->
+   <div class="board">
+    <header class="mhero">
+     <div class="tint">
+      <div class="faceoff">
+        <div class="team b"><span class="crest" id="bCrest"></span>
+          <span class="sidetag">蓝色方</span>
+          <span class="tn" id="bName">蓝方</span><span class="tp" id="bPct">—</span></div>
+        <div class="mid-sc"><div class="v" id="mScore">—</div>
+          <div class="l" id="mBo"></div>
+          <div class="l st" id="mStatus"></div></div>
+        <div class="team r"><span class="crest" id="rCrest"></span>
+          <span class="sidetag">红色方</span>
+          <span class="tn" id="rName">红方</span><span class="tp" id="rPct">—</span></div>
+      </div>
+      <div class="objbar hidden" id="objbar"></div>
+      <p class="sidewarn hidden" id="sideWarn"></p>
+     </div>
+      <h2 class="headline hidden" id="mHead">读取中</h2>
+      <p class="subline hidden" id="mSub"></p>
+      <div id="mDemo" class="demo-note hidden">演示数据 · 局势是构造的,概率是模型真算的</div>
+    </header>
+
+    <div class="hidden" id="pRoster">
+      <span class="hidden" id="rosterSub"></span>
+      <div id="roster"></div>
+    </div>
+   </div>
+
+    <section class="sec" style="padding-top:4px">
+      <div class="panel" id="pWin">
+        <div class="panel-hd">胜率走势
+          <span class="sub" id="winSub">阴影带是校准后模型够不到的区间</span></div>
+        <svg class="chart" id="winChart" viewBox="0 0 900 250" preserveAspectRatio="none"
+             role="img" aria-label="胜率走势"></svg>
+      </div>
+
+      <div class="panel" id="pGold">
+        <div class="panel-hd">经济与人头
+          <span class="sub">实线为经济差,虚线为人头差 · 正值为蓝方领先。
+            两者都进模型 —— 只看经济常常解释不了胜率的走向。</span></div>
+        <svg class="chart" id="goldChart" viewBox="0 0 900 200" preserveAspectRatio="none"
+             role="img" aria-label="经济差走势"></svg>
+      </div>
+
+      <div class="panel hidden" id="pReasons">
+        <div class="panel-hd">依据 <span class="sub">按模型给这些指标的权重排序</span></div>
+        <ol class="rlist" id="reasons"></ol>
+      </div>
+
+      <div class="panel hidden" id="pWarn">
+        <div class="panel-hd">这次读数的限制 <span class="sub">影响可信度的已知问题</span></div>
+        <ul class="wlist" id="warns"></ul>
+      </div>
+
+      <div class="panel" id="pModel">
+        <div class="panel-hd">模型 <span class="sub">它自己的成绩单</span></div>
+        <div class="note" id="meta"></div>
+      </div>
+
+      <!-- Stage 3: 四个不同血统的模型交叉质证。不改概率, 只报告哪些说法站住了。 -->
+      <div class="panel hidden" id="pDebate">
+        <div class="panel-hd">AI 复核
+          <span class="sub">四个模型交叉质证 · 不修改概率, 只报告哪些说法经受住了反驳</span>
+        </div>
+        <div id="dbIdle">
+          <button class="dbtn" id="btnDebate">让 AI 复核这场</button>
+          <p class="dbnote" id="dbHint">要一分钟左右 —— 四轮:检索 → 各自表态 → 交叉质证 → 裁定</p>
+        </div>
+        <div id="dbBusy" class="hidden">
+          <div class="dbspin"></div>
+          <p class="dbnote">复核中 · 已用 <span id="dbSec">0</span> 秒</p>
+        </div>
+        <div id="dbOut" class="hidden"></div>
+      </div>
+
+      <p class="fine" id="fine"></p>
+    </section>
+  </div>
+</main>
+
+<!-- ══ 手动 ══ -->
+<main id="scManual" class="hidden">
+  <div class="wrap">
+    <header class="hero" style="padding:44px 0 24px">
+      <h1 style="font-size:clamp(30px,4.6vw,42px)">手动输入</h1>
+      <p>不在列表里的对阵,或者想自己拨动局内数据看模型怎么反应。</p>
+    </header>
+    <section class="sec">
+      <div class="form">
+        <div class="frow col">
+          <div class="seg" id="lgSeg" role="tablist">
+            <button type="button" role="tab" data-v="LPL">LPL</button>
+            <button type="button" role="tab" data-v="LCK" aria-selected="true">LCK</button>
+            <button type="button" role="tab" data-v="LEC">LEC</button>
+            <button type="button" role="tab" data-v="LCS">LCS</button>
+          </div>
+          <input type="hidden" id="league" value="LCK">
+        </div>
+        <div class="frow"><label for="blue">蓝方</label>
+          <input id="blue" list="teams" autocomplete="off" placeholder="队名需与数据一致"></div>
+        <div class="frow"><label for="red">红方</label>
+          <input id="red" list="teams" autocomplete="off" placeholder="队名需与数据一致"></div>
+        <datalist id="teams"></datalist>
+        <div class="frow"><label>季后赛</label>
+          <label class="sw"><input type="checkbox" id="playoffs"><span></span></label></div>
+      </div>
+
+      <div class="form" id="draftBox"></div>
+
+      <div class="form">
+        <div class="frow"><label for="minute">分钟</label>
+          <input type="number" id="minute" min="5" max="60" placeholder="留空=赛前预测"></div>
+        <div class="frow"><label for="golddiff">经济差</label>
+          <input type="number" id="golddiff" step="100" placeholder="蓝方减红方"></div>
+        <div class="frow"><label for="xpdiff">经验差</label>
+          <input type="number" id="xpdiff" step="100" value="0"></div>
+        <div class="frow"><label for="csdiff">补刀差</label>
+          <input type="number" id="csdiff" value="0"></div>
+        <div class="frow"><label for="bk">蓝方人头</label>
+          <input type="number" id="bk" min="0" value="0"></div>
+        <div class="frow"><label for="rk">红方人头</label>
+          <input type="number" id="rk" min="0" value="0"></div>
+        <div class="frow"><label for="goldtotal">蓝方总经济</label>
+          <input type="number" id="goldtotal" step="500" placeholder="留空则估算"></div>
+      </div>
+      <button class="cta" id="btnRun">预测</button>
+    </section>
+  </div>
+</main>
+
+<div class="wrap"><div id="errBox" class="hidden"></div></div>
+
+<script>
+const ROLES = [["top","上单"],["jng","打野"],["mid","中单"],["bot","ADC"],["sup","辅助"]];
+const ROLE_CN = {top:"上单", jungle:"打野", jng:"打野", mid:"中单",
+                 bottom:"ADC", bot:"ADC", support:"辅助", sup:"辅助"};
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[<>&"]/g, c =>
+  ({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;"}[c]));
+// 小于 1000 时必须取整 —— 补间传进来的是浮点数, 原来的 String(n) 会打出
+// "180.15840871972475" 这种。金币本来就是整数, 四舍五入不丢信息。
+const kfmt = n => Math.abs(n) >= 1000 ? (n/1000).toFixed(1) + "k"
+                                      : String(Math.round(n));
+
+let TIMER = null, CUR = null, DEMO_VER = null;
+let HAS_PAINTED = false;     // 这一局是否已经成功画过一次 (断流时用来保住画面)
+const DEMO_ON = new URLSearchParams(location.search).has("demo");
+
+/* ══ 屏幕 ══ */
+/* 导航栏标题: "T1 VS GENG"。赛区原来占着这个位置, 但页面里 "BO3 · LPL"
+   那一行已经写了, 重复一次不如把对阵名放上来 —— 滚下去之后它是唯一还
+   能告诉你在看哪场比赛的东西。 */
+function vsTitle(m){
+  const t = (m && m.teams) || [];
+  const nm = x => (x && (x.code || x.model_name || x.name)) || "?";
+  return t.length >= 2 ? `${nm(t[0])} VS ${nm(t[1])}`
+                       : (m && m.league) || "比赛";
+}
+function show(id, brand, back){
+  for (const s of ["scList","scMatch","scManual"]) $(s).classList.toggle("hidden", s !== id);
+  $("errBox").classList.add("hidden");
+  $("brand").textContent = brand;
+  $("btnBack").classList.toggle("hidden", !back);
+  // 局切换只属于详情页, 离开就收起 —— 否则会留在导航栏上指向已经离开的比赛
+  if (id !== "scMatch"){
+    $("navGames").classList.add("hidden"); $("navGames").innerHTML = "";
+    $("pDebate").classList.add("hidden");
+  }
+  window.scrollTo(0, 0);
+}
+function goList(push){
+  stopPoll(); CUR = null;
+  show("scList", "赛果预测", false);
+  if (push !== false) history.pushState({v:"list"}, "");
+  loadLive(); loadUpcoming();
+}
+addEventListener("popstate", e => {
+  const v = (e.state || {}).v;
+  if (v === "match" || v === "manual") return;
+  stopPoll(); CUR = null; show("scList", "赛果预测", false);
+});
+
+/* ══ 图表 ══════════════════════════════════════════════════
+   纯内联 SVG, 不引任何图表库。两张图共用同一条 x 轴 (分钟)。 */
+const SVGNS = "http://www.w3.org/2000/svg";
+function pathFrom(pts){
+  return pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
+}
+function hatchDefs(){
+  return `<defs><pattern id="hatch" width="7" height="7" patternUnits="userSpaceOnUse"
+    patternTransform="rotate(45)"><rect width="7" height="7" fill="transparent"/>
+    <line x1="0" y1="0" x2="0" y2="7" stroke="var(--dead)" stroke-width="2.4"/>
+    </pattern></defs>`;
+}
+
+/* 胜率曲线 —— 死区画成上下两条阴影带, 把「模型够不到的区间」留在图上 */
+/* 图上所有百分比都写**领先那一方**的数, 并按方着色 —— 混着写蓝方的
+   40% 和纵轴的 75, 读者得自己换算。 */
+const lead = p => ({ v: Math.round(Math.max(p, 1-p) * 100),
+                     cls: p >= .5 ? "b" : "r" });
+
+function drawWin(series, pmin, pmax, blueName, refPre, refPost, redName){
+  const W = 900, H = 250, L = 46, R = 16, T = 14, B = 26;
+  // 曲线从第 0 分钟起, 起点就是 BP 后的概率。局内模型最早只在第 10 分钟
+  // 训练过, 所以前几分钟本来就没有局内读数 —— 但"这局开打时我们怎么看"
+  // 是有答案的, 就是 BP 后那个数。之前从第 5 分钟才起笔, 左边一截空白,
+  // 阴影也跟着缺一块, 看着像数据丢了。
+  const seed = (refPost != null ? refPost : refPre);
+  if (seed != null){
+    // 时间线在 0-5 分钟是有点的, 只是没有概率 (局内模型下界是 5)。所以要
+    // **补概率**, 不是补点 —— 之前判断"已经有 0 附近的点"就跳过了, 结果
+    // 那几个点始终没值, 曲线还是从第 5 分钟起笔。
+    series = series.map(p => (p.minute < 3 && p.probability_blue == null)
+      ? {...p, probability_blue: seed, seeded: true} : p);
+    if (!series.some(p => p.minute <= 0.02))
+      series = [{minute: 0, probability_blue: seed, seeded: true}, ...series];
+  }
+  const pts = series.filter(p => p.probability_blue != null);
+  const svg = $("winChart");
+  if (!pts.length){
+    svg.innerHTML = `${hatchDefs()}<text x="${W/2}" y="${H/2}" text-anchor="middle"
+      font-family="var(--sans)" font-size="15" fill="var(--ink-3)">还没有可画的胜率数据</text>`;
+    return;
+  }
+  const maxM = Math.max(...series.map(p => p.minute), 1);
+  const x = m => L + (W - L - R) * (m / maxM);
+  const y = p => T + (H - T - B) * (1 - p);
+  let s = hatchDefs();
+
+  // 死区标签也按"领先方"口径。下方那条是蓝方低于 pmin, 等价于红方高于
+  // 1-pmin —— 写"低于 11%"要读者自己换算, 和纵轴的口径也对不上。
+  if (pmax != null && pmax < .995)
+    s += `<rect class="deadband" x="${L}" y="${y(1)}" width="${W-L-R}"
+           height="${Math.max(0,y(pmax)-y(1))}"/>
+          <text class="deadlab" x="${L+6}" y="${y(1)+12}"
+            >模型够不到 · ${esc(blueName||"蓝方")}高于 ${Math.round(pmax*100)}%</text>`;
+  if (pmin != null && pmin > .005)
+    s += `<rect class="deadband" x="${L}" y="${y(pmin)}" width="${W-L-R}"
+           height="${Math.max(0,y(0)-y(pmin))}"/>
+          <text class="deadlab" x="${L+6}" y="${y(0)-5}"
+            >模型够不到 · ${esc(redName||"对手")}高于 ${Math.round((1-pmin)*100)}%</text>`;
+
+  // 纵轴对称: 中线是 50/50, 越往上蓝方赢面越大, 越往下红方赢面越大。
+  // 两端都标 100 —— 上面那个 100 是蓝方的, 下面那个是红方的。
+  // 标签是**领先方的胜率**: 中线 50, 往上是蓝方的, 往下是红方的。
+  // 之前用 |v-0.5|*200, 75% 和 25% 两处都印成 "50", 中线印成 0 —— 错的。
+  for (const v of [0, .25, .5, .75, 1]){
+    const lab = Math.round(Math.max(v, 1 - v) * 100);  // .5->50 .75->75 1->100
+    const cls = v === .5 ? "mid-line" : "grid";
+    s += `<line class="${cls}" x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}"/>`;
+    s += `<text class="${v > .5 ? 'axb' : v < .5 ? 'axr' : 'axmid'}" x="${L-8}"
+           y="${y(v)+3.5}" text-anchor="end">${lab}</text>`;
+  }
+  // 中线右端再补一个"势均力敌"的锚点, 免得只剩一个孤零零的 50
+  s += `<text class="axmid" x="${W-R}" y="${y(.5)-6}"
+         text-anchor="end">势均力敌</text>`;
+  for (let m = 0; m <= maxM; m += (maxM > 30 ? 10 : 5))
+    s += `<text x="${x(m)}" y="${H-8}" text-anchor="middle">${m}</text>`;
+
+  const line = pts.map(p => [x(p.minute), y(p.probability_blue)]);
+  const mid = y(.5);
+  // 填充以中线为基准分两色: 高于 50% 填蓝, 低于填红
+  const seal = d => `${d} L ${x(pts[pts.length-1].minute)} ${mid}
+                     L ${x(pts[0].minute)} ${mid} Z`;
+  s += `<clipPath id="clipUp"><rect x="${L}" y="${T}" width="${W-L-R}"
+          height="${mid-T}"/></clipPath>`;
+  s += `<clipPath id="clipDn"><rect x="${L}" y="${mid}" width="${W-L-R}"
+          height="${H-B-mid}"/></clipPath>`;
+  s += `<path class="pfill up" clip-path="url(#clipUp)" d="${seal(pathFrom(line))}"/>`;
+  s += `<path class="pfill dn" clip-path="url(#clipDn)" d="${seal(pathFrom(line))}"/>`;
+
+  // 参考线: 赛前 (第一段) 和 BP 后 (第二段)。
+  // 标签放左侧 —— 右侧被末端的当前值占了; 两条值接近时上下错开, 否则叠字。
+  const refs = [[refPre, "refpre", "赛前"], [refPost, "refpost", "BP 后"]]
+    .filter(a => a[0] != null)
+    .sort((a, b) => b[0] - a[0]);
+  refs.forEach(([val, cls, lab], i) => {
+    const close = refs.length === 2 && Math.abs(refs[0][0] - refs[1][0]) < .06;
+    const dy = close ? (i === 0 ? -6 : 13) : -6;
+    const L2 = lead(val);
+    const who = L2.cls === "b" ? (blueName || "蓝方") : (redName || "对手");
+    s += `<line class="${cls}" x1="${L}" x2="${W-R}" y1="${y(val)}" y2="${y(val)}"/>
+          <text class="reflab ${cls}" x="${L+6}" y="${y(val)+dy}"
+            >${lab} · ${esc(who)} ${L2.v}%</text>`;
+  });
+  s += `<path class="pline" d="${pathFrom(line)}"/>`;
+  const last = line[line.length - 1], lp = pts[pts.length - 1].probability_blue;
+  const nl = lead(lp);
+  s += `<circle class="nowdot ${nl.cls}" cx="${last[0]}" cy="${last[1]}" r="4.5"/>
+        <text class="nowlab ${nl.cls}" x="${last[0] - 8}" y="${last[1] - 11}"
+          text-anchor="end">${nl.v}%</text>`;
+  svg.innerHTML = s;
+  $("winSub").textContent = blueName
+    ? `中线 50 · 往上 ${blueName} 赢面变大,往下 ${redName || "对手"} 变大 · `
+      + `百分比写的都是领先方 · 斜纹带是模型够不到的区间`
+    : "中线 50 · 百分比写的都是领先方";
+}
+
+/* 经济差 —— 零线两侧分色填充 */
+function drawGold(series){
+  // R 和 T 比胜率图大 —— 右上角要放"人头 +N"这个标签, 边距太小会被面板
+  // 圆角裁掉一半。T=22 保证标签贴顶时也在画布内。
+  const W = 900, H = 200, L = 46, R = 52, T = 22, B = 24;
+  const svg = $("goldChart");
+  if (!series.length){
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle"
+      font-family="var(--sans)" font-size="15" fill="var(--ink-3)">还没有可画的经济数据</text>`;
+    return;
+  }
+  // 补一个第 0 分钟的零点。开局经济必然是 0 差, 但时间线的第一帧在第 1
+  // 分钟左右 —— 少了这一点, 左边就空一截, 填充也从那里才起。
+  if (!series.some(p => p.minute <= 0.02))
+    series = [{minute: 0, golddiff: 0, blue_gold: 0, red_gold: 0,
+               blue_kills: 0, red_kills: 0}, ...series];
+  const maxM = Math.max(...series.map(p => p.minute), 1);
+  const peak = Math.max(2000, ...series.map(p => Math.abs(p.golddiff)));
+  const x = m => L + (W - L - R) * (m / maxM);
+  const y = g => T + (H - T - B) * (1 - (g + peak) / (2 * peak));
+  let s = "";
+  for (const v of [peak, 0, -peak]){
+    s += `<line class="${v === 0 ? 'mid-line' : 'grid'}" x1="${L}" x2="${W-R}"
+           y1="${y(v)}" y2="${y(v)}"/>
+          <text x="${L-8}" y="${y(v)+3.5}" text-anchor="end">${v>0?"+":""}${kfmt(v)}</text>`;
+  }
+  for (let m = 0; m <= maxM; m += (maxM > 30 ? 10 : 5))
+    s += `<text x="${x(m)}" y="${H-7}" text-anchor="middle">${m}</text>`;
+
+  // 人头差也画上。只画经济会让胜率曲线看起来毫无道理 —— 实测那场
+  // JDG 经济一路领先, 但人头 3-5 → 5-9 落后, 胜率因此从 76% 掉到 35%。
+  // 光看经济图完全解释不了那条曲线。人头用自己的量程, 画成细虚线。
+  const kmax = Math.max(3, ...series.map(p =>
+    Math.abs((p.blue_kills || 0) - (p.red_kills || 0))));
+  const ky = k => T + (H - T - B) * (1 - (k + kmax) / (2 * kmax));
+  const kline = series.map(p => [x(p.minute), ky((p.blue_kills||0)-(p.red_kills||0))]);
+
+  const line = series.map(p => [x(p.minute), y(p.golddiff)]);
+  const zero = y(0);
+  // 正负分别填充: 先整体填色再用零线裁切太复杂, 直接按段分组
+  let seg = [], sign = null;
+  const flush = () => {
+    if (seg.length > 1){
+      const d = pathFrom(seg) + ` L ${seg[seg.length-1][0]} ${zero} L ${seg[0][0]} ${zero} Z`;
+      s += `<path class="${sign > 0 ? 'gpos' : 'gneg'}" d="${d}"/>`;
+    }
+    seg = [];
+  };
+  // 起始颜色要看**第一个非零点**的方向。开局经济差恒为 0, 按 >=0 判会算成
+  // "蓝方领先", 于是最左边多出一小段蓝色, 而那一段其实正在往红的走。
+  const firstNz = series.find(p => p.golddiff !== 0);
+  series.forEach((p, i) => {
+    const sg = p.golddiff > 0 ? 1 : p.golddiff < 0 ? -1
+             : (firstNz ? (firstNz.golddiff > 0 ? 1 : -1) : 1);
+    if (sign === null) sign = sg;
+    if (sg !== sign){
+      // 分界线要画在**真实穿越零线的位置**, 用线性插值算出来。
+      // 之前直接用 x(p_i), 但穿越发生在 i-1 和 i 之间 —— 从真实穿越点到
+      // x(p_i) 这一段线已经在另一侧了, 填充却还没开始, 于是每次过零点后
+      // 都留一块白。
+      const prev = series[i - 1];
+      let cx = x(p.minute);
+      if (prev){
+        const g0 = prev.golddiff, g1 = p.golddiff;
+        if (g0 !== g1){
+          const t = g0 / (g0 - g1);        // g0 + t*(g1-g0) = 0
+          cx = x(prev.minute + (p.minute - prev.minute) * t);
+        }
+      }
+      seg.push([cx, zero]); flush(); sign = sg; seg.push([cx, zero]);
+    }
+    seg.push(line[i]);
+  });
+  flush();
+  // 线也要分正负上色。之前整条线只按**最后一个点**的正负取色 —— 一整局
+  // 来回拉扯的曲线, 只要收尾是落后就全程画成红的, 和下面填充的蓝/红分区
+  // 自相矛盾。这里用零线把同一条路径裁成上下两半, 各画一次。
+  // id 带随机后缀: 页面上还有胜率图的 clipPath, 不能撞。
+  const uid = "gc" + Math.random().toString(36).slice(2, 8);
+  s += `<defs>
+      <clipPath id="${uid}a"><rect x="${L}" y="${T}"
+        width="${W-L-R}" height="${Math.max(0, zero-T)}"/></clipPath>
+      <clipPath id="${uid}b"><rect x="${L}" y="${zero}"
+        width="${W-L-R}" height="${Math.max(0, H-B-zero)}"/></clipPath>
+    </defs>
+    <path class="gline pos" clip-path="url(#${uid}a)" d="${pathFrom(line)}"/>
+    <path class="gline neg" clip-path="url(#${uid}b)" d="${pathFrom(line)}"/>`;
+  s += `<path class="kline" d="${pathFrom(kline)}"/>`;
+  const lastK = (series[series.length-1].blue_kills||0)
+              - (series[series.length-1].red_kills||0);
+  // y 要夹住: 人头差顶到量程上限时, -7 会把标签推出画布
+  const klabY = Math.max(T + 9, kline[kline.length-1][1] - 7);
+  s += `<text class="klab" x="${W-R+6}" y="${klabY}"
+         text-anchor="end">人头 ${lastK > 0 ? "+" : ""}${lastK}</text>`;
+  svg.innerHTML = s;
+}
+
+/* ══ 卡片 ══ */
+const fmtTime = iso => {
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const hm = d.toLocaleTimeString("zh-CN", {hour:"2-digit", minute:"2-digit"});
+  const dd = Math.round((new Date(iso).setHours(0,0,0,0) - new Date().setHours(0,0,0,0)) / 864e5);
+  const day = dd === 0 ? "今天" : dd === 1 ? "明天"
+    : d.toLocaleDateString("zh-CN", {month:"numeric", day:"numeric"});
+  return `${day} ${hm}`;
+};
+/* 队标内容: 图片盖在缩写上, 加载成功就把缩写撤掉 (队标多为透明 PNG,
+   留着会从背后透出来), 加载失败则露出缩写。 */
+function crestInner(t){
+  const code = esc(((t && (t.code || t.model_name || t.name)) || "?").slice(0, 4));
+  const img = t && t.image
+    ? `<img src="${esc(t.image)}" alt="" loading="lazy"
+        onload="this.nextElementSibling.style.display='none'"
+        onerror="this.style.display='none'">` : "";
+  return `${img}<span class="fb">${code}</span>`;
+}
+function crest(t){ return `<span class="crest">${crestInner(t)}</span>`; }
+function matchCard(m, live, demo){
+  const b = m.teams[0] || {}, r = m.teams[1] || {};
+  const el = document.createElement("button");
+  el.className = "card"; el.dataset.id = m.match_id;
+  el.dataset.live = live ? "1" : ""; if (demo) el.dataset.demo = "1";
+  if (!m.predictable){
+    el.disabled = true;
+    el.innerHTML =
+      `<div class="side"><span class="crest">${crestInner(b)}</span>
+        <span class="tname">${esc(b.name||"?")}</span></div>
+       <div class="card-mid"><span class="vsmark">VS</span>
+        <span class="card-sub">${esc((m.unknown_teams||[]).join("、")||"队伍")} 不在历史数据里</span>
+       </div>
+       <div class="side right"><span class="crest">${crestInner(r)}</span>
+        <span class="tname">${esc(r.name||"?")}</span></div>`;
+    return el;
+  }
+  // 中列自上而下: 时间(或直播状态) / VS(或比分) / 赛区 / BO几。
+  // 未开赛的比分恒为 0–0, 写出来没有信息量, 所以只有进行中才用比分顶掉 VS。
+  const score = (b.game_wins != null && r.game_wins != null)
+    ? `${b.game_wins}–${r.game_wins}` : null;
+  el.innerHTML =
+    `<div class="side"><span class="crest">${crestInner(b)}</span>
+      <span class="tname">${esc(b.model_name)}</span></div>
+     <div class="card-mid">
+       <span class="c-time">${live
+         ? (m.between_games ? `<span class="tag pause">局间</span>`
+            : `<span class="tag live"><span class="pulse"></span>进行中</span>`)
+         : esc(fmtTime(m.start_time))}</span>
+       ${live && score ? `<span class="sc">${esc(score)}</span>`
+                       : `<span class="vsmark">VS</span>`}
+       <span class="c-lg">${esc(m.league)}</span>
+       <span class="c-bo">${m.best_of ? `BO${m.best_of}` : ""}</span>
+       ${demo ? `<span class="tag demo">演示</span>` : ""}
+     </div>
+     <div class="side right"><span class="crest">${crestInner(r)}</span>
+      <span class="tname">${esc(r.model_name)}</span></div>`;
+  return el;
+}
+let LIVE_IDS = new Set();      // 正在进行的比赛 id, 用来从"即将开赛"里剔掉
+
+/* 网络抖一下就永久显示"读取失败"太脆了 —— 尤其通过 SSH 隧道访问时, 页面
+   加载那一刻两个列表同时发请求, 隧道刚建好容易有一次失败 (服务端实测只要
+   3-16 毫秒, 问题不在那边)。失败就退避重试两次再认输。 */
+async function fetchJSON(url, tries = 3){
+  let last;
+  for (let i = 0; i < tries; i++){
+    try {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return await r.json();
+    } catch (e){
+      last = e;
+      if (i < tries - 1) await new Promise(r => setTimeout(r, 400 * (i + 1)));
+    }
+  }
+  throw last;
+}
+
+async function loadLive(){
+  const box = $("liveList"); $("rLive").disabled = true;
+  try {
+    const j = await fetchJSON("/esports/live");
+    const ms = j.matches || [];
+    LIVE_IDS = new Set(ms.map(m => m.match_id));
+    $("nLive").textContent = ms.length ? `${ms.length} 场` : (DEMO_ON ? "演示" : "");
+    box.innerHTML = "";
+    if (DEMO_ON) box.appendChild(matchCard(DEMO_MATCH, true, true));
+    ms.forEach(m => box.appendChild(matchCard(m, true)));
+    if (!ms.length && !DEMO_ON)
+      box.innerHTML = `<div class="empty">四大赛区当前没有比赛在打</div>`;
+    if (ms.length) loadUpcoming();       // 有直播就重排下面, 去掉重复的那场
+  } catch (e){ box.innerHTML = `<div class="empty">读取失败:${esc(e.message)}</div>`; }
+  finally { $("rLive").disabled = false; }
+}
+async function loadUpcoming(){
+  const box = $("schedList"); $("rSched").disabled = true;
+  try {
+    const j = await fetchJSON("/esports/upcoming?limit=18");
+    // 正在进行的那场不该在"即将开赛"里再出现一次 —— 上游的 state 不可信,
+    // 它照样会把已经开打的比赛留在赛程里。
+    const ms = (j.matches || []).filter(m => !LIVE_IDS.has(m.match_id));
+    $("nSched").textContent = ms.length ? `${ms.length} 场` : "";
+    box.innerHTML = "";
+    if (!ms.length){ box.innerHTML = `<div class="empty">近期没有已排定的比赛</div>`; return; }
+    ms.slice(0, 16).forEach(m => box.appendChild(matchCard(m, false)));
+  } catch (e){ box.innerHTML = `<div class="empty">读取失败:${esc(e.message)}</div>`; }
+  finally { $("rSched").disabled = false; }
+}
+
+/* ══ 详情渲染 ══ */
+const LANE_ORDER = ["top", "jungle", "mid", "bottom", "support"];
+const LANE_ALIAS = {jng:"jungle", bot:"bottom", sup:"support"};
+const laneKey = r => LANE_ALIAS[r] || r;
+
+/* 阵容面板分成"骨架"和"数值"两步。
+
+   之前是每轮 (3 秒一次) 整块 innerHTML 重建, 于是十个英雄头像 + 六十个
+   装备图标的 <img> 元素全被销毁重造 —— 浏览器要重新取/解码, 中间那一帧
+   是空的, 看着就是每次轮询闪一下。图片在缓存里也救不了, 元素换了就得重来。
+
+   现在骨架只在**阵容真的变了**时才重建 (换人、换英雄、换局), 平时只改
+   文字和宽度。<img> 元素一直是同一个, 自然不会闪。 */
+function halfShell(p, side){
+  if (!p) return `<div class="half ${side}"></div>`;
+  const champ = p.champion || "";
+  // 头像用 CSS 盖住兜底文字, 不用 onload 去改 display —— onload 那套在
+  // 元素重建时会先露出兜底文字再被盖掉, 本身就是一次闪。
+  const icon = p.champion_icon
+    ? `<img src="${esc(p.champion_icon)}" alt="" onerror="this.remove()">` : "";
+  const nm = (p.summoner_name || "").trim();
+  return `<div class="half ${side}" data-pid="${esc(String(p.participant_id))}">
+    <div class="champ"><span class="fb">${champ ? esc(champ.slice(0,8))
+        : `<span class="unk">—</span>`}</span>${icon}
+      <span class="dtag" hidden>阵亡</span>
+      <span class="lv">${p.level ?? "-"}</span></div>
+    <div class="pbody">
+      <div class="pn">${nm ? esc(nm) : (champ ? esc(champ)
+        : `<span class="unk">选手 ${p.participant_id ?? ""}</span>`)}</div>
+      <div class="hp"><span></span></div>
+      <div class="pk"></div>
+      <div class="pd"></div>
+      <div class="gear">${Array.from({length: 6},
+        () => `<span class="slot"><img alt="" hidden></span>`).join("")}</div>
+    </div></div>`;
+}
+
+/* 只改数值, 不碰结构。 */
+function fillHalf(el, p){
+  if (!el || !p) return;
+  const q = s => el.querySelector(s);
+  const lv = q(".champ .lv");
+  if (lv) lv.textContent = p.level ?? "-";
+  q(".pk").innerHTML =
+    `${p.kills}/<span class="d">${p.deaths}</span>/${p.assists}`;
+  const bits = [
+    `${p.cs} 补刀`, `${kfmt(p.gold)}`,
+    p.damage_share != null ? `伤害 ${Math.round(p.damage_share*100)}%` : "",
+    p.wards_placed != null ? `眼 ${p.wards_placed}` : "",
+  ].filter(Boolean);
+  q(".pd").innerHTML = bits.map(t => `<span>${esc(t)}</span>`).join("");
+
+  // 装备: 只在真的换了才写 src。写同一个 src 浏览器不会重新加载, 但写空
+  // 再写回去就会 —— 所以先比一下。
+  const items = (p.items || []).slice(0, 6);
+  el.querySelectorAll(".gear .slot img").forEach((img, i) => {
+    const src = items[i] ? items[i].icon : "";
+    if (!src){ if (!img.hidden){ img.hidden = true; img.removeAttribute("src"); } return; }
+    if (img.getAttribute("src") !== src) img.setAttribute("src", src);
+    img.hidden = false;
+  });
+
+  // 血条。血量只有 window 端点给, details 里没有 —— 后端把两边并起来了。
+  // 死亡时 currentHealth 是 0, 血条空着正好就是"倒了"。
+  const bar = q(".hp");
+  const hp = (p.max_health && p.current_health != null)
+    ? Math.max(0, Math.min(1, p.current_health / p.max_health)) : null;
+
+  // 阵亡: 头像转灰 + 盖一个"阵亡"标。数据源没有复活时间 (window 和 details
+  // 的字段全扫过, 只有 deaths 计数和 currentHealth), 所以不写倒计时 ——
+  // 按公式估一个出来只会是个看着很准的假数。
+  const dead = hp === 0;
+  q(".champ").classList.toggle("dead", dead);
+  q(".dtag").hidden = !dead;
+
+  if (hp == null){ bar.hidden = true; return; }
+  bar.hidden = false;
+  bar.className = "hp " + (dead ? "dead" : hp < .35 ? "low" : "");
+  bar.title = `${p.current_health} / ${p.max_health}`;
+  tweenWidth(bar.querySelector("span"),
+             "hp:" + p.participant_id, +(hp * 100).toFixed(2));
+}
+/* 对位经济差。中间栏只放这个 —— 位置从阵型顺序已经看得出来,
+   写"上单/打野"是重复信息。
+
+   箭头指向领先的一方: 蓝方在左边, 蓝方领先就是 "‹ 1.2k"。之前是反的
+   (蓝方领先画成 "1.2k ›", 箭头指着红方), 看着像在说红方领先。 */
+function gapCell(gd){
+  if (gd == null) return `<div class="lane-gap"></div>`;
+  const a = Math.abs(gd);
+  const txt = a >= 1000 ? (a/1000).toFixed(1) + "k" : String(a);
+  if (a < 100) return `<div class="lane-gap"><span class="g even">--</span></div>`;
+  return `<div class="lane-gap">
+    <span class="g ${gd > 0 ? "b" : "r"}">${gd > 0 ? "‹ " + txt : txt + " ›"}</span>
+    </div>`;
+}
+
+/* ── 读数之间的补间动画 ──────────────────────────────────────────────
+   上游的数据粒度是 10 秒 (startingTime 必须对齐 10 秒边界), 再怎么加密
+   轮询也拿不到更细的。所以"顺"只能靠在两次读数之间自己插值。
+
+   每个键存的是**当前显示到哪了**, 不是"上一次的目标值"。这个区别是关键:
+   下一份读数常常在动画没跑完时就到了, 记目标值的话就会从别处重新开始 ——
+   看着就是跳。记当前值才能从画面上的位置接着走。
+
+   键必须跨重画稳定 (用 "gold:b"、"hp:3" 这种), 且换局/换比赛时要清空,
+   否则新一局的 2k 会从上一局的 50k 滚下来。 */
+const TWEEN = new Map();          // key -> {cur, raf}
+
+/* 时长要贴着数据的节奏, 不能凭手感取。上游粒度 10 秒, 实测读数约 6 秒一变,
+   页面 3 秒一轮。取 2600ms (略小于 POLL_MS): 数字基本是一路滑到下一份读数
+   落地, 中间不留僵住的空档。之前取 700ms, 滑 0.7 秒然后僵 5 秒, 就是"一跳
+   一跳"的由来。 */
+const TWEEN_MS = 2600;
+
+/* 按要求强制开启动画, 不再看系统的 prefers-reduced-motion。
+   注意这是明确的取舍: 开了"减弱动态效果"的用户 (含前庭功能敏感的人) 也会
+   看到这些补间。这里动的只是数字和长条的插值, 没有位移/缩放/闪烁, 属于
+   风险较低的一类。 */
+const REDUCED = false;
+function resetTweens(){
+  TWEEN.forEach(s => { if (s.raf) cancelAnimationFrame(s.raf); });
+  TWEEN.clear();
+}
+
+/* 数字和长条走同一套 rAF 插值。长条早先用的是 CSS transition, 但看板每轮
+   整块 innerHTML 重画, 元素一换 transition 就从头开始 —— 和数字不同步。
+   统一用 rAF 反而更简单也更准。
+   apply 每轮重新绑定到新元素上, 所以旧元素被换掉不影响。 */
+function tween(key, to, apply, ms){
+  const s = TWEEN.get(key);
+  if (s && s.raf) cancelAnimationFrame(s.raf);
+  const from = s ? s.cur : null;
+  // 页面在后台时 rAF 根本不触发, 排了也白排 —— 那样 DOM 会一直停在旧值,
+  // 切回来才猛地跳一下。后台直接给终值, 切回来看到的就是最新的。
+  if (REDUCED || document.hidden ||
+      from == null || !isFinite(from) || Math.abs(to - from) < 1e-6){
+    TWEEN.set(key, {cur: to, raf: 0});
+    apply(to);
+    return;
+  }
+  const t0 = performance.now(), dur = ms || TWEEN_MS;
+  const st = {cur: from, raf: 0};
+  TWEEN.set(key, st);
+  const step = now => {
+    const p = Math.min(1, (now - t0) / dur);
+    st.cur = p >= 1 ? to
+           : from + (to - from) * (1 - Math.pow(1 - p, 3));   // easeOutCubic
+    apply(st.cur);
+    st.raf = p < 1 ? requestAnimationFrame(step) : 0;
+  };
+  st.raf = requestAnimationFrame(step);
+}
+const tweenNum   = (el, key, to, fmt, ms) =>
+  el && tween(key, to, v => { el.textContent = fmt(v); }, ms);
+const tweenWidth = (el, key, toPct, ms) =>
+  el && tween(key, toPct, v => { el.style.width = v.toFixed(2) + "%"; }, ms);
+
+/* 战况条 —— 参照官方观战 HUD 的横条形式: 图标 + 数字, 不用文字表格。
+   图标全部内联 SVG, 不引外部图标库, 跟随主题变色。 */
+const ICONS = {
+  kill: `<path d="M12 2 L14.2 8.2 L20.5 6.4 L15.8 11 L20.5 15.6 L14.2 13.8
+          L12 20 L9.8 13.8 L3.5 15.6 L8.2 11 L3.5 6.4 L9.8 8.2 Z"/>`,
+  baron: `<path d="M12 2.5c-3.6 0-6.4 2.5-6.4 5.7 0 1.9 1 3.4 2.3 4.5
+           -.6 1.1-1.5 2-2.6 2.7 1.9.5 3.4.2 4.5-.4.7.3 1.4.4 2.2.4s1.5-.1
+           2.2-.4c1.1.6 2.6.9 4.5.4-1.1-.7-2-1.6-2.6-2.7 1.3-1.1 2.3-2.6
+           2.3-4.5 0-3.2-2.8-5.7-6.4-5.7zm-2.6 5a1.1 1.1 0 110 2.2 1.1 1.1 0
+           010-2.2zm5.2 0a1.1 1.1 0 110 2.2 1.1 1.1 0 010-2.2zM8 17.5
+           c1.2 2 2.4 3 4 4 1.6-1 2.8-2 4-4-1.3.6-2.6.9-4 .9s-2.7-.3-4-.9z"/>`,
+  dragon: `<path d="M3 9.5c2.2-2.6 5-3.9 8.4-3.9.9 0 1.7.1 2.5.3L17 3.2
+            l-.6 3.1 3.4.6-2.6 1.9c.9 1.1 1.4 2.4 1.4 3.8 0 3.9-3.4 7-8
+            7-1.9 0-3.6-.5-5-1.4l2.2-1.6c.9.4 1.8.6 2.8.6 3.1 0 5.4-1.9
+            5.4-4.4 0-.8-.2-1.5-.6-2.1l-2.6 1.9.5-2.8c-.6-.2-1.3-.3-2-.3
+            -2.4 0-4.5.9-6.1 2.6L3 9.5z"/>`,
+  tower: `<path d="M8 2h8l-.7 2.6H8.7L8 2zm.5 3.8h7l-.6 2.4H9.1L8.5 5.8z
+           M9.4 9.4h5.2L16 22H8l1.4-12.6zm1.1 2.2-.5 4.6h4l-.5-4.6h-3z"/>`,
+  inhib: `<path d="M12 2.2 19.5 7v10L12 21.8 4.5 17V7L12 2.2zm0 3.1L7.2 8.3
+           v7.4L12 18.7l4.8-3V8.3L12 5.3zm0 2.8 3 1.9v3.9l-3 1.9-3-1.9V10l3-1.9z"/>`,
+  gold: `<path d="M12 2.5c5.2 0 9.5 2.1 9.5 4.7v9.6c0 2.6-4.3 4.7-9.5 4.7
+          s-9.5-2.1-9.5-4.7V7.2C2.5 4.6 6.8 2.5 12 2.5zm0 2C8 4.5 4.7 5.9
+          4.7 7.2S8 9.9 12 9.9s7.3-1.4 7.3-2.7S16 4.5 12 4.5z"/>`,
+  cs: `<path d="M12 3c1.6 2.4 2.4 4.6 2.4 6.6 0 1.3-.3 2.4-.9 3.4
+        .9-.4 1.7-1 2.4-1.9.5 1.1.8 2.2.8 3.3 0 3.3-2.1 5.6-4.7 5.6
+        s-4.7-2.3-4.7-5.6c0-1.1.3-2.2.8-3.3.7.9 1.5 1.5 2.4 1.9
+        -.6-1-.9-2.1-.9-3.4C9.6 7.6 10.4 5.4 12 3z"/>`,
+};
+const ico = (k, cls) =>
+  `<svg class="ico ${cls||""}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[k]}</svg>`;
+
+/* 战况条: 每队的数据写在自己那一侧, 中间只放经济条。
+   之前是"蓝数字-图标-红数字"居中排, 要对着看才知道哪个是谁的。 */
+function paintObjectives(teams){
+  const box = $("objbar");
+  if (!teams || !teams.blue){ box.innerHTML = ""; box.classList.add("hidden"); return; }
+  const b = teams.blue, r = teams.red || {};
+  const tot = (b.gold || 0) + (r.gold || 0);
+  const bp = tot ? (b.gold / tot * 100) : 50;
+  const gd = (b.gold || 0) - (r.gold || 0);
+  // 由中间向外: 人头最靠中线, 两侧镜像。
+  const ITEMS = [["kill","人头","kills"], ["tower","塔","towers"],
+                 ["baron","大龙","barons"], ["inhib","水晶","inhibitors"],
+                 ["cs","补刀","cs"]];
+  // 小龙只画图标不写数字 —— 六种属性各有颜色, 数几个图标就知道拿了几条。
+  // 气泡用国服官方名, "风/火/土" 是简写, 对不上游戏里看到的字。
+  const DRAKE_CN = {cloud:"云端亚龙", infernal:"炼狱亚龙", mountain:"山脉亚龙",
+                    ocean:"海洋亚龙", hextech:"海克斯亚龙", chemtech:"炼金科技亚龙",
+                    elder:"远古巨龙"};
+  const drakes = t => {
+    const ds = t.dragon_types || [];
+    // 一条没拿就什么都不画。之前放一个灰色龙头占位, 看着像"拿了一条看不清"。
+    if (!ds.length) return `<span class="oi drakes"></span>`;
+    return `<span class="oi drakes">` + ds.map(d =>
+      `<span class="drake ${esc(String(d))}" title="${esc(DRAKE_CN[d] || d)}"
+        >${ico("dragon")}</span>`).join("") + `</span>`;
+  };
+  const cell = (t, k, lab, key) =>
+    `<span class="oi ${(t[key]||0) ? "" : "dim"}" title="${esc(lab)}">
+       ${ico(k)}<b data-tw="${esc(k)}:${t === b ? "b" : "r"}"
+                   data-to="${t[key] ?? 0}">${t[key] ?? 0}</b></span>`;
+  // 除人头外的项, 两端对齐
+  const REST = ITEMS.filter(([k]) => k !== "kill");
+  const restOf = (t, cls) => `<div class="oside ${cls}">`
+    + (cls === "b" ? REST.slice().reverse() : REST)
+        .map(([k, lab, key]) => cell(t, k, lab, key)).join("") + `</div>`;
+
+  box.innerHTML =
+    // 人头单独一行, 居中放大: "1 × 8"
+    `<div class="killrow">
+       <span class="kv b">${b.kills ?? 0}</span>
+       <span class="kx">${ico("kill")}</span>
+       <span class="kv r">${r.kills ?? 0}</span>
+     </div>
+     <div class="osides">${restOf(b,"b")}${restOf(r,"r")}</div>
+     <div class="goldrow">
+       <span class="gv b">${kfmt(b.gold||0)}</span>
+       <span class="goldbar"><span class="b" style="width:${bp.toFixed(2)}%"></span>
+         <span class="r" style="width:${(100-bp).toFixed(2)}%"></span></span>
+       <span class="gv r">${kfmt(r.gold||0)}</span>
+     </div>
+     <div class="drakerow">${drakes(b)}
+       <span class="gdiff ${gd >= 0 ? "b" : "r"}">${ico("gold","gi")}
+         <span class="gdv">${kfmt(Math.abs(gd))}</span></span>${drakes(r)}</div>`;
+  box.classList.remove("hidden");
+
+  // 重画完再补间。上面的 innerHTML 已经把终值写进去了, 所以就算下面
+  // 一行不跑 (比如 prefers-reduced-motion) 显示的也是对的。
+  const q = s => box.querySelector(s);
+  tweenNum(q(".kv.b"), "kills:b", b.kills || 0, v => Math.round(v));
+  tweenNum(q(".kv.r"), "kills:r", r.kills || 0, v => Math.round(v));
+  tweenNum(q(".gv.b"), "gold:b", b.gold || 0, kfmt);
+  tweenNum(q(".gv.r"), "gold:r", r.gold || 0, kfmt);
+  tweenNum(q(".gdiff .gdv"), "golddiff", Math.abs(gd), kfmt);
+  tweenWidth(q(".goldbar .b"), "goldbar:b", +bp.toFixed(2));
+  tweenWidth(q(".goldbar .r"), "goldbar:r", +(100 - bp).toFixed(2));
+  box.querySelectorAll("b[data-tw]").forEach(el =>
+    tweenNum(el, el.dataset.tw, +el.dataset.to, v => Math.round(v)));
+}
+let ROSTER_SIG = "";
+function paintRoster(players, sub, lanes){
+  if (!players || !players.length){ $("pRoster").classList.add("hidden"); return; }
+  const gapOf = {};
+  (lanes || []).forEach(l => { gapOf[l.lane] = l.gold_diff; });
+  const pick = (side, lane) => players.find(
+    p => p.side === side && laneKey(p.role) === lane);
+  // 有些位置名对不上时按出场顺序兜底, 保证十个人都排得上
+  const used = new Set();
+  const rows = LANE_ORDER.map(lane => {
+    const b = pick("blue", lane), r = pick("red", lane);
+    if (b) used.add(b); if (r) used.add(r);
+    return {lane, b, r};
+  });
+  const restB = players.filter(p => p.side === "blue" && !used.has(p));
+  const restR = players.filter(p => p.side === "red" && !used.has(p));
+  rows.forEach(row => {
+    if (!row.b && restB.length) row.b = restB.shift();
+    if (!row.r && restR.length) row.r = restR.shift();
+  });
+  const live = rows.filter(r => r.b || r.r);
+
+  // 骨架签名: 谁在场、拿的什么英雄、排在第几路。只有这些变了才重建 DOM,
+  // 否则十个头像 + 六十个装备图标每轮都要重新解码, 就是每次轮询闪一下。
+  const sig = live.map(r => [r.lane,
+      r.b && r.b.participant_id, r.b && r.b.champion,
+      r.r && r.r.participant_id, r.r && r.r.champion].join(":")).join("|");
+  const box = $("roster");
+  if (sig !== ROSTER_SIG){
+    ROSTER_SIG = sig;
+    box.innerHTML = live.map(r =>
+      `<div class="lane">${halfShell(r.b, "b")}`
+      + `<div class="lane-gap"></div>`
+      + `${halfShell(r.r, "r")}</div>`).join("");
+  }
+
+  const lanesEl = box.children;
+  live.forEach((r, i) => {
+    const laneEl = lanesEl[i];
+    if (!laneEl) return;
+    // 后端没给这一路的差值时(位置名对不上)现场用两人金币算
+    const gd = gapOf[r.lane] != null ? gapOf[r.lane]
+             : (r.b && r.r ? r.b.gold - r.r.gold : null);
+    laneEl.children[1].outerHTML = gapCell(gd);   // 纯文字, 重画不会闪
+    fillHalf(laneEl.querySelector(".half.b"), r.b);
+    fillHalf(laneEl.querySelector(".half.r"), r.r);
+  });
+  $("rosterSub").textContent = sub || "";
+  $("pRoster").classList.remove("hidden");
+}
+/* 两张图只在有局内时间线时才有内容。赛前预测没有时间轴, 画出来是两块
+   写着"还没有可画的数据"的空白 —— 直接收起来。 */
+function setCharts(on){
+  $("pWin").classList.toggle("hidden", !on);
+  $("pGold").classList.toggle("hidden", !on);
+}
+// 图表下方那排"分钟/经济差/补刀差/人头"已删除 —— 这四个数在上面的战况条和
+// 曲线本身里都读得到, 重复一遍只是占位置。
+/* 只列**已经开打**的那几局。之前是把 BO 的全部对局都列出来, 没打的那些
+   画成灰色禁用按钮 —— BO5 就是一排五个按钮里三个是死的, 占地方还误导。
+   playable 由后端按 state ∈ {inProgress, completed} 给出。 */
+function paintGameTabs(games, selected){
+  const tabs = $("navGames");
+  const gs = (games || []).filter(g => g.number && g.playable);
+  if (gs.length < 2){ tabs.classList.add("hidden"); tabs.innerHTML = ""; return; }
+  tabs.innerHTML = gs.map(g =>
+    `<button data-gid="${esc(g.game_id)}"
+      aria-selected="${g.game_id === selected}">G${g.number}</button>`).join("");
+  tabs.classList.remove("hidden");
+}
+function paintCore(m, p, pregame, model, head, sub, reasons, warns, notes, fine){
+  const b = m.teams[0], r = m.teams[1];
+  $("bName").textContent = b.model_name || b.name;
+  $("rName").textContent = r.model_name || r.name;
+  $("bCrest").innerHTML = crestInner(b);
+  $("rCrest").innerHTML = crestInner(r);
+  // 胜率是屏幕上最大的数字, 跳变最扎眼 —— 也补间。拿不到概率时不参与动画。
+  if (p == null){
+    $("bPct").textContent = $("rPct").textContent = "—";
+    TWEEN.delete("pct:b"); TWEEN.delete("pct:r");
+  } else {
+    const pf = v => v.toFixed(1) + "%";
+    tweenNum($("bPct"), "pct:b", p*100, pf);
+    tweenNum($("rPct"), "pct:r", (1-p)*100, pf);
+  }
+  $("mScore").textContent = (b.game_wins != null && r.game_wins != null)
+    ? `${b.game_wins} – ${r.game_wins}` : "—";
+  $("mBo").textContent = m.best_of ? `BO${m.best_of} · ${m.league || ""}` : (m.league || "");
+  $("mStatus").textContent = sub || "";   // 局数/分钟/状态收进比分下方
+  $("mHead").textContent = head || "";
+  $("mSub").textContent = sub || "";
+
+  const ol = $("reasons"); ol.innerHTML = "";
+  (reasons || []).forEach(x => {
+    const li = document.createElement("li");
+    li.textContent = x.text;      // 只用翻译好的句子, 英文字段名不进 DOM
+    ol.appendChild(li);
+  });
+  $("pReasons").classList.toggle("hidden", !(reasons || []).length);
+
+  const ul = $("warns"); ul.innerHTML = "";
+  (warns || []).forEach(t => {
+    const li = document.createElement("li"); li.textContent = t; ul.appendChild(li);
+  });
+  $("pWarn").classList.toggle("hidden", !(warns || []).length);
+
+  // 没有内容就整块收起来 —— 赛前/等待开局时 notes 是空的, 之前会留下一个
+  // 只有"模型 / 它自己的成绩单"标题、底下一片空白的卡片。
+  $("meta").innerHTML = (notes || []).filter(Boolean).map(t => `<p>${esc(t)}</p>`).join("");
+  $("pModel").classList.toggle("hidden", !$("meta").innerHTML);
+  $("fine").textContent = fine || "";
+}
+
+async function openMatch(m, live, opts){
+  opts = opts || {};
+  CUR = {m, live, demo: !!opts.demo, gameId: opts.gameId || null};
+  HAS_PAINTED = false;              // 换比赛/换局要重置, 否则会保住上一场的画面
+  resetTweens();                    // 数字要从头显示, 不能从上一场的值滚过来
+  // AI 复核是按"这场比赛"跑的, 换场必须清掉上一场的结论
+  $("pDebate").classList.toggle("hidden", !(m && m.predictable));
+  debateReset();
+  show("scMatch", vsTitle(m), true);
+  if (opts.push !== false) history.pushState({v:"match"}, "");
+  $("mDemo").classList.toggle("hidden", !opts.demo);
+  $("mHead").textContent = "读取中";
+  try { await refresh(); } catch (e){ showErr("没能拿到读数", e.message); }
+}
+
+/* 每次请求带一个序号。快速连点 G1/G2/G3 会有好几个请求同时在飞, 而
+   /esports/board 换一局要两秒 —— 先发的可能后回来, 于是画面停在你**没有**
+   选中的那一局上。序号对不上就直接丢弃, 只有最新的那次结果能上屏。 */
+let REQ = 0;
+/* showBusy 只在**用户主动切局**时传 true。跟播轮询三秒一次, 每次都压暗
+   就是三秒闪一下灰, 比不加提示还难受。而且切局时也要等 350 毫秒才压暗 ——
+   已经缓存过的一局几十毫秒就回来了, 那一下灰是纯粹的噪声。 */
+async function refresh(opts){
+  if (!CUR) return;
+  if (CUR.demo) return refreshDemo();
+  const {m, gameId} = CUR;
+  const q = gameId ? `?game_id=${encodeURIComponent(gameId)}` : "";
+  const tok = ++REQ;
+  let dim = null;
+  if (opts && opts.showBusy)
+    dim = setTimeout(() => { if (tok === REQ) $("scMatch").classList.add("busy"); }, 350);
+  let d;
+  try {
+    d = await (await fetch(`/esports/board/${encodeURIComponent(m.match_id)}${q}`)).json();
+  } finally {
+    if (dim) clearTimeout(dim);
+    if (tok === REQ) $("scMatch").classList.remove("busy");
+  }
+  if (tok !== REQ) return;          // 后面还有更新的请求, 这份已经过时
+  const mm = d.match || m;
+  CUR.m = mm;
+  paintGameTabs(d.games, d.selected_game_id);
+
+  // 选边警告。后端一直在算这个字段, 但一直没人渲染 —— 等于没算。
+  // 左右排错时页面不会报错, 只是把 A 队的金币/人头/胜率写在 B 队名下,
+  // 所以这条必须看得见。
+  const sw = $("sideWarn");
+  if (sw){
+    if (d.side_warning){
+      sw.textContent = d.side_warning;
+      sw.classList.remove("hidden");
+    } else {
+      sw.classList.add("hidden");
+    }
+  }
+
+  const lv = d.live, pr = d.prediction;
+
+  // 赛前视图 (从"即将开赛"点进来的) 是 runPre 画的, 屏幕上是赛前预测。
+  // 比赛没开, board 当然没有帧 —— 这时候什么都不要动。之前会一路走到下面
+  // 的 !lv 分支, 把赛前预测整个覆盖成"等待开局", 预测信息全没了。
+  if (!lv && !CUR.live) return;
+
+  // 赛前视图等到开打了: 就地升级成实时跟播, 并切到快轮询。
+  if (lv && !CUR.live){
+    CUR.live = true;
+    stopPoll(); startPoll();
+  }
+
+  // 没有帧: 分三种情况, 且**已经显示过数据就不要清空** ——
+  // 比赛暂停时数据流会断几分钟, 把满屏战况清成"无数据"比留着旧读数更糟。
+  if (!lv){
+    const gs = d.games || [];
+    const done = gs.length && gs.every(g => ["completed","unneeded"].includes(g.persisted_state));
+    if (HAS_PAINTED && !done){
+      $("mSub").textContent = "数据流中断,显示的是最后一次读数";
+      $("mDemo").classList.add("hidden");
+      return;                       // 保留画面, 下一轮继续试
+    }
+    // 只有**真的打完了**才停轮询。之前这里无条件 stopPoll(), 于是一旦显示
+    // "等待开局"就再也不看了 —— 比赛开打后页面永远停在那句话上, 除非手动
+    // 刷新。没开打时要继续慢速盯着, 拿到帧就会走下面的升级分支。
+    HAS_PAINTED = false;
+    if (done){
+      stopPoll();
+    } else {
+      CUR.live = false;              // 退回"等开打"状态, 用慢间隔
+      stopPoll(); startPoll(PRE_POLL_MS);
+    }
+    setCharts(false);
+    $("pRoster").classList.add("hidden");
+    // 战况条也必须清掉。之前漏了这一句 —— 从 G1 切到还没开打的 G2, 面板
+    // 顶上还挂着 G1 的人头/经济/小龙, 看着像 G2 已经打了三十分钟。
+    paintObjectives(null);
+    paintCore(mm, null, null, {},
+      done ? "这场比赛已经结束" : "这一局还没有实时数据",
+      done ? "实时数据流只在比赛进行时提供帧" : "等待开局",
+      [], [], [], "");
+    return;
+  }
+
+  // 开局头一两分钟 lolesports 还没把局内时钟同步出来, minute 是 null。
+  // 直接拼字符串就成了"第 null 分钟" —— 缺就说缺, 别把 null 印到脸上。
+  const minTxt = lv.minute != null ? `第 ${lv.minute} 分钟` : "刚开局";
+
+  // 开局不足 5 分钟: 局内模型用不了, 但赛前/BP 后的概率照给, 并标明来源。
+  if (!pr || pr.error || pr.too_early){
+    const p0 = pr && pr.probability_blue != null ? pr.probability_blue : null;
+    setCharts(false);
+    paintObjectives(lv.teams);
+    paintRoster(lv.players, `${minTxt}快照`, lv.lanes);
+    paintCore(mm, p0, null, {},
+      p0 != null
+        ? (p0 >= .5 ? `${mm.teams[0].model_name} 占优` : `${mm.teams[1].model_name} 占优`)
+        : minTxt,
+      `第 ${lv.game_number} 局 · ${minTxt} · `
+        + (pr && pr.source === "post_draft" ? "BP 后模型" : "赛前模型"),
+      [], [], [pr && (pr.note || pr.error)], "");
+    HAS_PAINTED = true;
+    // in_progress 已经把"帧还在动吗"算进去了 (见后端 window 的 stalled)
+    if (lv.in_progress) startPoll(); else stopPoll();
+    return;
+  }
+  const model = pr.model || {};
+  const notes = [pr.shift_note, model.note, model.range_note];
+  if (model.high_conf_share_at_this_slice != null)
+    notes.push(`在这个时间点,模型有 ${Math.round(model.high_conf_share_at_this_slice*100)}% `
+             + `的比赛能给出高置信判断,其余的它自己也说不准。`);
+  if (model.trained_through) notes.push(`训练数据截至 ${model.trained_through}。`);
+
+  // gameState 有三种以上取值, 不能"非 in_game 即已结束" ——
+  // 比赛暂停时会变成 paused, 之前一律标成"已结束", 看着像比赛没了。
+  const STATE_CN = {in_game:"实时跟播", paused:"暂停中", finished:"已结束"};
+  // stalled 要压在 gameState 前面判。帧流断掉时 gameState 卡在 in_game 不动
+  // (上游从没推过 finished), 光看它就会把一局早就打完的比赛标成"实时跟播"
+  // —— 实测 2026-08-23 LEC GX vs TH 第 1 局, 最后一帧是 44 分钟前的。
+  const stName = lv.stalled
+    ? "数据流已中断"
+    : (STATE_CN[lv.game_state]
+       || (lv.in_progress ? "实时跟播" : `状态 ${lv.game_state || "未知"}`));
+  paintCore(mm, pr.probability_blue, pr.pregame_probability_blue ?? null, model,
+    pr.summary || "", `第 ${lv.game_number} 局 · ${minTxt} · ${stName}`,
+    pr.reasons, pr.warnings, notes, pr.disclaimer);
+  setCharts(true);
+  drawWin(d.timeline || [], model.p_min, model.p_max, mm.teams[0].model_name,
+          pr.pregame_probability_blue, pr.postdraft_probability_blue,
+          mm.teams[1].model_name);
+  drawGold(d.timeline || []);
+  paintObjectives(lv.teams);
+  paintRoster(lv.players, `${minTxt}快照`, lv.lanes);
+  // AI 复核要用到当前局面 —— 存下来, 点按钮时一起发过去
+  CUR.ingame = lv.state || null;
+  CUR.champs = lv.players && lv.players.length === 10 ? {
+    blue: lv.players.filter(p => p.side === "blue").map(p => p.champion).filter(Boolean),
+    red:  lv.players.filter(p => p.side === "red").map(p => p.champion).filter(Boolean),
+  } : null;
+  // 逐个选手的读数, 给 AI 复核用。**不做平均** —— "等级 蓝 14.6 / 红 13.2"
+  // 抹掉的正是唯一值得判断的东西: 哪一路崩了、谁在吃线、谁被针对。
+  // 只挑简报要用的字段, 别把整个 players 数组塞过去。
+  CUR.players = (lv.players || []).map(p => ({
+    side: p.side, role: p.role, summoner_name: p.summoner_name,
+    champion: p.champion, level: p.level,
+    kills: p.kills, deaths: p.deaths, assists: p.assists,
+    cs: p.cs, gold: p.gold, damage_share: p.damage_share,
+  }));
+  CUR.lanes = lv.lanes || null;
+  if (!DB_DONE) $("btnDebate").textContent = "让 AI 复核当前局面";
+  HAS_PAINTED = true;
+  // 只有正在打的局才谈得上"延迟"。已结束的局最后一帧是几周前的,
+  // stale_seconds 是个天文数字, 会写出"数据延迟 32010 分钟"这种话。
+  if (lv.stalled)
+    $("mSub").textContent += ` · 数据停在 ${Math.round(lv.stale_seconds/60)} 分钟前`;
+  else if (lv.in_progress && lv.stale_seconds > 90)
+    $("mSub").textContent += ` · 数据延迟 ${Math.round(lv.stale_seconds/60)} 分钟`;
+  // 分钟数是扣掉暂停之后的游戏内时间, 和转播里的比赛时钟对齐。墙钟和它
+  // 差了多少要说出来, 否则看的人只会觉得这个数字对不上。
+  if (lv.paused_seconds >= 60)
+    $("mSub").textContent += ` · 期间暂停约 ${Math.round(lv.paused_seconds/60)} 分钟`;
+  // 暂停也要继续轮询 —— 恢复后才能自动接上; 只有真结束了才停。
+  // 帧流断掉的局也停: 再快的轮询也只会一遍遍拿回同一帧。
+  if (lv.game_state !== "finished" && !lv.stalled) startPoll(); else stopPoll();
+}
+
+/* ── AI 复核 (Stage 3) ────────────────────────────────────────────────
+   /debate 是同步端点, 一次约 55 秒 (四轮 LLM + 检索)。没法拿到真实进度,
+   所以只报已用秒数 —— 编一个假的"正在第 2 轮"比不报还糟。
+
+   这是全项目唯一真花钱的调用, 所以: 一次只能跑一个, 跑完把结果留在页面上,
+   不随轮询刷新掉。 */
+const DB_STATUS = {survived:"站住了", contested:"各执一词",
+                   conceded:"已让步", refuted:"被驳倒"};
+let DB_RUNNING = false, DB_DONE = false;
+/* 复核结果按 (比赛, 第几局) 缓存。一次复核要 55 秒和四次 LLM 调用 ——
+   切走再切回来就重跑一遍太浪费, 而且结论本身不会变 (它是对某个时刻的
+   判断, 面板顶部已经写明"基于第 N 分钟的局面")。
+   只留在内存里: 刷新页面就清掉, 免得给人看几小时前的旧结论。 */
+const DB_CACHE = new Map();
+const dbKey = () => CUR ? `${CUR.m && CUR.m.match_id}:${CUR.gameId || ""}` : "";
+
+function debateReset(){
+  DB_RUNNING = false;
+  $("dbBusy").classList.add("hidden");
+  $("dbIdle").classList.remove("hidden");
+  $("btnDebate").disabled = false;
+
+  // 这场/这局复核过就把结论放回去, 没有才清空。
+  // 之前这里无条件清空, 但 runPre 根本没调它 —— 于是从直播页复核完再点
+  // 一场未开赛的比赛, 上一场的结论会原样留在屏幕上。
+  const hit = DB_CACHE.get(dbKey());
+  if (hit){
+    DB_DONE = true;
+    $("dbOut").innerHTML = hit.html;
+    $("dbOut").classList.remove("hidden");
+    $("btnDebate").textContent = hit.ingame ? "按当前局面再复核" : "再复核一次";
+  } else {
+    DB_DONE = false;
+    $("dbOut").innerHTML = "";
+    $("dbOut").classList.add("hidden");
+    $("btnDebate").textContent = "让 AI 复核这场";
+  }
+}
+
+function paintDebate(j){
+  const v = (j.debate && (j.debate.verdict || (j.debate.rounds||{})["3_verdict"])) || {};
+  const claims = v.claims || [];
+  let s = "";
+  // 局内复核: 把这次复核基于的局面写出来, 免得看不出它是按第几分钟评的
+  const ig = j.ingame;
+  if (ig)
+    s += `<p class="dbnote" style="margin-top:12px">基于第 ${
+      Math.round((CUR.ingame && CUR.ingame.minute) || 0)} 分钟的局面 ·
+      局内模型 ${(ig.probability_blue*100).toFixed(1)}%
+      (赛前 ${(ig.pregame*100).toFixed(1)}%,
+      变动 ${ig.shift >= 0 ? "+" : ""}${(ig.shift*100).toFixed(1)} 个点)</p>`;
+  if (v.consensus) s += `<div class="dbcons">${esc(v.consensus)}</div>`;
+
+  if (claims.length){
+    // 站住的排前面 —— 那是最可信的, 让人一眼看到
+    const order = {survived:0, contested:1, conceded:2, refuted:3};
+    const sorted = claims.slice().sort(
+      (a,b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
+    s += `<div class="dbsec"><h4>主张裁定</h4>`;
+    for (const c of sorted){
+      const st = c.status || "contested";
+      const url = c.evidence_url || "";
+      s += `<div class="claim">
+        <span class="cst ${esc(st)}">${esc(DB_STATUS[st] || st)}</span>
+        <span>${esc(c.claim || "")}
+          ${c.note ? `<span class="cmeta">${esc(c.note)}</span>` : ""}
+          ${url ? `<span class="cmeta"><a href="${esc(url)}" target="_blank"
+             rel="noopener noreferrer">外部来源 ↗</a></span>` : ""}
+        </span></div>`;
+    }
+    s += `</div>`;
+  }
+
+  const open = v.open_disputes || [];
+  if (open.length){
+    s += `<div class="dbsec"><h4>仍有分歧</h4>`;
+    for (const d of open) s += `<div class="claim"><span>· ${esc(d)}</span></div>`;
+    s += `</div>`;
+  }
+
+  // 掉线的 agent 要说出来 —— 三缺一时结论的分量是不一样的。
+  // 但 error 非空 != 没参与: _clean() 的内容告警(如"疑似思维链泄漏")也走
+  // 这个字段, 那种情况下 text 是有的, agent 确实发言了。只按 error 过滤会
+  // 把"答了话但格式有瑕疵"报成"未能参与", 凭空吓人一跳。以 text 为准。
+  const r1 = (j.debate && (j.debate.rounds||{})["1_positions"]) || [];
+  const dead = r1.filter(t => !(t.text||"").trim()).map(t => t.agent);
+  const noisy = r1.filter(t => t.error && (t.text||"").trim()).map(t => t.agent);
+  if (dead.length)
+    s += `<p class="dberr">${dead.length} 个模型未能参与本轮 (${esc(dead.join("、"))}) ——
+          结论只反映其余模型的意见。</p>`;
+  if (noisy.length)
+    s += `<p class="dbnote">${esc(noisy.join("、"))} 的输出有格式问题, 已清理后采用。</p>`;
+  if (v.verdict_model)
+    s += `<p class="dbnote">主协调模型无响应, 本次裁定由 ${esc(v.verdict_model)} 代为完成。</p>`;
+  if (!claims.length && !v.consensus)
+    s += `<p class="dberr">这次没有产出可裁定的主张。</p>`;
+
+  // 协调者挂了不等于这轮什么都没有。**三个 agent 写了几千字, 只因为汇总
+  // 那一步的模型超时就全部丢掉, 是把单点故障又搭了一遍。** 2026-08-20 实测:
+  // 裁定四个模型全挂, 而质疑者那轮产出了 3957 字有效分析, 用户却只看到一行
+  // 红字。这里把原话摆出来 —— 不汇总、不改写、不替它们下结论, 只是让人看见。
+  const failed = !claims.length &&
+                 (!v.consensus || /^裁定失败/.test(v.consensus));
+  if (failed){
+    const rounds = (j.debate && j.debate.rounds) || {};
+    const said = [];
+    for (const k of ["1_positions", "2_crossexam"])
+      for (const t of (rounds[k] || []))
+        if ((t.text || "").trim()) said.push(t);
+    if (said.length){
+      s += `<div class="dbsec"><h4>各模型原话(未经汇总)</h4>
+        <p class="dbnote" style="margin:0 0 10px">汇总环节的模型无响应, 以下是各
+        agent 本轮的原始发言。<b>没有经过交叉裁定</b>, 其中的主张未经交叉核验,
+        请自行判断。</p>`;
+      for (const t of said)
+        s += `<div class="dbraw"><div class="dbrawhd">${esc(t.agent)} ·
+          ${esc((t.model || "").split("/").pop())}${
+          t.error ? ` · <span class="dberr">${esc(t.error)}</span>` : ""}</div>
+          <div class="dbrawtx">${esc(t.text)}</div></div>`;
+      s += `</div>`;
+    }
+  }
+
+  $("dbOut").innerHTML = s;
+  $("dbOut").classList.remove("hidden");
+}
+
+async function runDebate(){
+  if (DB_RUNNING || !CUR || !CUR.m) return;
+  const m = CUR.m;
+  if (!m.predictable){ showErr("无法复核", "队伍不在历史数据里"); return; }
+  DB_RUNNING = true;
+  $("btnDebate").disabled = true;
+  $("dbIdle").classList.add("hidden");
+  $("dbOut").classList.add("hidden");
+  $("dbBusy").classList.remove("hidden");
+  // 提示语会被下面的计时器改写, 每次开跑都要复位 —— 否则上一次拖慢过,
+  // 这一次一按下去就顶着"仍在等待", 反过来吓人。
+  if ($("dbHint")) $("dbHint").textContent =
+    "要一分钟左右 —— 四轮:检索 → 各自表态 → 交叉质证 → 裁定";
+
+  const t0 = Date.now();
+  const tick = setInterval(() => {
+    const sec = Math.round((Date.now() - t0) / 1000);
+    $("dbSec").textContent = sec;
+    // 免费额度会整段降级 —— 正常一分钟内回来, 卡住时能拖到三四分钟。
+    // 让进度条一直写"要一分钟左右"就是在骗人, 用户只会以为页面死了。
+    const hint = $("dbHint");
+    if (hint){
+      if (sec > 150) hint.textContent =
+        "仍在等待 —— 有模型响应异常, 正在改用备用模型。服务端最多跑 5 分钟, 到点会明确报超时, 不会一直转。";
+      else if (sec > 90) hint.textContent =
+        "比平常慢 —— 免费额度当前拥堵, 正在重试。";
+    }
+  }, 1000);
+
+  try {
+    const r = await fetch("/debate", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        blue_team: m.teams[0].model_name, red_team: m.teams[1].model_name,
+        league: m.league, search: true,
+        // 有局内读数就一起发 —— agent 看到的就不只是赛前预测, 而是
+        // "第 N 分钟、经济差多少、局内模型怎么看"。没有就退回赛前复核。
+        ingame: CUR.ingame || null,
+        blue_champions: (CUR.champs && CUR.champs.blue.length === 5)
+                        ? CUR.champs.blue : null,
+        red_champions: (CUR.champs && CUR.champs.red.length === 5)
+                       ? CUR.champs.red : null,
+        players: (CUR.players && CUR.players.length) ? CUR.players : null,
+        lanes: CUR.lanes || null,
+      }),
+    });
+    if (!r.ok){
+      const t = await r.text();
+      throw new Error(r.status === 401 ? "需要 X-Debate-Key" : t.slice(0, 160));
+    }
+    paintDebate(await r.json());
+    DB_CACHE.set(dbKey(), {html: $("dbOut").innerHTML, ingame: !!CUR.ingame});
+    DB_DONE = true;
+    $("dbIdle").classList.remove("hidden");
+    $("btnDebate").textContent = CUR.ingame ? "按当前局面再复核" : "再复核一次";
+  } catch (e){
+    $("dbOut").innerHTML = `<p class="dberr">复核失败: ${esc(e.message)}</p>`;
+    $("dbOut").classList.remove("hidden");
+    $("dbIdle").classList.remove("hidden");
+  } finally {
+    clearInterval(tick);
+    DB_RUNNING = false;
+    $("btnDebate").disabled = false;
+    $("dbBusy").classList.add("hidden");
+  }
+}
+
+/* 直播刷新间隔。
+
+   上限是 10 秒, 而且两边都一样: startingTime 必须对齐到 10 秒边界 (不对齐
+   返回 204), 所以请求的 URL 每 10 秒才换一次, 真正的新数据也就每 10 秒一批。
+   参照项目 (Aureom/live-lol-esports) 轮询 500ms 看着更顺, 但它同样用
+   "对齐10秒再减60秒", 那 20 次请求打的是同一个 URL, 靠 CDN 缓存兜着 ——
+   它换来的只是"窗口后半段返回的帧更全", 不是更新的数据。
+
+   之前 10 秒一轮的问题不是粒度不够, 是**相位**: 缓存 5 秒前就更新了, 页面
+   还要再等 5 秒才去取, 白白多压一截。3 秒一轮把这个相位误差压到 3 秒以内,
+   服务端热路径 35–53ms, 上游被 window_ttl 挡着, 代价可以忽略。 */
+const POLL_MS = 3000, LIST_POLL_MS = 30000;
+// 切到后台时的间隔。不停, 只放慢 —— 回到前台不用从头等一轮。
+const BG_POLL_MS = 15000;
+// 赛前视图只是在等开打, 30 秒看一眼就够。
+const PRE_POLL_MS = 30000;
+/* 上一轮没回来就跳过这一拍。缓存到期时 /esports/board 要真回上游, 实测
+   1.3–2.3 秒 —— 比 3 秒的间隔只小一点。没有这道闸, 网络一慢请求就会叠起来,
+   越叠越慢。 */
+let POLL_BUSY = false;
+function startPoll(ms){ if (!TIMER) TIMER = setInterval(async () => {
+  if (POLL_BUSY) return;
+  POLL_BUSY = true;
+  try { await refresh(); }
+  catch { stopPoll(); }
+  finally { POLL_BUSY = false; }
+}, ms || POLL_MS); }
+function stopPoll(){ if (TIMER){ clearInterval(TIMER); TIMER = null; } POLL_BUSY = false; }
+
+/* 列表页自己也要自动刷新 —— 之前完全没有轮询, 所以"正在进行"里的比分
+   和新开赛的比赛只能靠手动点刷新才出现。 */
+let LIST_TIMER = null;
+function startListPoll(){
+  if (LIST_TIMER) return;
+  LIST_TIMER = setInterval(() => {
+    // 后台也照常刷 —— 和详情页一致。浏览器自己会节流, 不用我们再挡一道。
+    if (!$("scList").classList.contains("hidden")) loadLive();
+  }, LIST_POLL_MS);
+}
+function stopListPoll(){ if (LIST_TIMER){ clearInterval(LIST_TIMER); LIST_TIMER = null; } }
+
+document.addEventListener("visibilitychange", () => {
+  // 后台不再停轮询 —— 之前是 stopPoll(), 所以切走就冻住, 切回来才更新。
+  // 只是放慢: 没人看的时候没必要三秒一轮, 但也不该完全不动。
+  //
+  // 注意浏览器自己还会再压一道: 后台标签页的 setInterval 会被节流, 隐藏
+  // 超过五分钟后大约一分钟才跑一次。这个我们改不了, 也不必改 —— 切回来
+  // 的那一下会立刻补一次全量刷新。
+  const onMatch = CUR && !$("scMatch").classList.contains("hidden");
+  // 间隔按当前视图取: 实时跟播才用快的, 赛前视图只是在等开打。
+  const rate = () => (CUR && CUR.live) ? POLL_MS : PRE_POLL_MS;
+  if (document.hidden){
+    if (onMatch){ stopPoll(); startPoll(Math.max(BG_POLL_MS, rate())); }
+    return;
+  }
+  stopPoll();
+  // 回到前台立刻补一次, 不用等下一个周期
+  if (onMatch){
+    refresh().catch(() => {}); startPoll(rate());
+  } else if (!$("scList").classList.contains("hidden")) loadLive();
+});
+
+/* ══ 演示 (?demo=1) ══
+   局势是构造的, 概率仍由 /predict/ingame 用真实队伍算。不进真实数据通路。 */
+const DEMO_MATCH = {
+  match_id:"__demo__", league:"LCK", best_of:3, state:"inProgress", predictable:true,
+  start_time:new Date().toISOString(), unknown_teams:[],
+  teams:[{name:"T1", model_name:"T1", code:"T1", game_wins:1,
+          image:"https://static.lolesports.com/teams/1631820014208_T1_logo_profile.png"},
+         {name:"Gen.G", model_name:"Gen.G", code:"GEN", game_wins:1,
+          image:"https://static.lolesports.com/teams/1631820575374_GenG_logo_profile.png"}],
+};
+const DEMO_ROSTER = [
+  {pid:1,side:"blue",role:"top",name:"Doran",champ:"KSante",items:[6662,3047,3075,3364,2055]},
+  {pid:2,side:"blue",role:"jungle",name:"Oner",champ:"XinZhao",items:[6631,3111,6333,3364]},
+  {pid:3,side:"blue",role:"mid",name:"Faker",champ:"Ahri",items:[6655,3020,4645,2055]},
+  {pid:4,side:"blue",role:"bottom",name:"Gumayusi",champ:"Corki",items:[3078,3006,3115,2055]},
+  {pid:5,side:"blue",role:"support",name:"Keria",champ:"Leona",items:[3860,3047,3364,2055]},
+  {pid:6,side:"red",role:"top",name:"Kiin",champ:"Ambessa",items:[6692,3047,3053]},
+  {pid:7,side:"red",role:"jungle",name:"Canyon",champ:"MonkeyKing",items:[6630,3047,3364]},
+  {pid:8,side:"red",role:"mid",name:"Chovy",champ:"Orianna",items:[6653,3020,3116]},
+  {pid:9,side:"red",role:"bottom",name:"Peyz",champ:"Sivir",items:[6672,3006,3031]},
+  {pid:10,side:"red",role:"support",name:"Duro",champ:"Braum",items:[3869,3047,3364]},
+];
+const SHAPE = {top:{cs:8.2,g:430,k:.18,d:.19,w:.35,ap:0},
+  jungle:{cs:6.4,g:445,k:.28,d:.20,w:.55,ap:0}, mid:{cs:9.1,g:470,k:.26,d:.27,w:.30,ap:1},
+  bottom:{cs:9.6,g:500,k:.30,d:.28,w:.28,ap:0}, support:{cs:1.4,g:300,k:.06,d:.06,w:1.9,ap:1}};
+const DEMO_FRAMES = [
+  {minute:8,  golddiff:-620, blue_kills:1, red_kills:3, csdiff:-14, gold_total:13200},
+  {minute:12, golddiff: 240, blue_kills:4, red_kills:4, csdiff:  3, gold_total:20100},
+  {minute:16, golddiff:1980, blue_kills:6, red_kills:4, csdiff: 18, gold_total:27600},
+  {minute:20, golddiff:3450, blue_kills:10,red_kills:5, csdiff: 29, gold_total:35800},
+  {minute:24, golddiff:5600, blue_kills:14,red_kills:6, csdiff: 41, gold_total:44300},
+  {minute:28, golddiff:8100, blue_kills:19,red_kills:7, csdiff: 52, gold_total:52900},
+];
+let DEMO_I = 0, DEMO_SERIES = [];
+// 各位置的经济占比。总和为 1, 用来把队伍总金币摊到五个人身上。
+const GOLD_SHARE = {top:.205, jungle:.19, mid:.215, bottom:.235, support:.155};
+function demoPlayers(f, ver){
+  const t = Math.max(.15, f.minute/28), win = f.golddiff > 0;
+  // 队伍总金币必须和帧里的 golddiff 自洽 —— 否则会出现「头条说蓝方领先
+  // 3.4k, 五路对位却全是红方领先」这种自相矛盾, 看着就像面板算错了。
+  const blueTotal = f.gold_total;
+  const redTotal = f.gold_total - f.golddiff;
+  return DEMO_ROSTER.map((r,i) => {
+    const s = SHAPE[r.role], mine = (r.side==="blue")===win;
+    const j = .94 + ((i*37)%13)/100;          // 抖动收窄, 不再盖过胜负差
+    const teamGold = r.side === "blue" ? blueTotal : redTotal;
+    const tk = r.side==="blue"?f.blue_kills:f.red_kills;
+    const ok = r.side==="blue"?f.red_kills:f.blue_kills;
+    return {participant_id:r.pid, side:r.side, role:r.role, summoner_name:r.name,
+      champion:r.champ,
+      champion_icon:`https://ddragon.leagueoflegends.com/cdn/${ver}/img/champion/${r.champ}.png`,
+      level:Math.min(18,Math.max(1,Math.round(3+t*14+(mine?.8:0)))),
+      kills:Math.round(tk*s.k*j), deaths:Math.round(ok*(r.role==="support"?.28:.2)*j),
+      assists:Math.round(tk*(r.role==="support"?.75:.35)*j),
+      cs:Math.round(f.minute*s.cs*(mine?1.06:.94)*j),
+      gold:Math.round(teamGold * GOLD_SHARE[r.role] * j),
+      kill_participation:Math.min(.95,(r.role==="support"?.62:.45)*j+t*.18),
+      damage_share:s.d*j*(mine?1.05:.95),
+      wards_placed:Math.round(f.minute*s.w*j), wards_destroyed:Math.round(f.minute*s.w*.28*j),
+      items:r.items.slice(0,Math.max(1,Math.round(t*r.items.length))).map(id=>({id,
+        icon:`https://ddragon.leagueoflegends.com/cdn/${ver}/img/item/${id}.png`})),
+      stats:{}};
+  });
+}
+async function refreshDemo(){
+  const f = DEMO_FRAMES[DEMO_I % DEMO_FRAMES.length]; DEMO_I++;
+  if (DEMO_I === 1) DEMO_SERIES = [];
+  const state = {...f, xpdiff:null};
+  const j = await post("/predict/ingame", {blue_team:"T1", red_team:"Gen.G",
+    league:"LCK", include_pregame:true, state});
+  const model = j.model || {};
+  DEMO_SERIES.push({minute:f.minute, golddiff:f.golddiff, blue_kills:f.blue_kills,
+                    red_kills:f.red_kills, probability_blue:j.probability_blue});
+  DEMO_SERIES.sort((a,b)=>a.minute-b.minute);
+  if (!DEMO_VER){
+    try { DEMO_VER = (await (await fetch("/esports/ddragon")).json()).version; }
+    catch { DEMO_VER = "16.16.1"; }
+  }
+  paintGameTabs([{number:1,game_id:"d1",playable:true},
+                 {number:2,game_id:"d2",playable:true},
+                 {number:3,game_id:"d3",playable:false}], "d2");
+  paintCore(DEMO_MATCH, j.probability_blue, j.pregame_probability_blue ?? null, model,
+    j.summary || "", `第 2 局 · 第 ${f.minute} 分钟 · 演示跟播`,
+    j.reasons, j.warnings, [j.shift_note, model.note, model.range_note], j.disclaimer);
+  setCharts(true);
+  drawWin(DEMO_SERIES, model.p_min, model.p_max, "T1");
+  drawGold(DEMO_SERIES);
+  // 演示的团队战况: 从帧数据推, 保持和头条一致
+  const dp = demoPlayers(f, DEMO_VER);
+  const sum = (side, k) => dp.filter(p => p.side === side)
+                             .reduce((a, p) => a + (p[k] || 0), 0);
+  paintObjectives({
+    blue:{gold:f.gold_total, kills:f.blue_kills, barons:f.minute>20?1:0,
+          dragons:Math.min(4,Math.floor(f.minute/7)), towers:Math.floor(f.minute/5),
+          inhibitors:f.minute>24?1:0, cs:sum("blue","cs")},
+    red:{gold:f.gold_total-f.golddiff, kills:f.red_kills, barons:0,
+         dragons:Math.max(0,Math.floor(f.minute/11)), towers:Math.floor(f.minute/9),
+         inhibitors:0, cs:sum("red","cs")},
+  });
+  paintRoster(dp, `第 ${f.minute} 分钟快照 · 演示`);
+  $("mDemo").classList.remove("hidden");
+  startPoll(6000);
+}
+
+/* ══ 交互 ══ */
+async function post(path, body){
+  const res = await fetch(path, {method:"POST",
+    headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j.detail || `服务返回 ${res.status}`);
+  return j;
+}
+function showErr(t, m){
+  const b = $("errBox"); b.classList.remove("hidden");
+  b.innerHTML = `<div class="err"><b>${esc(t)}</b><p>${esc(m)}</p></div>`;
+}
+document.addEventListener("click", async e => {
+  if (e.target.closest("#btnDebate")){ runDebate(); return; }
+  const tab = e.target.closest("#navGames button");
+  if (tab && !tab.disabled){
+    // 立刻把选中态点亮, 不等请求回来。之前是等 refresh() 拿到响应后由
+    // paintGameTabs 重画才高亮 —— 换到没缓存过的一局要两秒, 这两秒里点了
+    // 跟没点一样, 用起来就是"卡"。选中态是纯本地状态, 没有理由等网络。
+    for (const x of $("navGames").children)
+      x.setAttribute("aria-selected", x === tab);
+    if (CUR && !CUR.demo){
+      CUR.gameId = tab.dataset.gid;
+      // 换局 = 换数据源, 上一局的画面不能留。不重置的话, 切到还没打的
+      // 那一局 (没有帧) 会走"数据流中断"分支, 把上一局的战况当成这一局显示。
+      HAS_PAINTED = false;
+      resetTweens();          // 别让新一局的数字从上一局的数值滚过来
+      debateReset();          // 复核是按局缓存的, 换局要换成那一局的结论
+      stopPoll();
+      refresh({showBusy: true}).catch(err => showErr("没能拿到读数", err.message));
+    }
+    return;
+  }
+  const card = e.target.closest(".card");
+  if (!card || card.disabled) return;
+  if (card.dataset.demo) return openMatch(DEMO_MATCH, true, {demo:true});
+  const live = !!card.dataset.live;
+  const src = live ? "/esports/live" : "/esports/upcoming?limit=16";
+  try {
+    const j = await (await fetch(src)).json();
+    const m = (j.matches || []).find(x => x.match_id === card.dataset.id);
+    if (!m) return showErr("这场比赛没了", "列表可能已经更新,点一下刷新。");
+    if (live) openMatch(m, true, {});
+    else runPre(m);
+  } catch (err){ showErr("打不开这场比赛", err.message); }
+});
+
+async function runPre(m){
+  stopPoll(); CUR = {m, live:false, demo:false, gameId:null};
+  show("scMatch", vsTitle(m), true); history.pushState({v:"match"}, "");
+  $("mHead").textContent = "读取中";
+  try {
+    const b = m.teams[0].model_name, r = m.teams[1].model_name;
+    const j = await post("/predict", {blue_team:b, red_team:r, league:m.league});
+    const key = j.final.probability_source, st = j.stages[key], model = st.model || {};
+    const notes = [model.note, model.range_note];
+    if (j.data_quality) notes.push(`${j.league} 数据截至 ${j.data_quality.league_data_through},`
+      + `距今 ${j.data_quality.days_old} 天。`);
+    paintGameTabs([], null);
+    paintCore(m, j.final.probability_blue, null, model, j.final.summary || "",
+      key === "2_post_draft" ? "已计入 BP · 第二段模型" : "赛前 · 第一段模型",
+      st.reasons, j.warnings, notes, j.disclaimer);
+    setCharts(false);      // 赛前没有时间轴, 不画图
+    $("pRoster").classList.add("hidden");
+    paintObjectives(null);
+    // 赛前视图没有局内读数, 清掉上一场留下的
+    CUR.ingame = null; CUR.players = null; CUR.lanes = null;
+    $("pDebate").classList.remove("hidden");
+    debateReset();
+    // 慢速盯着, 开打了自动切成实时跟播 (见 refresh 里的升级分支)。
+    // 30 秒一轮 —— 比赛可能几小时后才开, 没必要按实时的三秒来。
+    startPoll(PRE_POLL_MS);
+  } catch (e){ showErr("没能拿到读数", e.message); }
+}
+
+/* 手动 */
+function buildSeg(){
+  $("lgSeg").addEventListener("click", e => {
+    const b = e.target.closest("button[data-v]"); if (!b) return;
+    for (const x of $("lgSeg").querySelectorAll("button"))
+      x.setAttribute("aria-selected", x === b);
+    if ($("league").value !== b.dataset.v){
+      $("league").value = b.dataset.v; loadTeams();
+    }
+  });
+}
+function buildDraft(){
+  const box = $("draftBox");
+  for (const [side, cn, cls] of [["blue","蓝方","b"], ["red","红方","r"]]){
+    box.insertAdjacentHTML("beforeend", `<p class="psec ${cls}">${cn} BP(可选)</p>`);
+    for (const [r, rcn] of ROLES)
+      box.insertAdjacentHTML("beforeend", `<div class="pick"><span>${rcn}</span>
+        <input id="${side}_${r}_p" placeholder="选手" autocomplete="off">
+        <input id="${side}_${r}_c" placeholder="英雄" autocomplete="off"></div>`);
+  }
+}
+function draftPayload(){
+  const out = {blue:{}, red:{}}; let n = 0;
+  for (const side of ["blue","red"]) for (const [r] of ROLES){
+    const p = $(`${side}_${r}_p`).value.trim(), c = $(`${side}_${r}_c`).value.trim();
+    if (p && c){ out[side][r] = {player:p, champion:c}; n++; }
+  }
+  return n ? out : null;
+}
+const num = id => { const v = $(id).value.trim(); return v === "" ? null : Number(v); };
+async function runManual(){
+  const blue = $("blue").value.trim(), red = $("red").value.trim();
+  if (!blue || !red) return showErr("还差队伍名", "蓝方和红方都要填。");
+  const league = $("league").value, minute = num("minute");
+  $("btnRun").disabled = true; $("btnRun").textContent = "读取中";
+  const fake = {league, best_of:null, match_id:"manual", predictable:true, unknown_teams:[],
+                teams:[{model_name:blue, name:blue}, {model_name:red, name:red}]};
+  try {
+    stopPoll(); CUR = null;
+    if (minute != null){
+      const state = {minute, golddiff:num("golddiff") ?? 0, xpdiff:num("xpdiff"),
+        csdiff:num("csdiff") ?? 0, blue_kills:num("bk") ?? 0,
+        red_kills:num("rk") ?? 0, gold_total:num("goldtotal")};
+      const d = draftPayload();
+      const body = {blue_team:blue, red_team:red, league, include_pregame:true, state};
+      if (d){
+        body.blue_champions = ROLES.map(([x]) => d.blue[x]?.champion).filter(Boolean);
+        body.red_champions  = ROLES.map(([x]) => d.red[x]?.champion).filter(Boolean);
+      }
+      const j = await post("/predict/ingame", body);
+      const model = j.model || {};
+      show("scMatch", league, true); history.pushState({v:"match"}, "");
+      paintGameTabs([], null);
+      paintCore(fake, j.probability_blue, j.pregame_probability_blue ?? null, model,
+        j.summary || "", `第 ${j.slice_used} 分钟切片 · 局内模型`,
+        j.reasons, j.warnings, [j.shift_note, model.note, model.range_note], j.disclaimer);
+      setCharts(true);
+      drawWin([{minute, probability_blue:j.probability_blue,
+                golddiff:state.golddiff, blue_kills:state.blue_kills,
+                red_kills:state.red_kills}], model.p_min, model.p_max, blue);
+      drawGold([{minute, golddiff:state.golddiff}]);
+      $("pRoster").classList.add("hidden");
+    } else {
+      const body = {blue_team:blue, red_team:red, league, playoffs:$("playoffs").checked};
+      const d = draftPayload(); if (d) body.draft = d;
+      const j = await post("/predict", body);
+      const key = j.final.probability_source, st = j.stages[key], model = st.model || {};
+      show("scMatch", league, true); history.pushState({v:"match"}, "");
+      paintGameTabs([], null);
+      paintCore(fake, j.final.probability_blue, null, model, j.final.summary || "",
+        key === "2_post_draft" ? "已计入 BP · 第二段模型" : "赛前 · 第一段模型",
+        st.reasons, j.warnings, [model.note, model.range_note], j.disclaimer);
+      setCharts(false);
+      $("pRoster").classList.add("hidden");
+    }
+  } catch (e){ showErr("没能拿到读数", e.message); }
+  finally { $("btnRun").disabled = false; $("btnRun").textContent = "预测"; }
+}
+async function loadTeams(){
+  try {
+    const t = await (await fetch("/teams?league=" + encodeURIComponent($("league").value))).json();
+    $("teams").innerHTML = (t.teams || []).map(n => `<option value="${esc(n)}">`).join("");
+  } catch {}
+}
+async function loadHealth(){
+  try {
+    const h = await (await fetch("/health")).json();
+    const f = Object.entries(h.data_freshness || {})
+      .sort((a,b) => b[1].days_old - a[1].days_old)[0];
+    if (!f) return;
+    const cn = {fresh:"新鲜", stale:"滞后", very_stale:"严重滞后"}[f[1].level] || f[1].level;
+    $("fresh").innerHTML = `<span class="dot ${esc(f[1].level)}"></span>`
+      + `最旧 ${esc(f[0])} 数据${esc(cn)} · ${f[1].days_old} 天前`;
+  } catch { $("fresh").textContent = "服务未就绪"; }
+}
+
+buildSeg(); buildDraft();
+$("btnBack").addEventListener("click", () => history.back());
+$("toManual").addEventListener("click", () => {
+  stopPoll(); CUR = null; show("scManual", "手动输入", true);
+  history.pushState({v:"manual"}, ""); loadTeams();
+});
+$("btnRun").addEventListener("click", runManual);
+$("rLive").addEventListener("click", e => { e.stopPropagation(); loadLive(); });
+$("rSched").addEventListener("click", e => { e.stopPropagation(); loadUpcoming(); });
+history.replaceState({v:"list"}, "");
+loadHealth(); loadLive(); loadUpcoming(); startListPoll();
+</script>
+</body>
+</html>

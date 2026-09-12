@@ -1,0 +1,17 @@
+[Unit]
+Description=Backfill finished-game snapshots once a day, after the data refresh
+
+[Timer]
+# 每天 13:30 UTC —— 排在日更 (12:20) 之后一小时。
+# 顺序很重要: 回填要靠 Oracle's Elixir 的 result 当标签, 而 OE 的数据要等
+# 日更拉下来。反过来跑的话, 当天新打的比赛全部配不上标签会被跳过。
+OnCalendar=*-*-* 13:30:00
+Persistent=true
+
+# 开机后如果错过了当天的点, 补跑一次
+AccuracySec=5min
+
+Unit=lol-backfill.service
+
+[Install]
+WantedBy=timers.target

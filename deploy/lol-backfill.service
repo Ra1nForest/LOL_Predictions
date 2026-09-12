@@ -1,0 +1,29 @@
+[Unit]
+# 注意: systemd 的 unit 文件不支持行尾注释, 注释必须独占一行。
+Description=LoL Match Prediction — backfill per-minute snapshots from finished games
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/lol/service
+ExecStart=/home/ubuntu/lol/venv312/bin/python /home/ubuntu/lol/service/research/backfill_late.py --days 95
+
+# 断点续跑, 所以每次只处理新增的局。首次全量约一小时, 之后几分钟。
+# 卡住就放弃, 下次再来 —— 已采到的不会丢。
+TimeoutStartSec=7200
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lol-backfill
+
+MemoryMax=2G
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+{
+  "协调者": {
+    "model": "google/gemma-4-31b-it",
+    "lineage": "gemma",
+    "leak": 1.0,
+    "restraint": 1.0,
+    "json_score": 1.0,
+    "latency_s": 3.2
+  },
+  "补充者": {
+    "model": "openai/gpt-oss-120b",
+    "lineage": "gptoss",
+    "leak": 1.0,
+    "restraint": 1.0,
+    "json_score": 0.0,
+    "latency_s": 1.4
+  },
+  "验证者": {
+    "model": "stepfun-ai/step-3.7-flash",
+    "lineage": "stepfun",
+    "leak": 1.0,
+    "restraint": 1.0,
+    "json_score": 0.0,
+    "latency_s": 10.7
+  },
+  "质疑者": {
+    "model": "nvidia/nemotron-3-ultra-550b-a55b",
+    "lineage": "nemotron",
+    "leak": 1.0,
+    "restraint": 1.0,
+    "json_score": 0.5,
+    "latency_s": 21.2
+  }
+}
