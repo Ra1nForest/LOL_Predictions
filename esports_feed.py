@@ -1096,10 +1096,22 @@ class EsportsFeed:
         return out
 
     def players(self, game_id: str, at: Optional[datetime] = None) -> list[Player]:
-        """十个人的等级/装备/KDA/属性。取不到返回空表。"""
-        url = f"{FEED}/details/{game_id}?startingTime={self._lagged(60, at)}"
-        p = self._get(url, self.window_ttl, key_hdr=False)
-        frames = (p or {}).get("frames") or []
+        """十个人的等级/装备/KDA/属性。取不到返回空表。
+
+        lag 用 window() 记下的自适应值 (和头条同一个), 取不到再退回 60 秒。原来写死 60 ——
+        而两个端点的发布时刻实测一致 (2026-09-13 LEC: 都是往回退 60 秒才有数据), 于是上游
+        快的时候 (有时 20~30 秒就有), 记分板比头条的胜率慢半分钟以上。
+        浏览器版 frontend/src/web/feed.ts 的 players() 同一套。
+        """
+        lags = [60] if at is not None else list(dict.fromkeys([self._lag.get(game_id, 60), 60]))
+        frames, lag = [], 60
+        for lg in lags:
+            url = f"{FEED}/details/{game_id}?startingTime={self._lagged(lg, at)}"
+            p = self._get(url, self.window_ttl, key_hdr=False)
+            frames = (p or {}).get("frames") or []
+            if frames:
+                lag = lg
+                break
         if not frames:
             return []
         meta = self.game_metadata(game_id)
@@ -1109,7 +1121,7 @@ class EsportsFeed:
         # 通常已经在缓存里 —— window() 刚用同样的参数取过。
         hp: dict[int, dict] = {}
         try:
-            w = self._window(game_id, self._lagged(60, at), ttl=self.window_ttl)
+            w = self._window(game_id, self._lagged(lag, at), ttl=self.window_ttl)
             wf = (w or {}).get("frames") or []
             if wf:
                 for side_key in ("blueTeam", "redTeam"):

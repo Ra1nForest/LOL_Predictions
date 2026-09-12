@@ -115,6 +115,8 @@ const UI: Record<string, string> = {
   还没有经济数据: "No gold data yet",
   "{team} 领先": "{team} ahead",
   "相对权重 {n}%": "Relative weight {n}%",
+  击杀: "Kills",
+  "峰值 {v}": "Peak {v}",
   // 记分板
   记分板: "Scoreboard",
   左右滑动看全部: "Swipe for more",

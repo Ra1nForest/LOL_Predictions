@@ -701,6 +701,58 @@ button {
   font-family: var(--sans);
   overflow: visible;
 }
+/* 胜率条: viewBox 是 preserveAspectRatio="none", 高度由这里给, 条带跟着变粗。
+   手机上原来 8px 细得像一根线, 加到 40 (条带约 12px)。 */
+.chart.scale-bar {
+  height: 26px;
+}
+@media (max-width: 620px) {
+  .chart.scale-bar {
+    height: 40px;
+  }
+}
+
+/* 走势图外壳: 数值气泡按它定位。touch-action: pan-y —— 手指横着拖是看数值,
+   竖着滑仍然是滚动页面。 */
+.chart-wrap {
+  position: relative;
+}
+.chart-wrap .chart {
+  touch-action: pan-y;
+  cursor: crosshair;
+}
+.chart-tip {
+  position: absolute;
+  z-index: 3;
+  pointer-events: none;
+  transform: translate(14px, -50%);
+  padding: 7px 10px;
+  border-radius: 10px;
+  background: var(--panel-strong);
+  border: 1px solid var(--hair-2);
+  box-shadow: var(--shadow);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.chart-tip.flip {
+  transform: translate(calc(-100% - 14px), -50%);
+}
+.chart-tip .tip-time {
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.chart-tip b {
+  font-weight: 620;
+}
+.chart-tip .blue {
+  color: var(--blue);
+}
+.chart-tip .red {
+  color: var(--red);
+}
 
 .grid-2 {
   display: grid;

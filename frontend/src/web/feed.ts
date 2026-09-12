@@ -781,16 +781,26 @@ export class Feed {
     return out;
   }
 
+  /** esports_feed.players —— lag 的取法见那边的注释 (和头条同一个自适应 lag, 取不到退回 60) */
   async players(gameId: string, at?: number): Promise<Player[]> {
-    const p = await this.get(`${FEED}/details/${gameId}?startingTime=${Feed.lagged(60, at)}`, this.windowTtl, false);
-    const frames = orArr(orObj(p).frames);
+    const lags = at === undefined ? [...new Set([this.lag.get(gameId) ?? 60, 60])] : [60];
+    let frames: Json[] = [];
+    let lag = 60;
+    for (const l of lags) {
+      const p = await this.get(`${FEED}/details/${gameId}?startingTime=${Feed.lagged(l, at)}`, this.windowTtl, false);
+      frames = orArr(orObj(p).frames);
+      if (frames.length) {
+        lag = l;
+        break;
+      }
+    }
     if (!frames.length) return [];
     const meta = await this.gameMetadata(gameId);
 
     // 血量只有 window 里有, 按 participantId 并进来; 拿不到就是没血量
     const hp = new Map<number, Json>();
     try {
-      const w = await this.rawWindow(gameId, Feed.lagged(60, at), this.windowTtl);
+      const w = await this.rawWindow(gameId, Feed.lagged(lag, at), this.windowTtl);
       const wf = orArr(orObj(w).frames);
       if (wf.length) {
         for (const k of ["blueTeam", "redTeam"]) {

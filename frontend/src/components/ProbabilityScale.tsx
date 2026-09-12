@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { Reason } from "../api/types";
 import { WhyBubbles } from "./WhyBubbles";
 import { T } from "../i18n";
+import { useTween } from "./chartKit";
 
 interface Props {
   blueName: string;
@@ -41,7 +42,8 @@ export function ProbabilityScale({
   const canExplain = !!reasons && reasons.length > 0;
   const lo = pMin ?? 0;
   const hi = pMax ?? 1;
-  const p = probabilityBlue;
+  // 数字和刻度一起补间: 新概率到了, 大数字滚过去、刻度上的竖线滑过去, 而不是一跳
+  const p = useTween(probabilityBlue);
   const split = (v: number) => {
     const s = (v * 100).toFixed(1).split(".");
     return { int: s[0]!, dec: s[1]! };
@@ -88,7 +90,7 @@ export function ProbabilityScale({
         </div>
       </div>
 
-      <svg viewBox="0 0 1000 26" className="chart" preserveAspectRatio="none" height="26">
+      <svg viewBox="0 0 1000 26" className="chart scale-bar" preserveAspectRatio="none" height="26">
         <defs>
           <pattern
             id="hatch-scale"
