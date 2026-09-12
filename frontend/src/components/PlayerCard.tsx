@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { Player } from "../api/types";
 import { T } from "../i18n";
+import { Num } from "./Num";
 import {
   AdIcon,
   ApIcon,
@@ -32,6 +33,8 @@ const ROLE_CN: Record<string, string> = {
 const pct = (v: number | null | undefined) =>
   v == null ? "—" : `${Math.round(v * 100)}%`;
 const num = (v: number | null | undefined) => (v == null ? "—" : String(v));
+/** 百分比, 变化时滚动过去 */
+const ratio = (v: number | null | undefined) => (v == null ? "—" : <Num value={v} fmt={pct} />);
 const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
 
 /**
@@ -97,11 +100,18 @@ export function PlayerCard({ p, onClose }: { p: Player; onClose: () => void }) {
       </div>
 
       <div className="pc-grid">
-        <Cell label="KDA" value={`${p.kills}/${p.deaths}/${p.assists}`} />
-        <Cell label={T("补刀")} value={String(p.cs)} />
-        <Cell label={T("经济")} value={k(p.gold)} />
-        <Cell label={T("参团率")} value={pct(p.kill_participation)} />
-        <Cell label={T("伤害占比")} value={pct(p.damage_share)} />
+        <Cell
+          label="KDA"
+          value={
+            <>
+              <Num value={p.kills} pop />/<Num value={p.deaths} pop />/<Num value={p.assists} pop />
+            </>
+          }
+        />
+        <Cell label={T("补刀")} value={<Num value={p.cs} />} />
+        <Cell label={T("经济")} value={<Num value={p.gold} fmt={(n) => k(Math.round(n))} />} />
+        <Cell label={T("参团率")} value={ratio(p.kill_participation)} />
+        <Cell label={T("伤害占比")} value={ratio(p.damage_share)} />
         <Cell label={T("视野")} value={`${num(p.wards_placed)} / ${num(p.wards_destroyed)}`} />
       </div>
 
@@ -112,8 +122,15 @@ export function PlayerCard({ p, onClose }: { p: Player; onClose: () => void }) {
           <div className="pc-stats">
             {STATS.map(({ k: key, cn, Icon }) => {
               const raw = st[key as keyof typeof st];
-              // 暴击和韧性上游给的是 0-1 的比例, 其余是绝对值
-              const v = key === "crit" || key === "tenacity" ? pct(raw) : num(raw);
+              // 暴击和韧性上游给的是 0-1 的比例, 其余是绝对值 (到位后照原样写, 不取整)
+              const v =
+                key === "crit" || key === "tenacity" ? (
+                  ratio(raw)
+                ) : raw == null ? (
+                  num(raw)
+                ) : (
+                  <Num value={raw} fmt={(n) => (n === raw ? String(raw) : String(Math.round(n)))} />
+                );
               return (
                 <div className="pc-stat" key={key} title={T(cn)}>
                   <Icon className="pc-stat-ico" />
@@ -165,7 +182,7 @@ export function PlayerCard({ p, onClose }: { p: Player; onClose: () => void }) {
   );
 }
 
-function Cell({ label, value }: { label: string; value: string }) {
+function Cell({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="pc-cell">
       <div className="pc-cell-l">{label}</div>

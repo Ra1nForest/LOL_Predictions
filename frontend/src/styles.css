@@ -1311,6 +1311,11 @@ a.cmeta:hover {
   overflow: visible;
   white-space: nowrap;
 }
+/* 会动的数字 (Num.tsx): inline-block 才能做"弹一下"的缩放, 行内元素不吃 transform */
+.num {
+  display: inline-block;
+}
+
 .sb-score {
   display: flex;
   align-items: baseline;

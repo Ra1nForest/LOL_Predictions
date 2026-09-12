@@ -187,6 +187,8 @@ export interface ViewCtx {
   /** 这一局的开局时刻 (Feed.gameStart) */
   start: number | null;
   trinkets: Set<number>;
+  /** 回放期间逐秒积累的走势点 (liveView 往里追加), 一次回放一份 */
+  trail: TimelinePoint[];
 }
 
 /**
@@ -293,13 +295,19 @@ export function liveView(board: BoardResponse, pf: PlayFrame, ctx: ViewCtx): Boa
   ) as unknown as Prediction;
   const prediction: Prediction = { ...res, postdraft_probability_blue: pr.postdraft_probability_blue ?? null };
 
-  const timeline: TimelinePoint[] = board.timeline.filter((p) => p.minute < minuteF);
-  timeline.push({
+  // 走势图按秒记: 回放每走过 1 秒游戏时间, 往轨迹末尾追加一个点。打开页面之前的部分
+  // 仍是看板的每分钟一个点 (补全整局的逐秒数据要把几百个窗口全取一遍); 两段在轨迹起点接上。
+  // 游戏时间倒退 (暂停时长刚被轮询更新, 分钟数往回收) 时, 把跑过头的点撤掉
+  const tip: TimelinePoint = {
     minute: minuteF,
     golddiff,
     blue_kills: teams.blue.kills,
     red_kills: teams.red.kills,
     probability_blue: prediction.probability_blue,
-  });
+  };
+  const trail = ctx.trail;
+  while (trail.length && trail[trail.length - 1]!.minute > minuteF) trail.pop();
+  if (!trail.length || minuteF - trail[trail.length - 1]!.minute >= 1 / 60) trail.push(tip);
+  const timeline: TimelinePoint[] = [...board.timeline.filter((p) => p.minute < trail[0]!.minute), ...trail];
   return { ...board, live, prediction, timeline };
 }

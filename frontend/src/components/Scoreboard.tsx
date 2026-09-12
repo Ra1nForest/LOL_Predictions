@@ -1,5 +1,7 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import type { Lane, Player, TeamObjectives } from "../api/types";
+import { useTween } from "./chartKit";
+import { Num } from "./Num";
 import { PlayerCard } from "./PlayerCard";
 import { ObjectiveIcon, DRAKE_CN } from "./ObjectiveIcon";
 import { KillIcon } from "./icons";
@@ -66,23 +68,15 @@ export function Scoreboard({ players, lanes, blue, red, blueName, redName }: Pro
             <TeamSide o={blue} name={blueName} side="blue" />
             <div className="sb-head-mid">
               <div className="sb-score">
-                <b className="blue">{blue.kills}</b>
+                <b className="blue"><Num value={blue.kills} pop /></b>
                 <KillIcon className="sb-kill-ico" />
-                <b className="red">{red.kills}</b>
+                <b className="red"><Num value={red.kills} pop /></b>
               </div>
               {/* 队伍总经济差用 "+xxxx", 颜色是领先方的。这里和下面每一路的
                   箭头写法**故意不同**: 这一处只有一个数、位置固定在正中,
                   加号已经够清楚; 而逐路那五行要在一眼之内分辨方向, 箭头比
                   正负号快。 */}
-              <div
-                className={`sb-golddiff${
-                  blue.gold > red.gold ? " blue" : red.gold > blue.gold ? " red" : ""
-                }`}
-              >
-                {blue.gold === red.gold
-                  ? T("经济持平")
-                  : `+${Math.abs(blue.gold - red.gold).toLocaleString()}`}
-              </div>
+              <GoldDiff d={blue.gold - red.gold} />
             </div>
             <TeamSide o={red} name={redName} side="red" />
           </div>
@@ -94,7 +88,6 @@ export function Scoreboard({ players, lanes, blue, red, blueName, redName }: Pro
               const r = rs.find((p) => norm(p.role) === lane);
               if (!b && !r) return null;
               const gap = laneOf.get(lane);
-              const d = gap?.gold_diff ?? 0;
               return (
                 <div className="sb-lane" key={lane}>
                   <PlayerCell p={b} side="blue" onOpen={setOpenPid} openPid={openPid} />
@@ -103,18 +96,7 @@ export function Scoreboard({ players, lanes, blue, red, blueName, redName }: Pro
                       箭头**指向领先的一方**: 蓝方领先就 "‹ 1,751", 红方就
                       "1,751 ›"。方向 + 颜色两重编码同一件事, 扫一眼就知道
                       这一路是谁在压制, 不用先读符号再想正负是谁。 */}
-                  <div className="sb-mid">
-                    {gap &&
-                      (d === 0 ? (
-                        <div className="sb-gap">{T("持平")}</div>
-                      ) : (
-                        <div className={`sb-gap ${d > 0 ? "blue" : "red"}`}>
-                          {d > 0 && <i className="arw">‹</i>}
-                          {Math.abs(d).toLocaleString()}
-                          {d < 0 && <i className="arw">›</i>}
-                        </div>
-                      ))}
-                  </div>
+                  <div className="sb-mid">{gap && <LaneGap d={gap.gold_diff} />}</div>
                   <PlayerCell p={r} side="red" onOpen={setOpenPid} openPid={openPid} />
                 </div>
               );
@@ -136,6 +118,35 @@ export function Scoreboard({ players, lanes, blue, red, blueName, redName }: Pro
   );
 }
 
+/**
+ * 队伍总经济差 / 每一路的经济差: 带正负方向的数要**整体**补间 (颜色、箭头跟着滚动中的值走),
+ * 不能只滚绝对值 —— 蓝方领先 500 变成红方领先 300 时, 只滚绝对值会是一个红色的数从 500 滚到 300,
+ * 看起来像红方的优势在缩小。这里滚的是带符号的差, 会先滚到 0 再换色往另一边涨。
+ * 用 React 状态补间, 所以拆成单独的小组件, 每秒重渲染的只是这一行字。
+ */
+function GoldDiff({ d }: { d: number }) {
+  const v = Math.round(useTween(d));
+  return (
+    <div className={`sb-golddiff${v > 0 ? " blue" : v < 0 ? " red" : ""}`}>
+      {v === 0 ? T("经济持平") : `+${Math.abs(v).toLocaleString()}`}
+    </div>
+  );
+}
+
+function LaneGap({ d }: { d: number }) {
+  const v = Math.round(useTween(d));
+  // 箭头**指向领先的一方**: 蓝方领先就 "‹ 1,751", 红方就 "1,751 ›"
+  return v === 0 ? (
+    <div className="sb-gap">{T("持平")}</div>
+  ) : (
+    <div className={`sb-gap ${v > 0 ? "blue" : "red"}`}>
+      {v > 0 && <i className="arw">‹</i>}
+      {Math.abs(v).toLocaleString()}
+      {v < 0 && <i className="arw">›</i>}
+    </div>
+  );
+}
+
 /** 一侧的资源点。领先的项加重 —— 五个数字全一样重就等于没有重点。 */
 function TeamSide({
   o,
@@ -152,7 +163,7 @@ function TeamSide({
   const stat = (
     icon: "gold" | "tower" | "dragon" | "baron" | "inhibitor",
     title: string,
-    v: number | string,
+    v: ReactNode,
     on: boolean,
   ) => (
     <span key={icon} className={`sb-stat${on ? " on" : ""}`} title={title}>
@@ -162,12 +173,13 @@ function TeamSide({
   );
   // **镜像**: 从中线往外是 经济 → 塔 → 龙 → 大龙 → 水晶。两侧顺序相反,
   // 于是同一项在左右两栏里离中线一样远, 视线横着扫就能比。
+  // 经济是连续涨的, 滚动过去; 塔龙这些是一件一件拿的, 直接跳并弹一下
   const items = [
-    stat("gold", T("总经济"), k(o.gold), o.gold > 0),
-    stat("tower", T("推塔"), o.towers, o.towers > 0),
-    stat("dragon", T("小龙"), o.dragons, o.dragons > 0),
-    stat("baron", T("大龙"), o.barons, o.barons > 0),
-    stat("inhibitor", T("水晶 (抑制器)"), o.inhibitors, o.inhibitors > 0),
+    stat("gold", T("总经济"), <Num value={o.gold} fmt={(n) => k(Math.round(n))} />, o.gold > 0),
+    stat("tower", T("推塔"), <Num value={o.towers} pop />, o.towers > 0),
+    stat("dragon", T("小龙"), <Num value={o.dragons} pop />, o.dragons > 0),
+    stat("baron", T("大龙"), <Num value={o.barons} pop />, o.barons > 0),
+    stat("inhibitor", T("水晶 (抑制器)"), <Num value={o.inhibitors} pop />, o.inhibitors > 0),
   ];
   return (
     <div className={`sb-team ${side}`}>
@@ -225,7 +237,7 @@ function PlayerCell({
             比在血条上写字醒目得多 —— 头像是这一行视觉上最重的元素,
             它一灰整行就"暗"下去了。 */}
         {dead && <span className="champ-dead">{T("阵亡")}</span>}
-        <span className="champ-lv">{p.level}</span>
+        <span className="champ-lv"><Num value={p.level} pop /></span>
       </button>
 
       <div className="sb-who">
@@ -235,8 +247,9 @@ function PlayerCell({
         {hp != null ? (
           <div className={`sb-hp${dead ? " dead" : ""}`}>
             <i style={{ width: `${Math.max(0, Math.min(1, hp)) * 100}%` }} />
+            {/* 和血条宽度的过渡 (0.4 秒) 一样快, 数字和条同步到位 */}
             <b>
-              {p.current_health}/{p.max_health}
+              <Num value={p.current_health ?? 0} ms={400} />/<Num value={p.max_health ?? 0} ms={400} />
             </b>
           </div>
         ) : (
@@ -269,9 +282,11 @@ function PlayerCell({
           表达过了, 这里再摆一遍只是占地方。 */}
       <div className="sb-nums">
         <div className="sb-kda">
-          {p.kills}/{p.deaths}/{p.assists}
+          <Num value={p.kills} pop />/<Num value={p.deaths} pop />/<Num value={p.assists} pop />
         </div>
-        <div className="sb-cs">{T("{n} 刀", { n: p.cs })}</div>
+        <div className="sb-cs">
+          <Num value={p.cs} fmt={(n) => T("{n} 刀", { n: Math.round(n) })} />
+        </div>
       </div>
     </div>
   );

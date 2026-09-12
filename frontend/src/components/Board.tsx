@@ -479,6 +479,8 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
         {hasFrames && (
           <div className="rise d2">
             <Scoreboard
+              // 换局就整块重挂: 数字补间只该在同一局里滚, 不能从上一局的数滚到这一局
+              key={lv!.game_id}
               players={lv!.players}
               lanes={lv!.lanes}
               blue={lv!.teams.blue}

@@ -99,7 +99,7 @@ export const staticApi = {
   ): Promise<() => void> {
     const [f, t, m] = await Promise.all([feed(), teams(), models()]);
     const [start, trinkets] = await Promise.all([f.gameStart(gameId), f.trinketIds()]);
-    const ctx: ViewCtx = { models: m, teams: t, today: localToday(), start, trinkets };
+    const ctx: ViewCtx = { models: m, teams: t, today: localToday(), start, trinkets, trail: [] };
     const player = new LivePlayer(f, gameId, (pf) => {
       const b = getBoard();
       if (!b?.live || b.live.game_id !== gameId || b.prediction?.probability_blue == null) return;

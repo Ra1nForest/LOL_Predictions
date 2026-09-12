@@ -32,6 +32,41 @@ export function useWidth<E extends HTMLElement>(fallback = 900) {
   return [ref, w] as const;
 }
 
+/**
+ * 0→1 的进度动画, 每一步回调 step(k), 最后一次保证是 k = 1。返回取消函数。
+ *
+ * 另挂一个定时器兜底: 页面不绘制时 (后台标签、被收起的内嵌窗口) requestAnimationFrame 会
+ * **整个停掉**, 实测每秒 0 次 —— 只靠它的话, 数字和走势线会一直停在旧值上。定时器在后台
+ * 也还会跑 (最慢每秒一次), 到点没走完就直接落到终点。
+ */
+export function tween(ms: number, step: (k: number) => void, curve: (t: number) => number = ease): () => void {
+  const t0 = performance.now();
+  let raf = 0;
+  let done = false;
+  const tick = (now: number) => {
+    if (done) return;
+    const t = Math.min(1, (now - t0) / ms);
+    if (t >= 1) done = true;
+    step(t >= 1 ? 1 : curve(t));
+    if (!done) raf = requestAnimationFrame(tick);
+  };
+  // 起点先同步画一次: 走势线每秒追加一个点, 下一个点到的时候上一段动画会被取消 ——
+  // rAF 停着的时候兜底定时器永远等不到, 不先画一次的话线就一直不长
+  step(0);
+  raf = requestAnimationFrame(tick);
+  const timer = setTimeout(() => {
+    if (done) return;
+    done = true;
+    cancelAnimationFrame(raf);
+    step(1);
+  }, ms + 150);
+  return () => {
+    done = true;
+    cancelAnimationFrame(raf);
+    clearTimeout(timer);
+  };
+}
+
 /** 数值补间: 目标变了就从当前显示的值平滑过渡过去, 中途又变了就从半路接着走 */
 export function useTween(target: number, ms = 650): number {
   const [v, setV] = useState(target);
@@ -44,17 +79,11 @@ export function useTween(target: number, ms = 650): number {
       return;
     }
     if (from === target) return;
-    const t0 = performance.now();
-    let raf = 0;
-    const step = (now: number) => {
-      const k = Math.min(1, (now - t0) / ms);
-      const x = from + (target - from) * ease(k);
+    return tween(ms, (k) => {
+      const x = k === 1 ? target : from + (target - from) * k;
       cur.current = x;
       setV(x);
-      if (k < 1) raf = requestAnimationFrame(step);
-    };
-    raf = requestAnimationFrame(step);
-    return () => cancelAnimationFrame(raf);
+    });
   }, [target, ms]);
   return v;
 }
@@ -73,21 +102,39 @@ export function lerpPoint(a: TimelinePoint, b: TimelinePoint, k: number): Timeli
   };
 }
 
+const samePoint = (a: TimelinePoint, b: TimelinePoint) =>
+  a.minute === b.minute && a.golddiff === b.golddiff && a.probability_blue === b.probability_blue;
+
 /**
- * 走势线新增的一段: 轮询带来新点时, 新点从原来的末端平滑长出来, 横轴跟着伸长。
+ * 走势线新增的一段: 新点从原来的末端长出来, 横轴跟着伸长。
  * 只处理"在末尾追加"这一种情况; 换局、点被重新抽样 (超过 60 个点时会重排) 就直接跳过去,
  * 硬做过渡反而会让整条线扭一下。
+ *
+ * 直播回放时每秒追加一个点 (web/player.ts), 要的是**一直在往前走**的感觉:
+ * - 新的一段用**匀速**、时长取"上一个点到这一个点隔了多久", 于是这一段刚长完下一个点
+ *   正好到, 线和横轴连续地滑, 不会每秒"冲一下、停一下" (缓出曲线就是那样)。
+ *   轮询那种隔几秒才来一个点的情况仍用缓出。
+ * - 回放每秒发三五帧, 大多和上一帧内容相同 (上游约 1Hz 才变): 内容没变就什么都不做,
+ *   否则正在长的那一段每次都会被打断、直接跳到终点。
  */
 export function useGrowingSeries(series: TimelinePoint[], ms = 750): TimelinePoint[] {
   const [out, setOut] = useState(series);
   const prev = useRef(series);
+  const stop = useRef<() => void>(() => {});
+  const lastAt = useRef(0);
+  useEffect(() => () => stop.current(), []);
   useEffect(() => {
     const old = prev.current;
+    if (old.length === series.length && old.every((p, i) => samePoint(p, series[i]!))) return;
     prev.current = series;
+    stop.current();
     const appended =
       old.length > 0 &&
       series.length > old.length &&
       old.every((p, i) => Math.abs(series[i]!.minute - p.minute) < 1e-9);
+    const now0 = performance.now();
+    const gap = now0 - lastAt.current;
+    lastAt.current = now0;
     if (!appended || reducedMotion()) {
       setOut(series);
       return;
@@ -95,15 +142,14 @@ export function useGrowingSeries(series: TimelinePoint[], ms = 750): TimelinePoi
     const base = series.slice(0, old.length);
     const from = series[old.length - 1]!;
     const added = series.slice(old.length);
-    const t0 = performance.now();
-    let raf = 0;
-    const step = (now: number) => {
-      const k = ease(Math.min(1, (now - t0) / ms));
-      setOut([...base, ...added.map((p) => lerpPoint(from, p, k))]);
-      if (k < 1) raf = requestAnimationFrame(step);
-    };
-    raf = requestAnimationFrame(step);
-    return () => cancelAnimationFrame(raf);
+    // 逐秒流: 上一次追加就在一两秒前 → 匀速, 时长跟着节奏走
+    const stream = added.length === 1 && gap < 2500;
+    const dur = stream ? Math.min(1500, Math.max(300, gap)) : ms;
+    stop.current = tween(
+      dur,
+      (k) => setOut(k === 1 ? series : [...base, ...added.map((p) => lerpPoint(from, p, k))]),
+      stream ? (t) => t : ease,
+    );
   }, [series, ms]);
   return out;
 }
