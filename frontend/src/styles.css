@@ -1474,17 +1474,29 @@ a.cmeta:hover {
   color: var(--ink-3);
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.015em;
-  display: flex;
-  align-items: baseline;
-  justify-content: center;
-  gap: 3px;
+  /* 数字居中成一列, 箭头绝对定位贴两边 —— 箭头不占位, 五行数字的中线永远对齐。
+     width: 100% 不能省: .sb-mid 是居中排的, 不写的话这个块会缩成和数字一样宽,
+     "贴两边"就成了贴着数字 */
+  position: relative;
+  width: 100%;
+  text-align: center;
 }
 /* 箭头指向领先的一方。方向和颜色两重编码同一件事 —— 扫一眼就知道
-   这一路谁在压制, 不用先读符号再想正负属于谁。 */
+   这一路谁在压制, 不用先读符号再想正负属于谁。
+   放进 .sb-mid 的左右内边距里 (12px), 不压数字。 */
 .sb-gap .arw {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
   font-style: normal;
   font-size: 1.05em;
   line-height: 1;
+}
+.sb-gap .arw.l {
+  left: -6px;
+}
+.sb-gap .arw.r {
+  right: -6px;
 }
 .sb-gap.blue {
   color: var(--blue);

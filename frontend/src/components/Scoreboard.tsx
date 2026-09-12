@@ -135,14 +135,15 @@ function GoldDiff({ d }: { d: number }) {
 
 function LaneGap({ d }: { d: number }) {
   const v = Math.round(useTween(d));
-  // 箭头**指向领先的一方**: 蓝方领先就 "‹ 1,751", 红方就 "1,751 ›"
+  // 箭头**指向领先的一方**, 贴在这一栏的左/右边上; 数字自己始终居中 ——
+  // 箭头跟着数字排的话, 五行的数字会随领先方左右错开, 竖着对不齐
   return v === 0 ? (
     <div className="sb-gap">{T("持平")}</div>
   ) : (
     <div className={`sb-gap ${v > 0 ? "blue" : "red"}`}>
-      {v > 0 && <i className="arw">‹</i>}
-      {Math.abs(v).toLocaleString()}
-      {v < 0 && <i className="arw">›</i>}
+      {v > 0 && <i className="arw l">‹</i>}
+      <span>{Math.abs(v).toLocaleString()}</span>
+      {v < 0 && <i className="arw r">›</i>}
     </div>
   );
 }
