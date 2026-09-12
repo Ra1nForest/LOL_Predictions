@@ -157,12 +157,17 @@ export function useGrowingSeries(series: TimelinePoint[], ms = 750): TimelinePoi
 /**
  * 把逐秒走势 (useFineTimeline) 并进看板的走势: 逐秒点覆盖到的时间段用逐秒点, 没覆盖到的
  * (还没补到的开头、直播时补全之后新走过的部分) 仍用原来的点。直播回放的逐秒轨迹在后者里。
+ *
+ * cap: 直播回放中的播放头 (分钟)。逐秒历史补到的是看板最新那一帧, 比播放头**靠前**几秒 ——
+ * 不截的话图会跑在记分板和胜率数字前面。截到播放头前 1 秒, 最末的一两个点 (含末端) 留给
+ * 回放自己的轨迹, 末端圆点就和头条的胜率是同一帧。
  */
-export function mergeFine(base: TimelinePoint[], fine: TimelinePoint[] | null): TimelinePoint[] {
-  if (!fine?.length) return base;
-  const from = fine[0]!.minute;
-  const to = fine[fine.length - 1]!.minute;
-  return [...base.filter((p) => p.minute < from || p.minute > to), ...fine].sort((a, b) => a.minute - b.minute);
+export function mergeFine(base: TimelinePoint[], fine: TimelinePoint[] | null, cap?: number): TimelinePoint[] {
+  const use = cap === undefined ? fine : fine?.filter((p) => p.minute < cap - 1 / 60);
+  if (!use?.length) return base;
+  const from = use[0]!.minute;
+  const to = use[use.length - 1]!.minute;
+  return [...base.filter((p) => p.minute < from || p.minute > to), ...use].sort((a, b) => a.minute - b.minute);
 }
 
 /** 横轴刻度间隔 (分钟): 两个刻度之间至少留 minGap 像素 */

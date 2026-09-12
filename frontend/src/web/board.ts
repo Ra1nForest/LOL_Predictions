@@ -311,7 +311,8 @@ function curveProb(m: Models, teams: TeamsFile, today: string, c: CurveCtx, row:
 /**
  * 逐秒走势 (静态站的走势图用, 见 feed.fineRows): 每一行配上胜率, 和看板曲线同一套 (curveCtx / curveProb)。
  * 看板自己的 timeline 不动 —— 它是 test:diff 拿去和 Python 逐字段比的东西。
- * 每补完一批交一次; 同一行的胜率只算一次。
+ * 每补完一批交一次。胜率按 (帧, 分钟数) 记在 memo 里: 传同一个 memo 反复重算, 只有新的点真算 ——
+ * 键里带分钟数, 是因为暂停区间事后才认出来时, 同一帧的局内时间会被修正, 那就得重算。
  */
 export async function fineTimeline(
   feed: Feed,
@@ -320,16 +321,17 @@ export async function fineTimeline(
   today: string,
   a: { gameId: string; blue: string; red: string; league: string; upto: number },
   onBatch: (pts: Json[]) => void,
+  memo: Map<string, { p: unknown } | null> = new Map(),
 ): Promise<void> {
   const c = await curveCtx(feed, teams, models.s1, a.blue, a.red, a.league, today, a.gameId);
-  const memo = new Map<string, { p: unknown } | null>();
   await feed.fineRows(a.gameId, a.upto, (rows) => {
     let lastP: unknown = null;
     onBatch(
       rows.map((row) => {
         if (row.minute >= 3) {
-          if (!memo.has(row.t)) memo.set(row.t, curveProb(models, teams, today, c, row));
-          const got = memo.get(row.t);
+          const key = `${row.t}|${row.minute}`;
+          if (!memo.has(key)) memo.set(key, curveProb(models, teams, today, c, row));
+          const got = memo.get(key);
           if (got) lastP = got.p;
         }
         return {

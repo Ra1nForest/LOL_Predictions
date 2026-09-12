@@ -955,6 +955,9 @@ export class Feed {
    * 每一局内秒留一帧 (上游内容本来就约 1Hz 才变)。35 分钟一局约 210 个窗口, 压缩后每个约 2.3 KB。
    * 横轴和 goldTimeline 同一个口径: 开局零点起、扣掉暂停 (pauseSpans, 它取的每分钟窗口已在缓存里)。
    * 从最近的窗口往前一批批取, 每批取完交一次 onBatch —— 图先细化最近那段, 往前慢慢补。
+   *
+   * 窗口一律缓存 1 小时: 窗口是整段一次发布的, 发布之后内容不再变 (2026-09-13 实测), 还没发布的
+   * 返回空, 走短缓存。所以直播中反复整局重算 (static-api.fine) 只有新发布的那一两个窗口要真取。
    */
   async fineRows(
     gameId: string,
@@ -976,16 +979,15 @@ export class Feed {
 
     const times: number[] = [];
     for (let t = Math.floor(start / 10_000) * 10_000; t <= end; t += 10_000) times.push(t);
-    const bySec = new Map<number, TimelineRow>();
-    const sorted = () => [...bySec.entries()].sort((a, b) => a[0] - b[0]).map(([, r]) => r);
+    // 每个局内秒留**最早**那一帧, 不是先处理到的那一帧: 一秒可能跨两个窗口, 而窗口的处理顺序
+    // 取决于分批边界 (又取决于 upto/from) —— 按先到先得, 同一局补两次会在这种秒上挑到不同的帧
+    const bySec = new Map<number, { ts: number; row: TimelineRow }>();
+    const sorted = () => [...bySec.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v.row);
     for (let hi = times.length; hi > 0; hi -= batch) {
       const part = times.slice(Math.max(0, hi - batch), hi);
       const framesets = await pool(part, POOL, async (tt) => {
-        const settled = (now - tt) / 1000 > 600;
         // 单个窗口失败只少那 10 秒, 不拖垮整条
-        const p = await this.rawWindow(gameId, Feed.lagged(0, tt), settled ? 3600 : this.windowTtl, this.windowTtl).catch(
-          () => null,
-        );
+        const p = await this.rawWindow(gameId, Feed.lagged(0, tt), 3600, this.windowTtl).catch(() => null);
         return orArr(orObj(p).frames);
       });
       for (const frames of framesets) {
@@ -995,9 +997,11 @@ export class Feed {
           if (!Number.isFinite(ts) || ts > end) continue;
           const secs = ingameSecs(ts);
           const k = Math.floor(secs);
-          // 暂停期间局内时间不走, 同一秒的冻结帧只留第一帧
-          if (secs < 0 || bySec.has(k)) continue;
-          bySec.set(k, Feed.timelineRow(f, secs / 60));
+          // 暂停期间局内时间不走, 同一秒的冻结帧也只留最早那一帧
+          if (secs < 0) continue;
+          const had = bySec.get(k);
+          if (had && had.ts <= ts) continue;
+          bySec.set(k, { ts, row: Feed.timelineRow(f, secs / 60) });
         }
       }
       onBatch?.(sorted());

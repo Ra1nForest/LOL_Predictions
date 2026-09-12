@@ -151,7 +151,9 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
   // 走势图逐秒 (静态版): 历史部分后台补成每秒一个点, 旧局和直播一个样。见 useFineTimeline
   const fine = useFineTimeline(data);
   const shownTimeline = shown?.timeline;
-  const timeline = useMemo(() => mergeFine(shownTimeline ?? [], fine), [shownTimeline, fine]);
+  // 回放中 (shown 是回放改写过的那份): 逐秒历史只画到播放头, 见 mergeFine
+  const cap = shown !== data ? shownTimeline?.[shownTimeline.length - 1]?.minute : undefined;
+  const timeline = useMemo(() => mergeFine(shownTimeline ?? [], fine, cap), [shownTimeline, fine, cap]);
 
   const teams = data?.match?.teams ?? initial?.teams ?? [];
   const blueName = teams[0]?.model_name ?? teams[0]?.name ?? T("蓝方");

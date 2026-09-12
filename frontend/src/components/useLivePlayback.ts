@@ -62,14 +62,30 @@ export function useFineTimeline(data: BoardResponse | null): TimelinePoint[] | n
   const gid = loadStatic && lv && data?.match && data.timeline.length > 0 ? lv.game_id : null;
 
   useEffect(() => {
-    if (!gid || !loadStatic || !ref.current) return;
+    if (!gid || !loadStatic) return;
+    const load = loadStatic;
     let alive = true;
-    const board = ref.current;
-    void loadStatic()
-      .then((s) => s.fine(board, (pts) => alive && setFine({ gid, pts })))
-      .catch((e) => console.warn(`逐秒走势补全失败: ${e}`));
+    const run = () => {
+      const board = ref.current;
+      if (!board || board.live?.game_id !== gid) return;
+      void load()
+        .then((s) => s.fine(board, (pts) => alive && setFine({ gid, pts })))
+        .catch((e) => console.warn(`逐秒走势补全失败: ${e}`));
+    };
+    run();
+    // 直播中的局要一直往后续补, 不能只在打开时补一次: 实时回放攒下的逐秒轨迹会断 ——
+    // 暂停时回放停掉、轨迹丢了; 标签页在后台时浏览器把定时器降到每秒甚至每分钟一次, 回放跳着走,
+    // 轨迹稀成一分钟一个点。缺的这些段由这里从数据源补回来: 每 30 秒一次, 切回标签页时立刻一次
+    // (打完的局 fine() 直接交缓存, 不联网)
+    const iv = setInterval(run, 30_000);
+    const onVis = () => {
+      if (document.visibilityState === "visible") run();
+    };
+    document.addEventListener("visibilitychange", onVis);
     return () => {
       alive = false;
+      clearInterval(iv);
+      document.removeEventListener("visibilitychange", onVis);
     };
   }, [gid]);
 

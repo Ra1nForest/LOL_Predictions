@@ -44,8 +44,11 @@ async function getJSON<T>(name: string): Promise<T> {
 let teamsP: Promise<TeamsFile> | null = null;
 let modelsP: Promise<Models> | null = null;
 let feedP: Promise<Feed> | null = null;
-/** 打完的局的逐秒走势, 按 game_id */
-const fineCache = new Map<string, TimelinePoint[]>();
+/** 逐秒走势补到了哪: 按 game_id, end 是已补到的帧时刻 (毫秒), done = 这局打完且补齐了 */
+const fineState = new Map<string, { pts: TimelinePoint[]; end: number; done: boolean }>();
+const fineBusy = new Set<string>();
+/** 逐秒走势的胜率记忆, 按 game_id (见 board.fineTimeline) */
+const fineMemo = new Map<string, Map<string, { p: unknown } | null>>();
 
 function teams(): Promise<TeamsFile> {
   teamsP ??= getJSON<TeamsFile>("teams.json").catch((e) => {
@@ -122,8 +125,13 @@ export const staticApi = {
   },
 
   /**
-   * 逐秒走势 (见 board.fineTimeline): 后台一批批补全, 每补完一批交一次 onPts。
-   * 打完的局整局缓存 —— 局号标签来回切不重取; 直播的局每次重新补到看板最新那一帧。
+   * 逐秒走势 (见 board.fineTimeline)。直播中的局由 useFineTimeline 定时再调, 打完的局补齐后不再取
+   * (局号标签来回切不重取)。同一局同时只跑一份。
+   *
+   * 每次都**整局重算**, 不做增量拼接: 暂停区间要等暂停过去一阵才认得出来, 认出来之前算的那批点
+   * 局内时间是偏大的 —— 增量拼接会把它们永久留下, 之后正确的点反而被当成"比末尾还早"丢掉,
+   * 曲线断一段。整局重算不贵: 窗口缓存 1 小时 (发布后不变), 只有新窗口真取; 胜率有 memo, 只算新点。
+   * 第一次补到哪交到哪; 之后算完整条再交, 免得中途那一刻只剩最近几分钟。
    */
   async fine(board: BoardResponse, onPts: (pts: TimelinePoint[]) => void): Promise<void> {
     const lv = board.live;
@@ -131,26 +139,37 @@ export const staticApi = {
     const blue = m?.teams[0]?.model_name;
     const red = m?.teams[1]?.model_name;
     if (!lv || !m || !blue || !red || !lv.frame_time) return;
-    const done = lv.game_state === "finished";
-    const hit = done ? fineCache.get(lv.game_id) : undefined;
-    if (hit) {
-      onPts(hit);
+    const gid = lv.game_id;
+    const upto = Date.parse(lv.frame_time);
+    const st = fineState.get(gid);
+    if (st && (st.done || upto - st.end < 5_000)) {
+      onPts(st.pts);
       return;
     }
-    const [f, t, mo] = await Promise.all([feed(), teams(), models()]);
-    let last: TimelinePoint[] = [];
-    await fineTimeline(
-      f,
-      t,
-      mo,
-      localToday(),
-      { gameId: lv.game_id, blue, red, league: m.league, upto: Date.parse(lv.frame_time) },
-      (pts) => {
-        last = pts as unknown as TimelinePoint[];
-        onPts(last);
-      },
-    );
-    if (done && last.length) fineCache.set(lv.game_id, last);
+    if (fineBusy.has(gid)) return;
+    fineBusy.add(gid);
+    try {
+      const [f, t, mo] = await Promise.all([feed(), teams(), models()]);
+      let memo = fineMemo.get(gid);
+      if (!memo) fineMemo.set(gid, (memo = new Map()));
+      let all: TimelinePoint[] = [];
+      await fineTimeline(
+        f,
+        t,
+        mo,
+        localToday(),
+        { gameId: gid, blue, red, league: m.league, upto },
+        (pts) => {
+          all = pts as unknown as TimelinePoint[];
+          if (!st) onPts(all);
+        },
+        memo,
+      );
+      if (st) onPts(all);
+      fineState.set(gid, { pts: all, end: upto, done: lv.game_state === "finished" });
+    } finally {
+      fineBusy.delete(gid);
+    }
   },
 
   async predict(body: PredictRequestBody): Promise<PredictResponse> {
