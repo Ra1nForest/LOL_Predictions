@@ -28,7 +28,7 @@ build step). They run in ~8s and need neither network nor API keys; the debate t
 python -m unittest discover -s tests -v
 ```
 
-Front end (Node only needed locally — the server has none):
+Front end (Node is only needed to build — `api.py` just serves the built files):
 
 ```bash
 npm --prefix frontend install
@@ -69,12 +69,12 @@ python research/harness.py
 python tools/debate_dryrun.py --dump       # exercises the whole Stage 3 protocol with stubs, no key
 ```
 
-Unattended pipeline (what the server actually runs):
+Unattended pipeline (what the local Windows scheduled tasks run — see Deployment):
 
 ```bash
 python daily_update.py --dry-run           # fetch + train into artifacts_staging/, no swap, no restart
 python daily_update.py                     # + metric gate, atomic swap, restart, /health probe
-python collect_live.py --status            # live late-game snapshot collector (systemd runs it every 2 min)
+python collect_live.py --status            # live late-game snapshot collector (scheduled every 2 min)
 python prediction_log.py --resolve --score # backfill real results for logged predictions, then score them
 ```
 
@@ -116,8 +116,8 @@ also what gets deployed — `research/`, `tools/`, `attic/` are not needed at ru
   advisory layer, still reachable via `/predict?agent_review`. `websearch.py` provides retrieval
   (Tavily / Brave / Serper, probed in that order); with none configured the service still runs.
 - **`frontend/`** is the UI source (Vite + React + TypeScript). `npm run build` emits into
-  `static/`, which is what `api.py` mounts — **the server has no Node**, so builds happen locally
-  and only the artefacts (`static/index.html` + `static/assets/*`) get deployed. `npm run dev`
+  `static/`, which is what `api.py` mounts — a server (when there is one) has no Node, so builds
+  happen locally and only the artefacts (`static/index.html` + `static/assets/*`) get copied over. `npm run dev`
   serves on 5173 and proxies the API prefixes to `127.0.0.1:8000` (an SSH tunnel to the box works).
   `static/legacy.html` is the previous single-file front end, kept reachable for comparison.
   The UI still has no domain logic: every claim it renders comes from the API's `reasons`,
@@ -251,7 +251,34 @@ guards. If one goes red, work out whether that trap is back before changing the 
 
 ## Deployment
 
-Systemd units in `deploy/`; the server runs four of them —
+**As of 2026-09-13 there is no server.** The Oracle box that used to run everything under "If a
+server comes back" can be reclaimed at any time, so it is no longer maintained or deployed to. It
+may still be up, running code from before that date — do not treat its data or behaviour as
+current, and do not propose server deploys. This changes only when a new server turns up or the
+free A1 grab succeeds.
+
+What actually runs:
+
+- **The public site** — GitHub Pages, rebuilt by `.github/workflows/pages.yml` on every push to
+  `main` that touches `frontend/` (see Commands). Visitors' browsers do all the live inference, so
+  shipping a front-end change is just pushing it.
+- **This Windows machine** — four scheduled tasks installed by `deploy/windows_install.ps1`:
+  `LoL-Predict` (`run_api.py`, the API on 127.0.0.1:8000), `LoL-Collect`, `LoL-Update`
+  (`daily_update.py --publish-web`: retrain, gate, swap, restart `LoL-Predict` via `schtasks /end`
+  + `/run`, then push the refreshed model files to the site) and `LoL-Backfill`. The batch jobs
+  start through `run_task.py` (windowless `pythonw` with stdout redirected into `logs/`). Tasks run
+  as the logged-in user with no stored credentials, so they need a session (a locked screen is
+  fine). All four have `-StartWhenAvailable`, so a run missed while the machine was off happens as soon
+  as it is back (for collection that only means "next sample now" — a missed live game cannot be
+  sampled afterwards). The install
+  script's header lists the differences from the systemd units that would otherwise fail silently
+  (local time vs UTC, catch-up, the restart command).
+- The Python side still has to stay correct with no server: it is the reference `test:golden` and
+  `test:diff` hold the browser implementation to, and the local tasks run it.
+
+### If a server comes back
+
+Systemd units in `deploy/`; a server runs four of them —
 `lol-predict` (the API), `lol-update` (twice-daily fetch + retrain via `daily_update.py`),
 `lol-collect` (live snapshots every 2 min), `lol-backfill` (daily, after the update, since it needs
 Oracle's Elixir results as labels). `deploy/install.sh` installs and verifies **only** `lol-predict`
@@ -267,5 +294,6 @@ with the shared lolesports key, and getting that key rate-limited kills the data
 over an SSH tunnel or an authenticated reverse proxy. README's "Exposure" section describes the
 earlier public-port setup and is stale on this point.
 
-Server-side data is authoritative: it has the live-collected snapshots and the freshest CSVs, so a
-local run may legitimately differ from what the deployed service reports.
+Neither machine's data is authoritative by default: the server's OAuth token once died for ten days
+(2026-08-31 → 09-09) while the local copy kept updating. Check `/health` → `data_through` and the
+`update` block on whichever machine you are reading from before trusting its numbers.

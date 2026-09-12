@@ -159,7 +159,9 @@ OK 'LoL-Collect  (每 2 分钟)'
 # --service 必须是 LoL-Predict: daily_update.py 在 Windows 上用
 # schtasks /end + /run 重启它。名字对不上就会走"没这个任务"分支, 结果是
 # 新模型在磁盘、服务还在用旧的 —— 和服务器上坏了十天的那个 bug 一模一样。
-$a = New-ScheduledTaskAction -Execute $Pyw -Argument 'run_task.py update daily_update.py --service LoL-Predict' -WorkingDirectory $Proj
+# --publish-web: 换模型成功后把新模型导出并推到 GitHub Pages 站 (tools/publish_web.py)。
+# 2026-09-12 起线上任务是手动 Set-ScheduledTask 加上的; 写进这里, 重装任务才不会悄悄丢掉它
+$a = New-ScheduledTaskAction -Execute $Pyw -Argument 'run_task.py update daily_update.py --service LoL-Predict --publish-web' -WorkingDirectory $Proj
 $s = New-ScheduledTaskSettingsSet @common -Hidden
 Register-ScheduledTask -TaskName 'LoL-Update' -Action $a `
   -Trigger @((New-ScheduledTaskTrigger -Daily -At $u00), (New-ScheduledTaskTrigger -Daily -At $u12)) `
