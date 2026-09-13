@@ -13,6 +13,13 @@ Oracle's Elixir 只提供 at10/15/20/25 四个时间点的快照。实测 T=25 �
 本脚本每次运行采一轮:
     找出正在打的局 -> 取当前帧 -> 追加一条快照到 collected/{gameId}.jsonl
     局结束后, 用系列赛比分的增量判断这一局谁赢, 写 {gameId}.result.json
+    对有局正在打的比赛, 请本机服务出一次看板 -> 它顺手把当时的预测写进
+    predictions/log.jsonl (见 log_predictions)
+
+为什么采集器要管预测留档: 留档是 api.esports_board 出看板时写的, 以前靠服务器上有人
+开着看板。服务器不维护了、大家看的是 GitHub Pages 静态站 (浏览器里算, 不写留档), 留档就
+停在了 2026-09-12 的 116 局。采集器本来就每 2 分钟轮询一次正在打的比赛, 顺手请本机服务
+出一次看板, 线上真账就能一直攒下去, 不需要有人开着页面。
 
 设计取舍
 --------
@@ -30,7 +37,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,6 +50,8 @@ from esports_feed import EsportsFeed, FeedError   # noqa: E402
 
 OUT = _HERE / "collected"
 STATE = OUT / "_series_state.json"
+# 本机服务 (run_api.py, 计划任务 LoL-Predict)。只绑 127.0.0.1, 见 CLAUDE.md
+API = os.environ.get("LOL_API", "http://127.0.0.1:8000")
 
 
 def log(m):
@@ -116,9 +128,36 @@ def snapshot(feed: EsportsFeed, game_id: str, meta: dict) -> int:
     return 1
 
 
+def log_predictions(match_ids) -> int:
+    """请本机服务给这几场出一次看板; 预测留档是 esports_board 自己写的。返回拿到胜率的场数。
+
+    **只对有局正在打的比赛调**, 调用方保证。对已打完的局出看板, 会把终局那一帧的 0.01 / 0.99
+    当成一次"预测"写进留档, 污染真账 (CLAUDE.md 专门记过这个坑, 2026-09-12 删过四条)。
+    curves=false: 留档只看头条那一段, 走势图不用算。
+    服务没开就整轮跳过 —— 这是旁路, 采集照常。去重在服务那边 (每局每分钟一条), 这里不管。
+    """
+    n = 0
+    for mid in match_ids:
+        url = f"{API}/esports/board/{mid}?curves=false"
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                body = json.loads(r.read().decode("utf-8"))
+            if (body.get("prediction") or {}).get("probability_blue") is not None:
+                n += 1
+        except urllib.error.HTTPError as e:
+            log(f"  {mid} 看板 HTTP {e.code} (不影响采集)")
+        except urllib.error.URLError as e:
+            log(f"  本机服务 {API} 连不上, 本轮不记预测: {e.reason}")
+            break
+        except Exception as e:
+            log(f"  {mid} 看板失败 (不影响采集): {type(e).__name__}: {e}")
+    return n
+
+
 def collect(feed: EsportsFeed) -> dict:
     state = load_state()
-    stats = {"matches": 0, "games": 0, "rows": 0, "finished": 0}
+    stats = {"matches": 0, "games": 0, "rows": 0, "finished": 0, "logged": 0}
+    playing: list[str] = []          # 有局正在打的比赛, 最后请本机服务记一次预测
 
     try:
         live = feed.live()
@@ -176,6 +215,8 @@ def collect(feed: EsportsFeed) -> dict:
             # 帧本身带 frame_time, 旧不旧读的人自己看得见; 这里的职责是
             # "别把有效数据扔了"。
             if st.game_state == "in_game":  # 正在打 -> 采一条
+                if m.match_id not in playing:
+                    playing.append(m.match_id)
                 # 蓝红必须按**这一局**的选边算, 不能用系列赛的队伍顺序 ——
                 # BO 里每局换边, 实测 7 局里有 2 局被标反 (NAVI/MKOI g2、
                 # EDG/TES g2)。蓝方是模型特征, 标反了整局的队伍级特征都会
@@ -256,6 +297,8 @@ def collect(feed: EsportsFeed) -> dict:
                              "seen_at": datetime.now(timezone.utc).isoformat()}
 
     save_state(state)
+    if playing:
+        stats["logged"] = log_predictions(playing)
     return stats
 
 
@@ -459,7 +502,7 @@ def main():
     except Exception as e:
         n = 0
         log(f"对账失败(不影响采集): {type(e).__name__}: {e}")
-    log(f"直播 {s['matches']} 场 · 新快照 {s['rows']} 条 · "
+    log(f"直播 {s['matches']} 场 · 新快照 {s['rows']} 条 · 记预测 {s['logged']} 场 · "
         f"判定胜负 {s['finished']} 局 · 对账补 {n} 局")
     return 0
 
