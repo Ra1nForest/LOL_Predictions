@@ -372,8 +372,10 @@ GET  /api                  endpoint index
 matches and drive a prediction from a click rather than from typed team names.
 Four things about that source cost real time to establish:
 
-- `startingTime` must be floored to 10 seconds **and pushed 60 seconds into the
-  past**. The feed lags; asking for the current instant returns HTTP 204.
+- `startingTime` must be floored to 10 seconds **and pushed into the past by the
+  publish delay**. The feed publishes each 10-second window whole, 20–60 seconds after
+  it starts (the delay changes from day to day, so it is measured live, not fixed);
+  asking for a window that is not out yet returns an error or HTTP 204.
 - **A game's `state` from the schedule API lags reality.** Observed live: the
   schedule reported a game `inProgress` while the frame feed reported
   `gameState: finished` with totals frozen. `frames[-1].gameState` is the only
@@ -441,7 +443,21 @@ the front end has no domain logic of its own.
 
 ## Deployment
 
-Currently on Oracle Cloud (VM.Standard3.Flex, 4 OCPU / 24 GB, Ubuntu 22.04).
+**There is no server any more** (since 2026-09-13): the Oracle VM that used to run everything
+could be reclaimed at any time, so it is no longer maintained. Two things run instead:
+
+- **The public site**, <https://ra1nforest.github.io/LOL_Predictions/> — GitHub Pages, rebuilt
+  by `.github/workflows/pages.yml` on every push that touches `frontend/`. It has no backend:
+  the browser calls lolesports directly and runs Stages 1, 2 and 4 itself (`frontend/src/web/`),
+  held to the Python implementation by `test:golden` and `test:diff`.
+- **A Windows machine** running four scheduled tasks installed by `deploy/windows_install.ps1`:
+  the API (`run_api.py`, 127.0.0.1:8000), live snapshot collection every 2 minutes, the
+  twice-daily fetch → retrain → gate → swap (`daily_update.py --publish-web`, which then
+  exports the new models and pushes them to the site), and the nightly frame backfill.
+
+### If a server comes back
+
+The systemd units in `deploy/` are kept for that.
 
 ```bash
 # on the server, code at ~/lol/service, venv at ~/lol/venv
@@ -477,10 +493,11 @@ Notes that cost time to learn:
 
 ### Exposure
 
-The service is unauthenticated on a public port. `/predict` costs only CPU. `/debate` costs
-four LLM calls plus retrieval per request, so it can be gated by setting `DEBATE_KEY` in the
-environment file, after which it requires an `X-Debate-Key` header. Unset, behaviour is
-unchanged.
+The API binds **127.0.0.1**, not a public port: `/esports/board` fans out to lolesports with
+the shared public key, and getting that key rate-limited would kill the only live data source.
+The public site does not need it — each visitor's browser talks to lolesports directly.
+`/debate` costs four LLM calls plus retrieval per request and can additionally be gated by
+setting `DEBATE_KEY`, after which it requires an `X-Debate-Key` header.
 
 ---
 

@@ -101,28 +101,15 @@ interface Props {
   error: string | null;
   emptyText: string;
   onOpen: (m: Match) => void;
-  onRefresh: () => void;
 }
 
-export function MatchList({
-  title,
-  matches,
-  kind,
-  loading,
-  error,
-  emptyText,
-  onOpen,
-  onRefresh,
-}: Props) {
+/** 列表自己不带刷新按钮 —— App 每 30 秒、以及切回标签页时自动重取 */
+export function MatchList({ title, matches, kind, loading, error, emptyText, onOpen }: Props) {
   return (
     <section className="section">
       <div className="section-head">
         <h2>{title}</h2>
         {!!matches.length && <span className="count">{matches.length}</span>}
-        <span className="spacer" />
-        <button className="btn" onClick={onRefresh} disabled={loading}>
-          {T("刷新")}
-        </button>
       </div>
       {error ? (
         <div className="panel pad err">{error}</div>

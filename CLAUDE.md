@@ -224,6 +224,14 @@ guards. If one goes red, work out whether that trap is back before changing the 
   (`research/gate_live_names.py`, 1755 games): broken names made Stage 2 no better than Stage 1
   (59.5% vs 59.4%); aligned names give 61.7%, Brier `t = +3.16`, log loss `t = +2.85` over 5
   time blocks (accuracy `t = +1.78`), and reproduce the training matrix's draft features exactly.
+- **The board blends Stage 2 into Stage 4 for minutes 3–15.** `api._blend_prior` /
+  `web/ingame.ts blendPrior` (`BLEND_FROM`/`BLEND_TO`) move the headline from the post-draft
+  probability (pre-game if there is none) to the in-game one, linearly in log-odds; switched on
+  by `blend=True` only on the board paths (headline, curve, per-second timeline, live playback).
+  `/predict/ingame` still returns the raw Stage 4 number, so `test:golden` is unaffected. It was
+  adopted for continuity, not accuracy (`research/gate_anchor.py`: t = +0.83, never worse; the
+  minute-3 jump fell from 14.3 to 0.1 points). Change it in both implementations — `test:diff`
+  catches a mismatch.
 - **A failed start calibration is not a result.** `_game_start` (and `gameStart` in
   `frontend/src/web/feed.ts`) retries every `START_RETRY_SEC` until the calibration windows have
   settled; only then does it accept `frames[0]`. Caching the first-sight failure put every live

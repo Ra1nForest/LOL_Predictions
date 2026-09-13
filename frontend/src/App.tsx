@@ -123,25 +123,28 @@ export default function App() {
         <h1>{T("胜率预测")}</h1>
         <p>{T("四大赛区比赛的实时胜率预测。")}</p>
       </header>
-      <MatchList
-        title={T("正在进行")}
-        matches={live}
-        kind="live"
-        loading={loading}
-        error={error}
-        emptyText={T("当前没有进行中的比赛")}
-        onOpen={openBoard}
-        onRefresh={() => void load()}
-      />
+      {/* 没有进行中的比赛就整块不显示 —— 一个写着"当前没有进行中的比赛"的空框占掉首屏一半,
+          而用户要找的即将开赛的场次被挤到下面。有比赛时它照常排在最上面。
+          取数失败的提示因此放到"即将开始"那一块 (它总是在的)。 */}
+      {live.length > 0 && (
+        <MatchList
+          title={T("正在进行")}
+          matches={live}
+          kind="live"
+          loading={loading}
+          error={null}
+          emptyText=""
+          onOpen={openBoard}
+        />
+      )}
       <MatchList
         title={T("即将开始")}
         matches={upcoming}
         kind="upcoming"
         loading={loading}
-        error={null}
+        error={error}
         emptyText={T("近期没有排期")}
         onOpen={openBoard}
-        onRefresh={() => void load()}
       />
     </div>
   );
