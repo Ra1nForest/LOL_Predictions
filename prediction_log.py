@@ -182,46 +182,95 @@ def resolve(window_h: float = 48) -> int:
     return n
 
 
+def _game_key(r) -> str:
+    return r.get("game_id") or f"{r.get('match_id')}#{r.get('game_number')}"
+
+
 def score():
-    """真账。和留出集的数字对照着看 —— 差得多就说明线上出了离线看不见的问题。"""
-    rows = [r for r in _rows() if r.get("y") is not None]
+    """真账。和留出集的数字对照着看 —— 差得多就说明线上出了离线看不见的问题。
+
+    **按局计分, 不按条。** 看板每局每分钟记一条: 2026-09-13 时 2064 条其实只有 116 局, 打 41 分钟
+    的局记 41 条、20 分钟的只记 20 条左右。按条平均, 长局就被多算几遍 —— 而长局恰恰是拉锯和
+    翻盘的局, 当时按条准确率 69.7%, 按局 75.7%; 样本量也显得比实际大 (同一局几十条共享一个胜负)。
+    所以这里每条记录的权重是 1/本局条数, 每局合起来算一票; ± 是按局算的 95% 区间。
+    另给固定时刻 (第 10/15/20/25 分钟各取一条) 的切面, 和留出集的 per_T 同一口径, 可以直接对照。
+    旧的按条数字留一行, 只作对照。
+    """
+    rows = [r for r in _rows() if r.get("y") is not None and r.get("probability_blue") is not None]
     if not rows:
         print("还没有已知结果的记录, 先跑 --resolve")
         return
+    from collections import defaultdict
     import numpy as np
-    p = np.array([r["probability_blue"] for r in rows])
-    y = np.array([r["y"] for r in rows])
-    acc = ((p >= .5).astype(int) == y).mean()
-    brier = ((p - y) ** 2).mean()
-    base = max(y.mean(), 1 - y.mean())
-    print(f"\n{'=' * 60}")
-    print(f"  线上真账: {len(rows)} 条已知结果")
-    print("=" * 60)
-    print(f"  准确率 {acc:.3f}   基线 {base:.3f}   Brier {brier:.4f}")
+    key = [_game_key(r) for r in rows]
+    p = np.array([r["probability_blue"] for r in rows], dtype=float)
+    y = np.array([r["y"] for r in rows], dtype=float)
+    hit = ((p >= .5).astype(float) == y).astype(float)
+    sq = (p - y) ** 2
+
+    def by_game(v, mask=None):
+        """每局先在自己的记录里平均, 再对局平均。返回 (均值, 95% 半宽, 局数)。"""
+        d = defaultdict(list)
+        for i, k in enumerate(key):
+            if mask is None or mask[i]:
+                d[k].append(v[i])
+        g = np.array([np.mean(x) for x in d.values()])
+        if not len(g):
+            return float("nan"), float("nan"), 0
+        half = 1.96 * g.std(ddof=1) / np.sqrt(len(g)) if len(g) > 1 else float("nan")
+        return float(g.mean()), float(half), len(g)
+
+    acc, acc_h, n_games = by_game(hit)
+    brier, brier_h, _ = by_game(sq)
+    yb, _, _ = by_game(y)
+    base = max(yb, 1 - yb)
+    print(f"\n{'=' * 64}")
+    print(f"  线上真账: {n_games} 局 ({len(rows)} 条记录, 每局每分钟一条) —— 下面按局计分, 每局一票")
+    print("=" * 64)
+    print(f"  准确率 {acc:.3f} ± {acc_h:.3f}   基线 {base:.3f}   Brier {brier:.4f} ± {brier_h:.4f}")
+    print(f"  (按条的旧口径: 准确率 {hit.mean():.3f}, Brier {sq.mean():.4f} —— 长局被重复计入)")
+
+    # 固定时刻: 每局取离第 T 分钟最近、相差不超过 1 分钟的那一条
+    print("\n按固定时刻 (每局一条, 和留出集的 per_T 同一口径):")
+    for T in (10, 15, 20, 25):
+        best = {}
+        for i, r in enumerate(rows):
+            m = r.get("minute")
+            if m is None or abs(m - T) > 1:
+                continue
+            k = key[i]
+            if k not in best or abs(m - T) < abs(rows[best[k]]["minute"] - T):
+                best[k] = i
+        idx = list(best.values())
+        if len(idx) >= 5:
+            print(f"  第 {T:>2} 分钟  {len(idx):>4} 局   准确率 {hit[idx].mean():.3f}   "
+                  f"Brier {sq[idx].mean():.4f}")
 
     print("\n按来源:")
     for src in sorted({r["source"] for r in rows}):
         m = np.array([r["source"] == src for r in rows])
-        if m.sum() >= 5:
-            print(f"  {src:<12} {m.sum():>5} 条   准确率 "
-                  f"{((p[m] >= .5).astype(int) == y[m]).mean():.3f}   "
-                  f"Brier {((p[m]-y[m])**2).mean():.4f}")
+        a, ah, n = by_game(hit, m)
+        b, _, _ = by_game(sq, m)
+        if n >= 5:
+            print(f"  {src:<12} {n:>4} 局 / {m.sum():>5} 条   准确率 {a:.3f} ± {ah:.3f}   Brier {b:.4f}")
 
     print("\n按赛区:")
     for lg in sorted({r["league"] for r in rows if r.get("league")}):
         m = np.array([r.get("league") == lg for r in rows])
-        if m.sum() >= 5:
-            print(f"  {lg:<8} {m.sum():>5} 条   准确率 "
-                  f"{((p[m] >= .5).astype(int) == y[m]).mean():.3f}")
+        a, ah, n = by_game(hit, m)
+        if n >= 5:
+            print(f"  {lg:<8} {n:>4} 局 / {m.sum():>5} 条   准确率 {a:.3f} ± {ah:.3f}")
 
-    # 校准: 说 70% 的那些, 是不是真有 70% 赢了
-    print("\n校准 (说了多少 vs 实际赢了多少):")
+    # 校准: 说 70% 的那些, 是不是真有 70% 赢了。一局在某一档里有几条都只算一票
+    print("\n校准 (按局: 说了多少 vs 实际赢了多少):")
     for lo in (0.0, .2, .4, .6, .8):
         hi = lo + .2
         m = (p >= lo) & (p < hi if hi < 1 else p <= 1)
-        if m.sum() >= 5:
-            print(f"  预测 {lo:.0%}-{hi:.0%}  {m.sum():>5} 条   "
-                  f"实际蓝方胜率 {y[m].mean():.1%}   (理想 ≈ {p[m].mean():.1%})")
+        wy, _, n = by_game(y, m)
+        wp, _, _ = by_game(p, m)
+        if n >= 5:
+            print(f"  预测 {lo:.0%}-{hi:.0%}  {n:>4} 局 / {m.sum():>5} 条   "
+                  f"实际蓝方胜率 {wy:.1%}   (理想 ≈ {wp:.1%})")
 
 
 def main():
