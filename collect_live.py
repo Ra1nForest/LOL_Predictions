@@ -182,6 +182,7 @@ def collect(feed: EsportsFeed) -> dict:
         wins = {t.api_name: (t.game_wins or 0) for t in m.teams}
         prev = state.get(m.match_id, {})
         prev_wins = prev.get("wins") or {}
+        ended: list = []             # 这一轮看到已结束、有快照、还没判胜负的局
 
         try:
             games = feed.games(m.match_id)
@@ -270,30 +271,39 @@ def collect(feed: EsportsFeed) -> dict:
                         f"g{g.get('number')} 第 {st.minute} 分钟 -> +1")
 
             elif st.game_state == "finished":
-                # 结束了且还没判过胜负 -> 用系列赛比分增量判断
-                rpath = OUT / f"{gid}.result.json"
-                if rpath.exists() or not (OUT / f"{gid}.jsonl").exists():
-                    continue
-                winner = None
-                for name, w in wins.items():
-                    if w > prev_wins.get(name, 0):
-                        winner = name
-                        break
-                if winner:
-                    # 局长也要扣暂停。上面那个 st 是热循环里取的 (不扫暂停,
-                    # 因为要对每一局都探一次), 这里一局只走一次, 付得起。
-                    fin = feed.window(gid, precise_minute=True) or st
-                    rpath.write_text(json.dumps({
-                        "game_id": gid, "winner": winner,
-                        "final_minute": fin.minute,
-                        "wins_before": prev_wins, "wins_after": wins,
-                        "decided_at": datetime.now(timezone.utc).isoformat(),
-                    }, ensure_ascii=False, indent=1), encoding="utf-8")
-                    stats["finished"] += 1
-                    log(f"  g{g.get('number')} 结束, 胜者 {winner} "
-                        f"(第 {fin.minute} 分钟)")
+                # 结束了、采到过快照、还没判过胜负 -> 先记下, 这一场的局都看完再判
+                if (OUT / f"{gid}.jsonl").exists() and not (OUT / f"{gid}.result.json").exists():
+                    ended.append((gid, g, st))
 
-        state[m.match_id] = {"wins": wins,
+        # 胜负靠系列赛比分的增量推断。**只在"这一轮恰好一局刚结束、比分也恰好只多了 1 分"时才标**,
+        # 而且只有标出去的那 1 分才记进"已分配"的比分 (state 里的 wins)。
+        #
+        # 2026-09-05 LPL IG vs TES: 第 3 局 IG 赢, 比分先涨成 2:1 而帧还写着 in_game —— 原来的写法
+        # 把新比分直接存成"上一轮", 这 1 分就没配给任何一局; 第 4 局结束时第 3、4 局同一轮都显示结束,
+        # 只看到 TES 那 1 分, 两局都被标成 TES。全部 261 个标签里这样错了 3 个 (都在 LPL, 它的比分
+        # 接口和帧最不同步), 其中一个还被 reconcile 当成已知前提, 把第 5 局也推错了。
+        # 现在没分出去的分留着, 等那一局在帧里也结束了再配; 同一轮两局以上一起结束、或者分数对不上,
+        # 就不标 —— 留给 oe_correct / reconcile。宁可少标, 不能标错。
+        attributed = dict(prev_wins) if prev_wins else dict(wins)   # 第一次见到这场: 以当下比分为起点
+        inc = {n: w - attributed.get(n, 0) for n, w in wins.items()}
+        if prev_wins and len(ended) == 1 and sum(inc.values()) == 1 and max(inc.values()) == 1:
+            gid, g, st = ended[0]
+            winner = max(inc, key=inc.get)
+            # 局长也要扣暂停。上面那个 st 是热循环里取的 (不扫暂停,
+            # 因为要对每一局都探一次), 这里一局只走一次, 付得起。
+            fin = feed.window(gid, precise_minute=True) or st
+            after = {**attributed, winner: attributed.get(winner, 0) + 1}
+            (OUT / f"{gid}.result.json").write_text(json.dumps({
+                "game_id": gid, "winner": winner,
+                "final_minute": fin.minute,
+                "wins_before": attributed, "wins_after": after,
+                "decided_at": datetime.now(timezone.utc).isoformat(),
+            }, ensure_ascii=False, indent=1), encoding="utf-8")
+            attributed = after
+            stats["finished"] += 1
+            log(f"  g{g.get('number')} 结束, 胜者 {winner} (第 {fin.minute} 分钟)")
+
+        state[m.match_id] = {"wins": attributed, "observed": wins,
                              "seen_at": datetime.now(timezone.utc).isoformat()}
 
     save_state(state)
@@ -319,6 +329,9 @@ def reconcile(feed: EsportsFeed) -> int:
     就留着不动 —— 宁可少标, 不能标错。
     """
     filled = 0
+    state = load_state()
+    warned = set(state.get("_warned") or [])     # 比分对不上已经报过的比赛, 不再每轮重报
+    n_warned = len(warned)
     for mpath in sorted(OUT.glob("*.meta.json")):
         try:
             meta = json.loads(mpath.read_text(encoding="utf-8"))
@@ -368,7 +381,11 @@ def reconcile(feed: EsportsFeed) -> int:
             if w in rest:
                 rest[w] -= 1
         if any(v < 0 for v in rest.values()):
-            log(f"  {mid} 比分对不上 (已知 {known} vs 最终 {finals}), 跳过")
+            # 已知的胜负和最终比分矛盾 = 其中有标错的。每轮 (而且这场的每一局) 都会走到这里,
+            # 只报一次; 标错的那局等 OE 登记后由 oe_correct 改正, 改完这里自然就对上了
+            if mid not in warned:
+                warned.add(mid)
+                log(f"  {mid} 比分对不上 (已知 {known} vs 最终 {finals}), 跳过 —— 等 OE 登记后 oe_correct 改正")
             continue
 
         # 注意: unknown 只含"采到快照的局"; 没采到的局也占掉了胜场,
@@ -392,7 +409,107 @@ def reconcile(feed: EsportsFeed) -> int:
             }, ensure_ascii=False, indent=1), encoding="utf-8")
             filled += 1
             log(f"  对账补上 {gid} -> {w}")
+    if len(warned) != n_warned:
+        state = load_state()
+        state["_warned"] = sorted(warned)
+        save_state(state)
     return filled
+
+
+OE_EVERY_H = 6
+
+
+def oe_correct(force: bool = False) -> int:
+    """按 Oracle's Elixir 的逐局结果核对采集到的胜负。返回改正 + 补上的局数。
+
+    比分增量推断会错 (见 collect 里那段说明), reconcile 也只能在比分自洽时补。而 OE 晚一两天
+    会逐局登记真实胜负 —— 那才是标准答案。有 OE 就以 OE 为准 (source="oe"), 覆盖增量/对账推出来
+    的, 原来的写进 "was" 留底; OE 还没登记的局先不动, 下次再查。
+    配对同 prediction_log.resolve: 赛区 + **两队** + 局号 + 就近日期 (research/backfill_late.find_oe)。
+    队名先经 esports_feed.map_team 换成 OE 的名字, 换不出来就不配 (不猜)。选边以帧为准, 万一和 OE
+    反了, 按反的方向再配一次, 胜者跟着换边。
+    读 OE 要几秒, 每 OE_EVERY_H 小时查一次就够 —— 它本来就晚一两天才登记。
+    """
+    state = load_state()
+    now = datetime.now(timezone.utc)
+    last = state.get("_oe_checked_at")
+    if not force and last:
+        try:
+            if (now - datetime.fromisoformat(last)).total_seconds() < OE_EVERY_H * 3600:
+                return 0
+        except ValueError:
+            pass
+
+    cand = []
+    for mpath in sorted(OUT.glob("*.meta.json")):
+        try:
+            meta = json.loads(mpath.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        gid = meta.get("game_id")
+        if not gid or not (OUT / f"{gid}.jsonl").exists():
+            continue
+        rp = OUT / f"{gid}.result.json"
+        cur = None
+        if rp.exists():
+            try:
+                cur = json.loads(rp.read_text(encoding="utf-8"))
+            except Exception:
+                cur = None
+        if cur and cur.get("source") == "oe":
+            continue
+        cand.append((meta, rp, cur))
+
+    n = 0
+    if cand:
+        sys.path.insert(0, str(_HERE / "research"))
+        from backfill_late import LEAGUE_TO_OE, find_oe, oe_index
+        from esports_feed import map_team
+        oe = oe_index()
+        names: dict = {}
+        for meta, rp, cur in cand:
+            gid = meta["game_id"]
+            lg = LEAGUE_TO_OE.get(meta.get("league"), meta.get("league"))
+            if lg not in names:
+                x = oe[oe.league == lg]
+                names[lg] = sorted(set(x.teamname.dropna()) | set(x.red_name.dropna()))
+            b, r = map_team(meta.get("blue"), names[lg]), map_team(meta.get("red"), names[lg])
+            try:
+                when = datetime.fromisoformat(meta["collected_from"])
+            except Exception:
+                continue
+            if not (b and r):
+                continue
+            num = meta.get("game_number") or 1
+            row = find_oe(oe, lg, when, b, r, num, window_h=24)
+            if row is not None:
+                side = "blue" if int(row["result"]) == 1 else "red"
+            else:
+                row = find_oe(oe, lg, when, r, b, num, window_h=24)
+                if row is None:
+                    continue                         # OE 还没登记, 下次再查
+                side = "red" if int(row["result"]) == 1 else "blue"
+            winner = meta.get(side)                  # 采集器自己的队名 (lolesports), 和增量判定同一口径
+            was = cur.get("winner") if cur else None
+            rec = {**(cur or {"game_id": gid}), "winner": winner, "source": "oe",
+                   "oe_gameid": str(row["gameid"]), "checked_at": now.isoformat()}
+            gl = row.get("gamelength")
+            if "final_minute" not in rec and gl is not None and gl == gl:
+                rec["final_minute"] = int(gl // 60)
+            if was is not None and was != winner:
+                rec["was"] = was
+                log(f"  按 OE 改正 {meta.get('league')} {meta.get('blue')} vs {meta.get('red')} "
+                    f"g{num}: {was} -> {winner}")
+            elif was is None:
+                log(f"  按 OE 补上 {meta.get('league')} {meta.get('blue')} vs {meta.get('red')} g{num}: {winner}")
+            rp.write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+            if was != winner:
+                n += 1
+
+    state = load_state()          # 别的步骤可能刚写过, 重读再改
+    state["_oe_checked_at"] = now.isoformat()
+    save_state(state)
+    return n
 
 
 def fix_sides(feed: EsportsFeed) -> int:
@@ -479,7 +596,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--status", action="store_true", help="看已攒了多少")
     ap.add_argument("--reconcile", action="store_true",
-                    help="只跑赛后对账, 不采集")
+                    help="只跑赛后核对 (先按 OE 改正/补上胜负, 再按比分对账), 不采集")
     ap.add_argument("--fix-sides", action="store_true",
                     help="修正历史 meta 里标反的蓝红 (一次性)")
     a = ap.parse_args()
@@ -490,12 +607,19 @@ def main():
         log(f"修正 {n} 局的蓝红")
         return 0
     if a.reconcile:
+        k = oe_correct(force=True)                 # 先按 OE 改正, 对账拿到的已知胜负才是对的
         n = reconcile(EsportsFeed())
-        log(f"对账补上 {n} 局")
+        log(f"按 OE 改正/补上 {k} 局 · 对账补上 {n} 局")
         return 0
     feed = EsportsFeed()
     log("采集一轮")
     s = collect(feed)
+    # 按 OE 核对 (每 OE_EVERY_H 小时一次), 再对账 —— 顺序不能反, 见 --reconcile 那行
+    try:
+        k = oe_correct()
+    except Exception as e:
+        k = 0
+        log(f"按 OE 核对失败(不影响采集): {type(e).__name__}: {e}")
     # 每轮末尾对一次账 —— 只读已完赛的比赛, 都带缓存, 代价很小
     try:
         n = reconcile(feed)
@@ -503,7 +627,7 @@ def main():
         n = 0
         log(f"对账失败(不影响采集): {type(e).__name__}: {e}")
     log(f"直播 {s['matches']} 场 · 新快照 {s['rows']} 条 · 记预测 {s['logged']} 场 · "
-        f"判定胜负 {s['finished']} 局 · 对账补 {n} 局")
+        f"判定胜负 {s['finished']} 局 · OE 核对 {k} 局 · 对账补 {n} 局")
     return 0
 
 
