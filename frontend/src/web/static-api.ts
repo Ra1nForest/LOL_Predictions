@@ -158,7 +158,8 @@ export const staticApi = {
         t,
         mo,
         localToday(),
-        { gameId: gid, blue, red, league: m.league, upto },
+        // prior: 看板的 BP 后概率 —— 逐秒走势开局那段和头条同一个渐变
+        { gameId: gid, blue, red, league: m.league, upto, prior: board.prediction?.postdraft_probability_blue ?? null },
         (pts) => {
           all = pts as unknown as TimelinePoint[];
           if (!st) onPts(all);

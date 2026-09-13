@@ -290,6 +290,9 @@ export function liveView(board: BoardResponse, pf: PlayFrame, ctx: ViewCtx): Boa
       },
       blueChamps: bch.length === 5 ? bch : null,
       redChamps: rch.length === 5 ? rch : null,
+      // 同看板头条: 开局那段从 BP 后渐变过渡到局内模型
+      blend: true,
+      blendWith: pr.postdraft_probability_blue ?? null,
     },
     ctx.today,
   ) as unknown as Prediction;

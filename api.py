@@ -793,6 +793,7 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
     # (window 的默认调用返回空), 分钟数就是未知。之前的条件只挡了 minute<5,
     # None 直接漏进下面的 IngameState(minute=None) -> pydantic 校验错误,
     # 整个响应变成一段报错文本。不知道第几分钟 = 选不了切片, 和太早是一回事。
+    board_p2 = None          # BP 后概率; 曲线开局那段的渐变也要用 (_blend_prior)
     MIN_MINUTE = 3
     if st.minute is None or st.minute < MIN_MINUTE:
         # 局内模型给不了不等于没有概率可给 —— 赛前和 BP 后这两段一直有效,
@@ -811,6 +812,7 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                     p2 = _predict_core(b, r, minfo.league, False, draft)
             except Exception:
                 pass
+        board_p2 = p2
         # 留档: 赛前/BP 后的概率整局不变, minute=None 让它每局只记一次
         log_prediction(match_id=match_id, game_id=st.game_id,
                        league=minfo.league if minfo else None,
@@ -851,7 +853,22 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                     bch, rch = bl, rd
             except Exception as e:
                 _warn("头条取阵容失败, 本次预测不含阵容强势期", e)
-            pred, _row = _ingame_core(b, r, minfo.league, sd, bch, rch, True)
+            # BP 后 (第二段) 的概率 —— **先算**: 头条开局那段要从它渐变过渡到局内模型
+            # (_blend_prior)。帧的 gameMetadata 里有本局英雄和选手, 名字怎么对齐见
+            # _board_draft。凑不齐十个人就不给这条线, 不猜 (渐变就退回赛前概率)。
+            p2 = None
+            try:
+                draft = _board_draft(feed, st.game_id, minfo)
+                if draft:
+                    p2 = _predict_core(minfo.teams[0].model_name,
+                                       minfo.teams[1].model_name,
+                                       minfo.league, False, draft)
+            except Exception as e:
+                print(f"  Stage2 参考线跳过: {type(e).__name__}: {e}")
+            board_p2 = p2
+
+            pred, _row = _ingame_core(b, r, minfo.league, sd, bch, rch, True,
+                                      blend=True, blend_with=p2)
             log_prediction(match_id=match_id, game_id=st.game_id,
                            league=minfo.league, blue=b, red=r,
                            probability_blue=pred.get("probability_blue"),
@@ -860,19 +877,8 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                            game_number=chosen.get("number"),
                            golddiff=st.golddiff,
                            blue_kills=st.blue_kills, red_kills=st.red_kills)
-
-            # BP 后 (第二段) 的参考值。帧的 gameMetadata 里有本局英雄和选手,
-            # 名字怎么对齐见 _board_draft。凑不齐十个人就不给这条线, 不猜。
-            try:
-                draft = _board_draft(feed, st.game_id, minfo)
-                if draft:
-                    p2 = _predict_core(minfo.teams[0].model_name,
-                                       minfo.teams[1].model_name,
-                                       minfo.league, False, draft)
-                    if p2 is not None:
-                        pred["postdraft_probability_blue"] = p2
-            except Exception as e:
-                print(f"  Stage2 参考线跳过: {type(e).__name__}: {e}")
+            if p2 is not None:
+                pred["postdraft_probability_blue"] = p2
 
             out["prediction"] = pred
         except HTTPException as e:
@@ -931,9 +937,11 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                         # include_pregame 必须和头条数字一致 (True)。
                         # 传 False 会让模型丢掉全部赛前特征, 实测同一时刻
                         # 曲线末端 81.7% 对头条 87.9% —— 差 6pp, 看着就像 bug。
+                        # blend 同头条: 曲线开局那段也从 BP 后渐变过渡, 两者同一个数
                         res, _row = _ingame_core(b, r, minfo.league, sd,
                                                  c_bch, c_rch, True,
-                                                 pre_ctx=pre_ctx)
+                                                 pre_ctx=pre_ctx,
+                                                 blend=True, blend_with=board_p2)
                         last_p = res.get("probability_blue")
                     except Exception as e:
                         # 这里以前是静默 pass, 于是元组解包失败也看不出来,
@@ -1110,8 +1118,33 @@ def _ingame_disclaimer(ig) -> str:
     return "".join(bits)
 
 
+# 看板开局那段的渐变 (research/gate_anchor.py 的 C2)。第 BLEND_FROM 分钟以前完全是 BP 后 (没有就
+# 赛前) 的概率, 到第 BLEND_TO 分钟完全交给局内模型, 中间在对数几率上线性过渡。
+#
+# 为什么: 局内模型自带一套"赛前判断" (队伍滚动统计 + 阵容强势期), 看不到 BP 后模型用的英雄胜率和
+# 选手熟练度; 12 分钟以前又一律按 T=10 评估, 第 3 分钟的小经济差被放大。原来第 3 分钟硬切,
+# 2026-09-13 实测第 2→3 分钟平均跳 14.3 个百分点, 39% 的局跳超过 15 (BP 后说 MKOI 64%, 下一分钟
+# 局内给 VIT 83%)。渐变后跳 0.1, 0% 的局超过 15。
+# 准确度: 532 局两份模型都没见过的比赛, 全局 Brier t=+0.83, 10-19 分钟 t=+1.85, 各段都不比硬切差
+# —— 没过 2.5 的闸, 采纳理由是"不变差 + 连续", 用户 2026-09-13 定的。3/15 在看结果之前定下。
+BLEND_FROM, BLEND_TO = 3.0, 15.0
+
+
+def _blend_prior(prior, ingame, minute):
+    """(渐变后的概率, 局内模型的权重)。权重到 1 就原样返回局内模型的数。"""
+    w = min(1.0, max(0.0, (float(minute) - BLEND_FROM) / (BLEND_TO - BLEND_FROM)))
+    if w >= 1.0:
+        return ingame, w
+    cl = lambda q: min(max(q, 1e-6), 1 - 1e-6)
+    lg = lambda q: math.log(q / (1 - q))
+    z = (1 - w) * lg(cl(prior)) + w * lg(cl(ingame))
+    return 1 / (1 + math.exp(-z)), w
+
+
 def _ingame_core(req_blue, req_red, league, st, bch, rch, include_pre, raw=False,
-                 pre_ctx=None):
+                 pre_ctx=None, blend=False, blend_with=None):
+    # blend=True (看板用): 开局那段从 blend_with (BP 后概率; None 则用赛前概率) 渐变过渡到局内模型,
+    # 见 _blend_prior。/predict/ingame 不开 —— 它回答的是"局内模型怎么看", 不掺别的模型。
     # xpdiff 为 null = 数据源给不了 (实时接入)。换用训练时就不含经验差的
     # 变体, 而不是拿 0 顶替 —— 后者会让 evidence() 生成「双方经验持平」,
     # 把缺失讲成实测结论。
@@ -1145,7 +1178,13 @@ def _ingame_core(req_blue, req_red, league, st, bch, rch, include_pre, raw=False
         pre_row=pre_row, league=league)
     warns += w2
     raw_p, cal = ig.predict(row)
+    ig_cal, w_blend = cal, None
+    if blend:
+        anchor = blend_with if blend_with is not None else pre_p
+        if anchor is not None:
+            cal, w_blend = _blend_prior(anchor, cal, st.minute)
     # 概率被上下限夹住的警告要看**实际输出**, 不能按经济差猜 —— 见 clip_warning
+    # (渐变之后的数才是实际输出)
     cw = ig.clip_warning(cal)
     if cw:
         warns.append(cw)
@@ -1177,6 +1216,10 @@ def _ingame_core(req_blue, req_red, league, st, bch, rch, include_pre, raw=False
             side = req_blue if d > 0 else req_red
             out["shift_note"] = (f"相比赛前, 局势已向 {side} 移动 "
                                  f"{abs(d) * 100:.0f} 个百分点")
+    if w_blend is not None:
+        # 头条是渐变后的数; 局内模型自己的读数和它占的权重也给出来, 核对用
+        out["ingame_probability_blue"] = round(ig_cal, 4)
+        out["blend_weight"] = round(w_blend, 4)
     out["model"]["note"] = EX.confidence_note(out["model"])
     out["model"]["range_note"] = EX.range_note(
         ig.metrics.get("p_min"), ig.metrics.get("p_max"))

@@ -1810,3 +1810,29 @@ class CollectorKeepsLaggedFrames(unittest.TestCase):
         self.assertFalse(st.live, "前提: 这种帧的 live 是 False")
         self.assertEqual(st.game_state, "in_game",
                          "而它的 game_state 仍然是 in_game —— 数据有效, 只是旧")
+
+
+class BlendPriorContinuity(unittest.TestCase):
+    """坑: 看板第 3 分钟从 BP 后概率硬切到局内模型, 胜率一跳 (2026-09-13 实测平均 14 个百分点,
+    39% 的局超过 15 —— BP 后说 MKOI 64%, 下一分钟局内给 VIT 83%)。现在 3→15 分钟渐变过渡,
+    两端必须严丝合缝, 否则跳变换个地方又回来。research/gate_anchor.py 的 C2。"""
+
+    def test_起点就是BP后(self):
+        from api import _blend_prior, BLEND_FROM
+        p, w = _blend_prior(0.36, 0.83, BLEND_FROM)
+        self.assertEqual(w, 0.0)
+        self.assertAlmostEqual(p, 0.36, places=9, msg="第 3 分钟还应该完全是 BP 后的概率")
+
+    def test_终点就是局内模型(self):
+        from api import _blend_prior, BLEND_TO
+        p, w = _blend_prior(0.36, 0.83, BLEND_TO)
+        self.assertEqual((p, w), (0.83, 1.0), "第 15 分钟起应当原样交出局内模型的数")
+        p, w = _blend_prior(0.36, 0.83, 40)
+        self.assertEqual((p, w), (0.83, 1.0))
+
+    def test_中间落在两者之间且连续(self):
+        from api import _blend_prior
+        ps = [_blend_prior(0.36, 0.83, m / 10)[0] for m in range(30, 151)]
+        self.assertTrue(all(0.36 - 1e-9 <= p <= 0.83 + 1e-9 for p in ps))
+        steps = [abs(b - a) for a, b in zip(ps, ps[1:])]
+        self.assertLess(max(steps), 0.01, "每 6 秒最多动 1 个百分点, 不应有台阶")

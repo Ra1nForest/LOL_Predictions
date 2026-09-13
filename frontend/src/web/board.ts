@@ -248,6 +248,8 @@ interface CurveCtx {
   league: string;
   preCtx: PreCtx | null;
   ln: [string[], string[]] | null;
+  /** BP 后概率 (没有就 null, 渐变退回赛前) —— 曲线和头条同一个渐变 */
+  prior: number | null;
 }
 
 async function curveCtx(
@@ -259,6 +261,7 @@ async function curveCtx(
   league: string,
   today: string,
   gameId: string,
+  prior: number | null,
 ): Promise<CurveCtx> {
   let preCtx: PreCtx | null = null;
   try {
@@ -272,7 +275,7 @@ async function curveCtx(
   } catch (e) {
     warn("曲线取阵容失败, 曲线会偏离头条", e);
   }
-  return { blue, red, league, preCtx, ln };
+  return { blue, red, league, preCtx, ln, prior };
 }
 
 /** 曲线上一行的胜率, 和看板头条同一个函数。失败给 null, 调用方沿用上一个点 */
@@ -298,6 +301,8 @@ function curveProb(m: Models, teams: TeamsFile, today: string, c: CurveCtx, row:
         blueChamps: c.ln ? c.ln[0] : null,
         redChamps: c.ln ? c.ln[1] : null,
         preCtx: c.preCtx,
+        blend: true,
+        blendWith: c.prior,
       },
       today,
     );
@@ -319,11 +324,11 @@ export async function fineTimeline(
   teams: TeamsFile,
   models: Models,
   today: string,
-  a: { gameId: string; blue: string; red: string; league: string; upto: number },
+  a: { gameId: string; blue: string; red: string; league: string; upto: number; prior: number | null },
   onBatch: (pts: Json[]) => void,
   memo: Map<string, { p: unknown } | null> = new Map(),
 ): Promise<void> {
-  const c = await curveCtx(feed, teams, models.s1, a.blue, a.red, a.league, today, a.gameId);
+  const c = await curveCtx(feed, teams, models.s1, a.blue, a.red, a.league, today, a.gameId, a.prior);
   await feed.fineRows(a.gameId, a.upto, (rows) => {
     let lastP: unknown = null;
     onBatch(
@@ -544,6 +549,7 @@ export async function buildBoard(
     console.warn(`players() 失败: ${e}`);
   }
 
+  let boardP2: number | null = null; // BP 后概率; 曲线开局那段的渐变也要用 (ingame.blendPrior)
   const MIN_MINUTE = 3;
   if (st.minute === null || st.minute < MIN_MINUTE) {
     // 局内模型给不了, 赛前和 BP 后这两段一直有效 —— 照给
@@ -564,6 +570,7 @@ export async function buildBoard(
         /* 和服务器一样: BP 后算不出来就只给赛前 */
       }
     }
+    boardP2 = p2;
     out.prediction = {
       too_early: true,
       minute: st.minute,
@@ -586,6 +593,26 @@ export async function buildBoard(
       } catch (e) {
         warn("头条取阵容失败, 本次预测不含阵容强势期", e);
       }
+      // BP 后 (第二段) 的概率, 同 api.py —— 先算: 头条开局那段要从它渐变过渡到局内模型。
+      // 凑不齐十个人就不给这条线, 不猜 (渐变就退回赛前概率)
+      let p2: number | null = null;
+      try {
+        const draft = await boardDraft(feed, st.game_id, minfo);
+        if (draft) {
+          p2 = predictCore(
+            models.s2,
+            teams,
+            minfo.teams[0]!.model_name,
+            minfo.teams[1]!.model_name,
+            minfo.league,
+            draft,
+            today,
+          );
+        }
+      } catch (e) {
+        console.warn(`Stage2 参考线跳过: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      boardP2 = p2;
       const pred = ingameResponse(
         ingame,
         s1,
@@ -605,26 +632,12 @@ export async function buildBoard(
           },
           blueChamps: ln ? ln[0] : null,
           redChamps: ln ? ln[1] : null,
+          blend: true,
+          blendWith: p2,
         },
         today,
       ) as Record<string, unknown>;
-      // BP 后 (第二段) 的参考值, 同 api.py: 凑不齐十个人就不给这条线, 不猜
-      try {
-        const draft = await boardDraft(feed, st.game_id, minfo);
-        if (draft) {
-          pred.postdraft_probability_blue = predictCore(
-            models.s2,
-            teams,
-            minfo.teams[0]!.model_name,
-            minfo.teams[1]!.model_name,
-            minfo.league,
-            draft,
-            today,
-          );
-        }
-      } catch (e) {
-        console.warn(`Stage2 参考线跳过: ${e instanceof Error ? e.message : String(e)}`);
-      }
+      if (p2 !== null) pred.postdraft_probability_blue = p2;
       out.prediction = pred;
     } catch (e) {
       out.prediction = { error: e instanceof Error ? e.message : String(e) };
@@ -645,6 +658,7 @@ export async function buildBoard(
         minfo.league,
         today,
         st.game_id,
+        boardP2,
       );
       const series: Json[] = [];
       let lastP: unknown = null;

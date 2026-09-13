@@ -366,6 +366,23 @@ export interface IngameArgs {
   redChamps: string[] | null;
   /** 调用方已经算好的赛前上下文 (曲线每个点共用一份)。不给就在这里算。 */
   preCtx?: PreCtx | null;
+  /** 看板用: 开局那段从 blendWith (BP 后概率; 没有就赛前) 渐变过渡到局内模型, 见 blendPrior */
+  blend?: boolean;
+  blendWith?: number | null;
+}
+
+/** api.BLEND_FROM / BLEND_TO —— 渐变区间 (分钟), 理由见 api.py 那段注释 */
+export const BLEND_FROM = 3;
+export const BLEND_TO = 15;
+
+/** api._blend_prior: [渐变后的概率, 局内模型的权重] */
+export function blendPrior(prior: number, ingame: number, minute: number): [number, number] {
+  const w = Math.min(1, Math.max(0, (minute - BLEND_FROM) / (BLEND_TO - BLEND_FROM)));
+  if (w >= 1) return [ingame, w];
+  const cl = (q: number) => Math.min(Math.max(q, 1e-6), 1 - 1e-6);
+  const lg = (q: number) => Math.log(q / (1 - q));
+  const z = (1 - w) * lg(cl(prior)) + w * lg(cl(ingame));
+  return [1 / (1 + Math.exp(-z)), w];
 }
 
 /**
@@ -412,7 +429,14 @@ export function ingameResponse(
   });
   warns.push(...b.warnings);
   const p = predictRow(model, b.row);
-  const cw = clipWarning(model, p.cal);
+  let cal = p.cal;
+  let wBlend: number | null = null;
+  if (a.blend) {
+    const anchor = a.blendWith ?? preP;
+    if (anchor !== null && anchor !== undefined) [cal, wBlend] = blendPrior(anchor, p.cal, st.minute);
+  }
+  // 夹住的警告看实际输出 (渐变之后的数)
+  const cw = clipWarning(model, cal);
   if (cw) warns.push(cw);
 
   const perT = model.metrics.per_T?.[String(b.T)] ?? {};
@@ -431,20 +455,24 @@ export function ingameResponse(
     league: a.league,
     minute: st.minute,
     slice_used: b.T,
-    probability_blue: pyRound(p.cal, 4),
+    probability_blue: pyRound(cal, 4),
     probability_raw: pyRound(p.raw, 4),
-    summary: summarize(ex, p.cal, a.blue, a.red, null, st.minute),
+    summary: summarize(ex, cal, a.blue, a.red, null, st.minute),
     model: card,
     warnings: warns,
     disclaimer: disclaimer(model),
   };
   if (preP !== null) {
     out.pregame_probability_blue = pyRound(preP, 4);
-    out.shift_from_pregame = pyRound(p.cal - preP, 4);
-    const d = p.cal - preP;
+    out.shift_from_pregame = pyRound(cal - preP, 4);
+    const d = cal - preP;
     if (Math.abs(d) >= 0.05) {
       out.shift_note = `相比赛前, 局势已向 ${d > 0 ? a.blue : a.red} 移动 ${pyFixed(Math.abs(d) * 100, 0)} 个百分点`;
     }
+  }
+  if (wBlend !== null) {
+    out.ingame_probability_blue = pyRound(p.cal, 4);
+    out.blend_weight = pyRound(wBlend, 4);
   }
   card.note = confidenceNote(card);
   card.range_note = rangeNote(model.pMin, model.pMax);
