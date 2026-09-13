@@ -211,19 +211,21 @@ class FeatureStore:
         """
         返回该赛区数据的新鲜度。
 
-        阈值依据: LoL 赛区通常每周 3-5 个比赛日, 10 场滚动窗口约 2-3 周。
-          <= 3 天   正常
-          4-9 天    滚动窗口缺了最近一两个比赛日, 预测仍有参考价值
-          >= 10 天  可能整整错过一个赛段的开局 (含转会/换人), 不可靠
+        阈值依据: LEC/LCS 这类赛区**只在周末打** —— 上周日打完到本周六是 6 天, OE 还要晚
+        一两天登记, 所以正常情况下最多 8 天没有新数据。原来的 3 天在它们身上几乎每周都报,
+        报的是赛程本身, 不是数据出了问题 (2026-09-13 用户指出, 当时 LCS 停在 7 天前)。
+          <= 8 天   正常 (覆盖一个完整的周末间隔)
+          9-13 天   错过了一个比赛周末, 滚动窗口缺最近比赛, 预测仍有参考价值
+          >= 14 天  连续两个周末没数据, 可能整段赛程缺失 (含转会/换人), 不可靠
         """
         last = self.league_last.get(league)
         if last is None:
             return dict(league=league, ok=False, days=None,
                         level="unknown", message=f"{league} 无数据")
         days = (pd.Timestamp.now().normalize() - pd.Timestamp(last).normalize()).days
-        if days <= 3:
+        if days <= 8:
             lvl, msg = "fresh", None
-        elif days < 10:
+        elif days < 14:
             lvl = "stale"
             msg = (f"{league} 数据截至 {pd.Timestamp(last).date()} ({days} 天前) — "
                    f"滚动窗口缺少最近比赛, 预测偏向旧状态")

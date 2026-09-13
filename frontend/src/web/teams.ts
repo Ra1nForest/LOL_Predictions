@@ -91,7 +91,7 @@ export interface Staleness {
   message: string | null;
 }
 
-/** FeatureStore.staleness(league) */
+/** FeatureStore.staleness(league) —— 阈值 8 / 14 天的理由见那边 (周末才打的赛区) */
 export function staleness(t: TeamsFile, league: string, today: string): Staleness {
   if (!own(t.league_last, league)) {
     return { league, ok: false, days: null, level: "unknown", message: `${league} 无数据` };
@@ -100,10 +100,10 @@ export function staleness(t: TeamsFile, league: string, today: string): Stalenes
   const days = daysBetween(today, last);
   let level: Staleness["level"];
   let message: string | null;
-  if (days <= 3) {
+  if (days <= 8) {
     level = "fresh";
     message = null;
-  } else if (days < 10) {
+  } else if (days < 14) {
     level = "stale";
     message = `${league} 数据截至 ${last} (${days} 天前) — 滚动窗口缺少最近比赛, 预测偏向旧状态`;
   } else {
