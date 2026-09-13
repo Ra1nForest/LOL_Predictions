@@ -315,10 +315,14 @@ button {
   position: absolute;
   inset: 0;
   border-radius: inherit;
+  /* 悬停时两边各染一方的颜色、向中间淡出 —— 左蓝右红, 中线附近留白, 像两队对峙。
+     颜色取主题变量, 深浅两种模式都跟着走 */
   background: linear-gradient(
-    100deg,
-    transparent 30%,
-    color-mix(in srgb, var(--blue) 8%, transparent)
+    90deg,
+    color-mix(in srgb, var(--blue) 13%, transparent) 0%,
+    transparent 42%,
+    transparent 58%,
+    color-mix(in srgb, var(--red) 13%, transparent) 100%
   );
   opacity: 0;
   transition: opacity 0.35s var(--ease);
