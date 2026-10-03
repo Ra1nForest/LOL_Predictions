@@ -146,7 +146,7 @@ def resolve(window_h: float = 48) -> int:
     sys.path.insert(0, str(_ROOT))
     sys.path.insert(0, str(_ROOT / "research"))
     from datetime import datetime as _dt
-    from backfill_late import oe_index, find_oe, LEAGUE_TO_OE
+    from backfill_late import oe_index, find_oe, oe_league
 
     rows = _rows()
     todo = [r for r in rows if r.get("y") is None]
@@ -164,7 +164,9 @@ def resolve(window_h: float = 48) -> int:
             when = _dt.fromisoformat(r["t"])
         except Exception:
             continue
-        lg = LEAGUE_TO_OE.get(r.get("league"), r.get("league"))
+        # 留档存的是上游原样的赛区名 ("Worlds"), 换 OE 名字要大小写无关 —— 见 oe_league。
+        # DCGI 不映射, 那几局的 y 会一直是 None (理由见 backfill_late.LEAGUE_TO_OE)
+        lg = oe_league(r.get("league"))
         row = find_oe(oe, lg, when, r.get("blue"), r.get("red"),
                       r.get("game_number") or 1, window_h=window_h)
         if row is None:

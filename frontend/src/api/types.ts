@@ -27,7 +27,14 @@ export interface Match {
   start_time: string;
   state: "unstarted" | "inProgress" | "completed" | string;
   best_of: number | null;
+  /** 两队都映射得出模型队名。**不等于"有赛前预测"** —— 那看 pregame_league */
   predictable: boolean;
+  /**
+   * 赛前 / BP 后 (Stage 1/2) 按哪个赛区算。四大赛区就是 league; 国际赛两队同一个母赛区时是
+   * 那个母赛区 ("LCK"); null = 这场不给赛前和 BP 后 (跨赛区, 或有队不在四大赛区的数据里),
+   * 看板开局 3 分钟起直接用局内模型。
+   */
+  pregame_league: string | null;
   teams: TeamRef[];
   unknown_teams?: string[];
   between_games?: boolean;
@@ -174,17 +181,19 @@ export interface Prediction {
    *  `pr?.model.note` 这种写法在 too_early 时抛 TypeError, **整个 React 树
    *  卸载, 页面全白** —— 实测 2026-09-01 LCK 第 2 局开局那一刻。 */
   model?: ModelCard;
-  warnings: string[];
+  /** too_early 里通常**没有** (只有国际赛同母赛区时带一条口径说明); 局内那段总有 */
+  warnings?: string[];
   pregame_probability_blue: number | null;
   postdraft_probability_blue: number | null;
   shift_from_pregame: number | null;
   shift_note: string | null;
   reasons: Reason[];
   disclaimer: string | null;
-  /** 开局不足 3 分钟时后端只给赛前/BP 后概率 */
+  /** 开局不足 3 分钟时后端只给赛前/BP 后概率 (算不出来或这场不给时 probability_blue 为 null) */
   too_early?: boolean;
   note?: string;
-  source?: string;
+  /** too_early 用的是哪一段: post_draft / pre_draft; 两段都没有时是 null */
+  source?: string | null;
   error?: string;
 }
 

@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from xgboost import XGBClassifier
 
 from feature_store import FeatureStore, ROLES
-from ingame_service import IngameModel, SessionStore
+from ingame_service import IngameModel, SessionStore, NO_PRE_STATS
 import websearch as WS
 import explain as EX
 import esports_feed as EF
@@ -230,6 +230,131 @@ def _feed():
     return f
 
 
+def _known_for(league):
+    """映射这个赛区的队名时用哪份已知队伍表 (喂给 esports_feed.map_team)。
+
+    四大赛区: 本赛区的表, 和原来一样。国际赛: 四大赛区的并集 —— 参赛队来自各个赛区, 而按赛事名
+    去查 (known_teams("Worlds")) 恒为空表; 空表从前让 map_team 把任何队名原样放过, 修好之后又会
+    一律返回 None, 两样都不对。特征库还没加载时返回 None = 不校验, 和原来一样。
+    所有映射队名的地方 (赛程、即将开赛、直播列表、看板) 只走这一处。浏览器版是 board.ts 的 knownFor。
+    """
+    store = STATE.get("store")
+    if not store:
+        return None
+    return store.known_teams(str(league).upper() if EF.is_major(league) else None)
+
+
+def pregame_league(store, blue_model, red_model, match_league):
+    """这场比赛的赛前 (Stage 1) 和 BP 后 (Stage 2) 按哪个赛区的口径算; None = 不给这两段。
+
+    · 四大赛区: 原样返回比赛的赛区 —— 国内比赛的行为一点都不变。
+    · 国际赛, 两队都认识且母赛区相同 (LPL 打 LPL, 多半是预选和内战): 返回那个母赛区。
+      实测这类比赛上 Stage 1/2 和国内表现一样 (research/gate_international.py, 314 局)。
+    · 其余 (跨赛区, 或有一队不在四大赛区的数据里): None。
+      Stage 1/2 的特征全是"赛区内的相对量", 看不见赛区之间的差距; 训练集里没有一场跨赛区的比赛。
+      523 局历史跨赛区国际赛上准确率约 50%, 校准斜率约 0, 却和国内一样自信 —— 显示出来就是在误导人。
+    Stage 4 不受影响, 仍拿比赛本身的赛区 (国际赛的 is_* 全 0, 和训练时一样), 见 esports_board。
+    浏览器版是 board.ts 的 pregameLeague, 由 test:golden 的 intl_cases 对账。
+    """
+    if EF.is_major(match_league):
+        return match_league
+    if store is None or not blue_model or not red_model:
+        return None
+    hb = store.home_league(blue_model)
+    return hb if hb is not None and hb == store.home_league(red_model) else None
+
+
+def _pregame_of(m):
+    """按这场比赛**此刻**的模型队名定下 m.pregame_league 并返回。
+
+    _match_json 每次序列化都重算一遍 —— 列表卡片和看板必须对同一场比赛说同一句话, 而看板会在
+    中途重新映射队名; 存一份旧值就可能和队名对不上。
+    """
+    two = len(m.teams) == 2
+    m.pregame_league = pregame_league(STATE.get("store"),
+                                      m.teams[0].model_name if two else None,
+                                      m.teams[1].model_name if two else None,
+                                      m.league)
+    return m.pregame_league
+
+
+# 看板上"为什么没有赛前/BP 后"的三种说法 (头条 too_early 的 note、局内阶段的 warnings 都用它们)。
+# 浏览器版 board.ts 一字不差; 改了要同步 i18n.ts 的英文模板。
+_CROSS_REGION_NOTE = ("跨赛区对阵: 赛前和 BP 后模型只在赛区内战上验证过, 在历史跨赛区国际赛上没有预测力, "
+                      "这里不显示; 开局 3 分钟起直接用局内模型")
+
+
+def _pregame_reason(m):
+    """(kind, 一句话) 或 (None, None)。kind:
+      unmapped      有队名映射不出来 —— 没有赛前和 BP 后, 只有局内模型
+      cross_region  国际赛跨赛区 (两队都认识) —— 同上, 但原因是模型没在跨赛区上验证过
+      intl_home     国际赛同母赛区 —— 照常给赛前和 BP 后, 但要说明口径是两队母赛区的内战
+    四大赛区两队都认识时返回 (None, None), 国内看板一个字都不多。
+    """
+    if len(m.teams) != 2:
+        return None, None
+    miss = [t.api_name or "" for t in m.teams if not t.usable]
+    if miss:
+        return "unmapped", (f"{' 和 '.join(miss)} 不在四大赛区的数据里, 没有赛前和 BP 后预测; "
+                            f"开局 3 分钟起直接用局内模型")
+    lg = m.pregame_league
+    if lg is None:
+        return "cross_region", _CROSS_REGION_NOTE
+    if not EF.is_major(m.league):
+        return "intl_home", f"国际赛: 赛前和 BP 后按两队所在的 {lg} 内战口径计算, 国际赛的场次不计入近况"
+    return None, None
+
+
+def _board_warnings(warns, why_kind, why):
+    """看板局内阶段的提醒: 把"为什么没有赛前/BP 后"放在第一条。
+
+    跨赛区 / 队名不认识时看板是**故意**不带赛前特征的 (include_pre=False), 局内模型的 make_row
+    却照样说"没有可用的赛前队伍统计" —— 两队的统计其实都在, 只是不用; 原因说错了, 还和第一条
+    重复。这两种情况下按原文去掉那一句。只在看板这一层做: /predict/ingame 的响应和 test:golden
+    的局内用例都不受影响。头条和直播回放 (web/player.ts) 共用; 浏览器版是 board.ts 的 boardWarnings,
+    由 test:golden 的 intl_cases 对账。
+    """
+    out = list(warns)
+    if why_kind in ("unmapped", "cross_region"):
+        out = [w for w in out if w != NO_PRE_STATS]
+    if why:
+        out.insert(0, why)
+    return out
+
+
+def _early_prediction(minute, p1, p2, why_kind, why):
+    """开局头 3 分钟 (局内模型还用不上) 那一段的 prediction —— 纯函数, 取数在 esports_board。
+
+    单独拿出来是为了对账: test:diff 只取已完赛的终局帧 (分钟数一定 >= 3), 这一段从来不在它的
+    范围里; 抽成纯函数后 test:golden 的 intl_cases 逐条比对 note / source / warnings。
+    浏览器版是 board.ts 的 earlyPrediction。
+    """
+    head = ((f"开局第 {minute} 分钟, " if minute is not None
+             else "刚开局 (局内时间还没同步出来), ")
+            + "局内模型最早在第 10 分钟的切片上训练过。")
+    if p1 is not None or p2 is not None:
+        tail = ("这里显示的是" + ("BP 后" if p2 is not None else "赛前")
+                + "的概率 —— 它不看局内数据, 但一直有效。")
+    elif why_kind in ("unmapped", "cross_region"):
+        tail = why + "。"
+    else:
+        # 两段都算不出来 (队伍历史不足、出错)。原来这里仍然写"这里显示的是赛前的概率",
+        # 而 probability_blue 明明是 null —— 说了一个页面上并不存在的数。
+        tail = "这一局算不出赛前和 BP 后的概率, 开局 3 分钟起才有局内胜率。"
+    out = {
+        "too_early": True, "minute": minute,
+        "pregame_probability_blue": p1,
+        "postdraft_probability_blue": p2,
+        "probability_blue": p2 if p2 is not None else p1,
+        "source": ("post_draft" if p2 is not None
+                   else "pre_draft" if p1 is not None else None),
+        "note": head + tail,
+    }
+    if why_kind == "intl_home":
+        out["warnings"] = [why]
+    return out
+
+
 def _predict_core(blue, red, league, playoffs, draft):
     """只要一个 Stage 2 概率, 不要整个响应。draft 是
     {side: {role: {player, champion}}}。算不出来返回 None, 不抛。"""
@@ -317,6 +442,8 @@ def _match_json(m, feed):
         "state": m.state,
         "best_of": m.best_of,
         "predictable": m.predictable,
+        # 赛前 / BP 后按哪个赛区算, null = 不给 (跨赛区或有队不认识) —— 见 pregame_league
+        "pregame_league": _pregame_of(m),
         "teams": [{
             "name": t.api_name,
             "code": t.code,
@@ -332,10 +459,9 @@ def _match_json(m, feed):
 @app.get("/esports/schedule")
 def esports_schedule(league: str, state: Optional[str] = None):
     """赛程。state 可选 unstarted / inProgress / completed。"""
-    store, feed = STATE.get("store"), _feed()
-    known = store.known_teams(league) if store else None
+    feed = _feed()
     try:
-        ms = feed.schedule(league, known=known)
+        ms = feed.schedule(league, known=_known_for(league))
     except Exception as e:
         raise HTTPException(502, f"赛程拉取失败: {e}")
     if state:
@@ -355,7 +481,7 @@ def esports_ddragon():
 
 @app.get("/esports/upcoming")
 def esports_upcoming(limit: int = 24, past_hours: int = 5):
-    """四大赛区接下来的比赛, 按开赛时间合并排序。
+    """四大赛区和国际赛接下来的比赛, 按开赛时间合并排序。
 
     **不按 state 过滤。** 实测 2026-08-16: LPL 当天三场 (含两场尚未到
     开赛时间的) 在 getSchedule 里全部标成 state="completed", 而
@@ -365,14 +491,17 @@ def esports_upcoming(limit: int = 24, past_hours: int = 5):
     改用两个可信的信号:
       · start_time —— 未来的, 或刚开始不久的 (past_hours 内)
       · 实际战绩 —— 任一方赢过局数 > 0 就是真打过了, 不算"接下来"
+
+    两边都还是 TBD 的占位赛不列: 它只有一个时间, 没有对阵。加了国际赛之后这一点变得要紧 ——
+    实测 2026-10-03 德玛西亚杯后续轮次的占位赛占满了前 24 个名额, 真正有对阵的比赛被挤出去;
+    10-15 起世界赛入围赛的占位赛也会进来。只定了一边的 (TBD vs 某队) 照常列出。
     """
-    store, feed = STATE.get("store"), _feed()
+    feed = _feed()
     now = datetime.now(timezone.utc)
     out, errs = [], []
     for lg in EF.LEAGUE_IDS:
         try:
-            known = store.known_teams(lg) if store else None
-            for m in feed.schedule(lg, known=known):
+            for m in feed.schedule(lg, known=_known_for(lg)):
                 if not m.start_time:
                     continue
                 try:
@@ -383,6 +512,8 @@ def esports_upcoming(limit: int = 24, past_hours: int = 5):
                 if ts < now - timedelta(hours=past_hours):
                     continue
                 if any((t.game_wins or 0) > 0 for t in m.teams):
+                    continue
+                if all((t.api_name or "").upper() in ("", "TBD") for t in m.teams):
                     continue
                 out.append(_match_json(m, feed))
         except Exception as e:
@@ -398,7 +529,7 @@ def esports_live():
     getLive 不可靠 —— 实测 2026-08-16 LPL 已经打到第 6 分钟, 它仍返回 0 场。
     所以再拿今天开赛不久的比赛逐个查帧补上。帧是唯一权威。
     """
-    store, feed = STATE.get("store"), _feed()
+    feed = _feed()
     found, seen = [], set()
     try:
         for m in feed.live():
@@ -410,8 +541,15 @@ def esports_live():
     try:
         cands = []
         for lg in EF.LEAGUE_IDS:
-            known = store.known_teams(lg) if store else None
-            for m in feed.schedule(lg, known=known):
+            # 按赛区各自 try (同 esports_upcoming): 赛区表现在有九个赛区, 原来九个请求包在下面
+            # 同一个 try 里, 任何一个国际赛取不到 (重试三次后抛 FeedError), 四大的候选连同
+            # "局间休息"那一段判断都会整批丢掉 —— 上游一次偶发失败就让国内比赛从直播列表消失。
+            try:
+                ms = feed.schedule(lg, known=_known_for(lg))
+            except Exception as e:
+                print(f"  {lg} 赛程取不到, 这一轮跳过: {e}")
+                continue
+            for m in ms:
                 if m.match_id in seen or _clinched(m):
                     continue
                 cands.append(m)
@@ -441,7 +579,7 @@ def esports_live():
 
     out = []
     for m in found:
-        known = store.known_teams(m.league) if store else None
+        known = _known_for(m.league)
         for t in m.teams:
             t.model_name = EF.map_team(t.api_name, known)
 
@@ -592,22 +730,26 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
         raise HTTPException(502, f"对局详情拉取失败: {e}")
 
     # 这场比赛的基本信息 —— 从直播列表或赛程里找
+    # 每一处上游请求各自 try: 赛区表里有九个赛区, 一个赛区的赛程取不到 (上游偶发失败, 重试三次后
+    # 抛 FeedError) 只跳过它自己 —— 原来整段包在一个 try 里, 排在前面的一个国际赛取不到, 后面
+    # 赛区的比赛就都找不到基本信息了。
     minfo = None
     try:
-        for m in feed.live():
-            if m.match_id == match_id:
-                minfo = m; break
-        if minfo is None:
-            for lg in EF.LEAGUE_IDS:
-                for m in feed.schedule(lg, known=(store.known_teams(lg) if store else None)):
-                    if m.match_id == match_id:
-                        minfo = m; break
-                if minfo:
-                    break
+        minfo = next((m for m in feed.live() if m.match_id == match_id), None)
     except Exception as e:
         _warn("查找比赛信息失败", e)
+    if minfo is None:
+        for lg in EF.LEAGUE_IDS:
+            try:
+                ms = feed.schedule(lg, known=_known_for(lg))
+            except Exception as e:
+                _warn("查找比赛信息失败", e)
+                continue
+            minfo = next((m for m in ms if m.match_id == match_id), None)
+            if minfo:
+                break
     if minfo is not None and store:
-        known = store.known_teams(minfo.league)
+        known = _known_for(minfo.league)
         for t in minfo.teams:
             t.model_name = EF.map_team(t.api_name, known)
     if minfo is not None:
@@ -795,47 +937,55 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
     # 整个响应变成一段报错文本。不知道第几分钟 = 选不了切片, 和太早是一回事。
     board_p2 = None          # BP 后概率; 曲线开局那段的渐变也要用 (_blend_prior)
     MIN_MINUTE = 3
+    # 赛前 / BP 后能不能给, 按哪个赛区算 —— 见 pregame_league。
+    #   two      两队齐了: 局内模型 (Stage 4) 只要这个。队名映射不出来也照算, 用 lolesports 的
+    #            原名当**标签** (摘要、理由里的队名), 绝不拿它去特征库查任何东西 —— 下面没有赛前
+    #            特征那条路 (include_pre=False) 根本不碰队名。
+    #   use_pre  两队都认识且 pregame_league 定得下来: 才算 Stage 1/2、才渐变、局内模型才带赛前特征。
+    #            四大赛区里 pregame_league 就是比赛赛区, 所以 use_pre == predictable, 国内看板不变。
+    # 国际赛的 Stage 4 仍拿**比赛本身**的赛区 (minfo.league): is_* 全 0, 和训练时国际赛的编码一样;
+    # 只有赛前特征 (pre_league) 按两队的母赛区算。
+    two = bool(minfo) and len(minfo.teams) == 2
+    pg_lg = _pregame_of(minfo) if minfo else None
+    use_pre = two and minfo.predictable and pg_lg is not None
+    bl = rl = None
+    if two:
+        bl = minfo.teams[0].model_name or minfo.teams[0].api_name
+        rl = minfo.teams[1].model_name or minfo.teams[1].api_name
+    why_kind, why = _pregame_reason(minfo) if two else (None, None)
     if st.minute is None or st.minute < MIN_MINUTE:
         # 局内模型给不了不等于没有概率可给 —— 赛前和 BP 后这两段一直有效,
         # 而且开局几分钟局势本来就接近它们。之前这里直接不给数, 界面上就成了
         # "前十分钟不预测", 那是把能给的也藏了。
         p1 = p2 = None
-        if minfo and minfo.predictable:
-            b, r = minfo.teams[0].model_name, minfo.teams[1].model_name
+        if use_pre:
             try:
-                _row, p1, _w = _pre_context(b, r, minfo.league)
+                _row, p1, _w = _pre_context(bl, rl, pg_lg)
             except Exception:
                 pass
             try:
                 draft = _board_draft(feed, st.game_id, minfo)
                 if draft:
-                    p2 = _predict_core(b, r, minfo.league, False, draft)
+                    p2 = _predict_core(bl, rl, pg_lg, False, draft)
             except Exception:
                 pass
         board_p2 = p2
-        # 留档: 赛前/BP 后的概率整局不变, minute=None 让它每局只记一次
-        log_prediction(match_id=match_id, game_id=st.game_id,
-                       league=minfo.league if minfo else None,
-                       blue=minfo.teams[0].model_name if minfo else None,
-                       red=minfo.teams[1].model_name if minfo else None,
-                       probability_blue=(p2 if p2 is not None else p1),
-                       source="post_draft" if p2 is not None else "pre_draft",
-                       minute=None, game_number=chosen.get("number"))
-        out["prediction"] = {
-            "too_early": True, "minute": st.minute,
-            "pregame_probability_blue": p1,
-            "postdraft_probability_blue": p2,
-            "probability_blue": p2 if p2 is not None else p1,
-            "source": "post_draft" if p2 is not None else "pre_draft",
-            "note": (f"开局第 {st.minute} 分钟, " if st.minute is not None
-                     else "刚开局 (局内时间还没同步出来), ")
-                    + "局内模型最早在第 10 分钟的切片上训练过。这里显示的是"
-                    + ("BP 后" if p2 is not None else "赛前")
-                    + "的概率 —— 它不看局内数据, 但一直有效。",
-        }
-    elif minfo and minfo.predictable and (ig_live or ig_full):
+        out["prediction"] = _early_prediction(st.minute, p1, p2, why_kind, why)
+        # 留档: 赛前/BP 后的概率整局不变, minute=None 让它每局只记一次。
+        # 有队名映射不出来就不记 —— 留档里的队名要拿去和 OE 配胜负 (prediction_log.resolve),
+        # lolesports 原名永远配不上, 记了也是一条永远没有结果的行。两段都没算出来 (跨赛区本来就
+        # 不算) 也不调: 没有数可记, source 也和响应里的 null 对不上。
+        pr0 = out["prediction"]
+        if minfo and minfo.predictable and pr0["probability_blue"] is not None:
+            log_prediction(match_id=match_id, game_id=st.game_id,
+                           league=minfo.league,
+                           blue=minfo.teams[0].model_name,
+                           red=minfo.teams[1].model_name,
+                           probability_blue=pr0["probability_blue"],
+                           source=pr0["source"],
+                           minute=None, game_number=chosen.get("number"))
+    elif two and (ig_live or ig_full):
         try:
-            b, r = minfo.teams[0].model_name, minfo.teams[1].model_name
             sd = IngameState(**st.to_state())
             # _ingame_core 返回 (响应, 特征行) —— 第二个元素里有 NaN,
             # 直接塞进 JSON 会让整个响应 500。只要第一个。
@@ -845,38 +995,47 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
             bch = rch = None
             try:
                 meta0 = feed.game_metadata(st.game_id)
-                bl = [v["champion"] for v in meta0.values()
-                      if v.get("side") == "blue" and v.get("champion")]
-                rd = [v["champion"] for v in meta0.values()
-                      if v.get("side") == "red" and v.get("champion")]
-                if len(bl) == 5 and len(rd) == 5:
-                    bch, rch = bl, rd
+                bc0 = [v["champion"] for v in meta0.values()
+                       if v.get("side") == "blue" and v.get("champion")]
+                rc0 = [v["champion"] for v in meta0.values()
+                       if v.get("side") == "red" and v.get("champion")]
+                if len(bc0) == 5 and len(rc0) == 5:
+                    bch, rch = bc0, rc0
             except Exception as e:
                 _warn("头条取阵容失败, 本次预测不含阵容强势期", e)
             # BP 后 (第二段) 的概率 —— **先算**: 头条开局那段要从它渐变过渡到局内模型
             # (_blend_prior)。帧的 gameMetadata 里有本局英雄和选手, 名字怎么对齐见
             # _board_draft。凑不齐十个人就不给这条线, 不猜 (渐变就退回赛前概率)。
             p2 = None
-            try:
-                draft = _board_draft(feed, st.game_id, minfo)
-                if draft:
-                    p2 = _predict_core(minfo.teams[0].model_name,
-                                       minfo.teams[1].model_name,
-                                       minfo.league, False, draft)
-            except Exception as e:
-                print(f"  Stage2 参考线跳过: {type(e).__name__}: {e}")
+            if use_pre:
+                try:
+                    draft = _board_draft(feed, st.game_id, minfo)
+                    if draft:
+                        p2 = _predict_core(bl, rl, pg_lg, False, draft)
+                except Exception as e:
+                    print(f"  Stage2 参考线跳过: {type(e).__name__}: {e}")
             board_p2 = p2
 
-            pred, _row = _ingame_core(b, r, minfo.league, sd, bch, rch, True,
-                                      blend=True, blend_with=p2)
-            log_prediction(match_id=match_id, game_id=st.game_id,
-                           league=minfo.league, blue=b, red=r,
-                           probability_blue=pred.get("probability_blue"),
-                           source="ingame", minute=st.minute,
-                           slice_used=pred.get("slice_used"),
-                           game_number=chosen.get("number"),
-                           golddiff=st.golddiff,
-                           blue_kills=st.blue_kills, red_kills=st.red_kills)
+            if use_pre:
+                pred, _row = _ingame_core(bl, rl, minfo.league, sd, bch, rch, True,
+                                          blend=True, blend_with=p2, pre_league=pg_lg)
+            else:
+                # 没有赛前口径 (跨赛区 / 队名不认识): 不带赛前特征、不渐变, 第 3 分钟起就是局内模型
+                # 自己的数。include_pre=False 是显式的 —— 不能让 _ingame_core 退回按比赛赛区去算
+                # _pre_context (那正是跨赛区上没有预测力的那套特征)。实测把局内模型的赛前特征整组
+                # 置空, 跨赛区国际赛上 Brier 差 +0.0007, t = +0.15: 丢掉它们不损失什么。
+                pred, _row = _ingame_core(bl, rl, minfo.league, sd, bch, rch, False)
+            # 原因放第一条; 故意不带赛前特征时去掉局内模型那句"没有可用的赛前队伍统计"
+            pred["warnings"] = _board_warnings(pred["warnings"], why_kind, why)
+            if minfo.predictable:
+                log_prediction(match_id=match_id, game_id=st.game_id,
+                               league=minfo.league, blue=bl, red=rl,
+                               probability_blue=pred.get("probability_blue"),
+                               source="ingame", minute=st.minute,
+                               slice_used=pred.get("slice_used"),
+                               game_number=chosen.get("number"),
+                               golddiff=st.golddiff,
+                               blue_kills=st.blue_kills, red_kills=st.red_kills)
             if p2 is not None:
                 pred["postdraft_probability_blue"] = p2
 
@@ -886,8 +1045,8 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
         except Exception as e:
             out["prediction"] = {"error": str(e)}
 
-    # 曲线
-    if curves and minfo and minfo.predictable:
+    # 曲线。条件和头条的局内段一样 (two): 队名映射不出来也画局内模型的线, 赛前口径同头条。
+    if curves and two:
         try:
             # 上界用**这一局最后一帧**的时刻, 不是"现在" —— 见 gold_timeline
             upto = None
@@ -898,14 +1057,15 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                 except Exception:
                     upto = None
             rows = feed.downsample(feed.gold_timeline(st.game_id, upto=upto), points)
-            b, r = minfo.teams[0].model_name, minfo.teams[1].model_name
-            # 赛前特征只和队伍有关, 整条曲线算一次就够
-            try:
-                pre_ctx = _pre_context(b, r, minfo.league)
-            except Exception as e:
-                # 曲线丢掉赛前特征 -> 整条线和头条对不上, 但不会报错
-                pre_ctx = None
-                _warn("曲线取赛前特征失败, 曲线会偏离头条", e)
+            # 赛前特征只和队伍有关, 整条曲线算一次就够。没有赛前口径时不算 (同头条)
+            pre_ctx = None
+            if use_pre:
+                try:
+                    pre_ctx = _pre_context(bl, rl, pg_lg)
+                except Exception as e:
+                    # 曲线丢掉赛前特征 -> 整条线和头条对不上, 但不会报错
+                    pre_ctx = None
+                    _warn("曲线取赛前特征失败, 曲线会偏离头条", e)
             # 阵容也要传给曲线。之前这里写死 None —— 头条带阵容、曲线不带,
             # 于是同一时刻两个数能差十几个百分点 (实测末端 75% 对头条 91.5%)。
             # 局内模型靠阵容算强势期指数, 缺了它整条曲线都偏。
@@ -934,14 +1094,19 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                             csdiff=row.get("csdiff", 0),
                             blue_kills=row["blue_kills"], red_kills=row["red_kills"],
                             gold_total=row["blue_gold"])
-                        # include_pregame 必须和头条数字一致 (True)。
+                        # include_pregame 必须和头条数字一致 (有赛前口径时 True)。
                         # 传 False 会让模型丢掉全部赛前特征, 实测同一时刻
                         # 曲线末端 81.7% 对头条 87.9% —— 差 6pp, 看着就像 bug。
                         # blend 同头条: 曲线开局那段也从 BP 后渐变过渡, 两者同一个数
-                        res, _row = _ingame_core(b, r, minfo.league, sd,
-                                                 c_bch, c_rch, True,
-                                                 pre_ctx=pre_ctx,
-                                                 blend=True, blend_with=board_p2)
+                        if use_pre:
+                            res, _row = _ingame_core(bl, rl, minfo.league, sd,
+                                                     c_bch, c_rch, True,
+                                                     pre_ctx=pre_ctx,
+                                                     blend=True, blend_with=board_p2,
+                                                     pre_league=pg_lg)
+                        else:
+                            res, _row = _ingame_core(bl, rl, minfo.league, sd,
+                                                     c_bch, c_rch, False)
                         last_p = res.get("probability_blue")
                     except Exception as e:
                         # 这里以前是静默 pass, 于是元组解包失败也看不出来,
@@ -1142,9 +1307,15 @@ def _blend_prior(prior, ingame, minute):
 
 
 def _ingame_core(req_blue, req_red, league, st, bch, rch, include_pre, raw=False,
-                 pre_ctx=None, blend=False, blend_with=None):
+                 pre_ctx=None, blend=False, blend_with=None, pre_league=None):
     # blend=True (看板用): 开局那段从 blend_with (BP 后概率; None 则用赛前概率) 渐变过渡到局内模型,
     # 见 _blend_prior。/predict/ingame 不开 —— 它回答的是"局内模型怎么看", 不掺别的模型。
+    #
+    # league 只决定局内模型自己的 is_* 和 LPL 那条警告; 赛前特征 (_pre_context) 按 pre_league 算,
+    # 不给就同 league。两者分开是为国际赛: 同母赛区对阵时看板传 pre_league = 两队的母赛区, 而
+    # league 仍是赛事本身 (is_* 全 0, 和训练时国际赛的编码一致) —— 见 pregame_league。
+    # include_pre=False 就是**不带**赛前特征: 不用 pre_ctx, 也不会退回按 league 去算 _pre_context。
+    # 看板在跨赛区 / 队名不认识时走这条, 浏览器版 ingameResponse 的 includePregame=false 同义。
     # xpdiff 为 null = 数据源给不了 (实时接入)。换用训练时就不含经验差的
     # 变体, 而不是拿 0 顶替 —— 后者会让 evidence() 生成「双方经验持平」,
     # 把缺失讲成实测结论。
@@ -1166,7 +1337,8 @@ def _ingame_core(req_blue, req_red, league, st, bch, rch, include_pre, raw=False
         warns += list(w)
     elif include_pre and store:
         try:
-            pre_row, pre_p, w = _pre_context(req_blue, req_red, league)
+            pre_row, pre_p, w = _pre_context(req_blue, req_red,
+                                             league if pre_league is None else pre_league)
             warns += w
         except Exception as e:
             warns.append(f"赛前特征不可用: {e}")

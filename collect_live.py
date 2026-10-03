@@ -46,7 +46,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
-from esports_feed import EsportsFeed, FeedError   # noqa: E402
+from esports_feed import EsportsFeed, FeedError, LEAGUE_IDS   # noqa: E402
 
 OUT = _HERE / "collected"
 STATE = OUT / "_series_state.json"
@@ -165,11 +165,17 @@ def collect(feed: EsportsFeed) -> dict:
         log(f"取直播列表失败: {e}")
         return stats
 
-    # 直播列表可能漏, 补上最近开赛的
+    # 直播列表可能漏, 补上最近开赛的。赛区和 feed.live() 同一张表 (四大 + 国际赛) —— 这里原来
+    # 写死四大, 国际赛只能靠 getLive, 而 getLive 实测会漏好几分钟
+    # 每个赛区各自 try: 一个赛区取不到 (上游偶发失败) 只跳过它自己, 不让一个国际赛的失败把四大的
+    # 候选一起丢掉 —— 原来整段包在一个 try 里, 赛区从四个变成九个以后这个风险跟着变大。
     try:
         cands = []
-        for lg in ("LCK", "LPL", "LEC", "LCS"):
-            cands += feed.schedule(lg)
+        for lg in LEAGUE_IDS:
+            try:
+                cands += feed.schedule(lg)
+            except Exception as e:
+                log(f"  {lg} 赛程取不到, 这一轮跳过: {e}")
         seen = {m.match_id for m in live}
         for m in feed.live_by_frames(cands):
             if m.match_id not in seen:
@@ -349,9 +355,15 @@ def reconcile(feed: EsportsFeed) -> int:
                             for g in games):
             continue
 
-        # 最终比分。schedule 里带 result.gameWins
+        # 最终比分。schedule 里带 result.gameWins。
+        # 包 try: meta 里的赛区不在 LEAGUE_IDS 里 (或上游一时取不到) 时 schedule 会抛 FeedError ——
+        # 不包的话它会冲出整个循环, 一场比赛的问题让后面所有比赛这一轮都对不了账。
         finals = {}
-        for m in feed.schedule(meta.get("league") or ""):
+        try:
+            sched = feed.schedule(meta.get("league") or "")
+        except Exception:
+            continue
+        for m in sched:
             if m.match_id == mid:
                 finals = {t.api_name: (t.game_wins or 0) for t in m.teams}
                 break
@@ -463,16 +475,21 @@ def oe_correct(force: bool = False) -> int:
     n = 0
     if cand:
         sys.path.insert(0, str(_HERE / "research"))
-        from backfill_late import LEAGUE_TO_OE, find_oe, oe_index
+        from backfill_late import find_oe, oe_index, oe_league
         from esports_feed import map_team
         oe = oe_index()
         names: dict = {}
         for meta, rp, cur in cand:
             gid = meta["game_id"]
-            lg = LEAGUE_TO_OE.get(meta.get("league"), meta.get("league"))
+            # meta 存的是上游原样的赛区名 ("Worlds"), 换 OE 名字大小写无关 —— 见 oe_league
+            lg = oe_league(meta.get("league"))
             if lg not in names:
                 x = oe[oe.league == lg]
                 names[lg] = sorted(set(x.teamname.dropna()) | set(x.red_name.dropna()))
+            # OE 里这个赛区一局都没有 (还没登记, 或 DCGI 这种故意不映射的) -> 这次不核对, 下次再查。
+            # 显式跳过, 不靠 map_team: 它从前拿到空表会把队名原样放过 (现在会返回 None)
+            if not names[lg]:
+                continue
             b, r = map_team(meta.get("blue"), names[lg]), map_team(meta.get("red"), names[lg])
             try:
                 when = datetime.fromisoformat(meta["collected_from"])

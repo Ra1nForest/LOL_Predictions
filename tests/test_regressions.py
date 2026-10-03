@@ -1836,3 +1836,334 @@ class BlendPriorContinuity(unittest.TestCase):
         self.assertTrue(all(0.36 - 1e-9 <= p <= 0.83 + 1e-9 for p in ps))
         steps = [abs(b - a) for a, b in zip(ps, ps[1:])]
         self.assertLess(max(steps), 0.01, "每 6 秒最多动 1 个百分点, 不应有台阶")
+
+
+class EmptyKnownListIsNotNoValidation(unittest.TestCase):
+    """坑: map_team 写的是 `if known:`, 空表是假值, 于是 known=[] 时直接把队名原样放过。
+
+    国际赛按赛事名查已知队伍 (known_teams("Worlds")) 恒为空表 —— 每个国际赛队名都不经校验成了
+    model_name, 看板以为能预测, 错误要到 make_row 深处才抛出来又被吞掉。实测
+    map_team("GAM Esports", []) 返回 "GAM Esports"。known=None 才是"不校验"。
+    """
+
+    def test_空表不是不校验(self):
+        from esports_feed import map_team
+        self.assertIsNone(map_team("GAM Esports", []), "known=[] 必须返回 None, 不能原样放过")
+        self.assertIsNone(map_team("Beijing JDG Esports", []), "别名也一样要落在 known 里")
+
+    def test_别名的目标不在已知队伍里就返回None(self):
+        from esports_feed import map_team
+        self.assertIsNone(map_team("Beijing JDG Esports", ["T1", "Gen.G"]),
+                          "给不在特征库里的队加别名会重新造出'可预测'的假象")
+        self.assertEqual(map_team("Beijing JDG Esports", ["JD Gaming"]), "JD Gaming")
+
+    def test_known为None仍然只换别名不校验(self):
+        from esports_feed import map_team
+        self.assertEqual(map_team("Beijing JDG Esports", None), "JD Gaming")
+        self.assertEqual(map_team("Anything Goes", None), "Anything Goes")
+
+
+class LeagueKeysMatchUpstreamNames(unittest.TestCase):
+    """坑: live() 按 m.league.upper() in LEAGUE_IDS 过滤。键写成 "WLDS" / "FIRSTSTAND" 不会报错,
+    只会把正在打的国际赛静默丢掉 —— 2026-10-03 DCGI 的 FlyQuest vs LGD 在 getLive 里是 inProgress,
+    feed.live() 却返回 [] (那时表里只有四大)。键必须等于 getLeagues 的 league.name.upper()。
+    """
+
+    # getLeagues 实测返回的名字 (2026-10-03)
+    UPSTREAM = {"Worlds": "98767975604431411", "MSI": "98767991325878492",
+                "First Stand": "113464388705111224", "DCGI": "117126995932274206",
+                "Esports World Cup": "116838530616006090"}
+
+    def test_每个国际赛的键都等于上游名字的大写(self):
+        from esports_feed import LEAGUE_IDS
+        for name, lid in self.UPSTREAM.items():
+            self.assertEqual(LEAGUE_IDS.get(name.upper()), lid, name)
+        for lg in ("LCK", "LPL", "LEC", "LCS"):
+            self.assertIn(lg, LEAGUE_IDS, "四大赛区不能丢")
+
+    def test_live保留国际赛而且不改上游的大小写(self):
+        from esports_feed import EsportsFeed
+        events = [{"league": {"name": n}, "startTime": "2026-10-03T08:00:00Z", "state": "inProgress",
+                   "match": {"id": f"M{i}", "strategy": {"count": 3},
+                             "teams": [{"name": "T1", "code": "T1"}, {"name": "FlyQuest", "code": "FLY"}]}}
+                  for i, n in enumerate(list(self.UPSTREAM) + ["LCK", "LCK Challengers"])]
+        f = EsportsFeed()
+        f._get = lambda url, ttl, **k: {"data": {"schedule": {"events": events}}}
+        got = [m.league for m in f.live()]
+        self.assertEqual(got, list(self.UPSTREAM) + ["LCK"],
+                         "国际赛要留下、Match.league 保留上游原样; 不在表里的次级联赛照旧过滤掉")
+
+    def test_is_major大小写无关且只认四大(self):
+        from esports_feed import is_major
+        for lg in ("LCK", "lpl", "Lec", "LCS"):
+            self.assertTrue(is_major(lg), lg)
+        for lg in ("Worlds", "WORLDS", "MSI", "DCGI", "First Stand", "Esports World Cup", "", None):
+            self.assertFalse(is_major(lg), lg)
+
+
+class _StubStore:
+    """只有 pregame_league / 映射队名用得到的两个方法。四队: 两支 LCK、一支 LPL、一支 LCS。"""
+    HOME = {"T1": "LCK", "Gen.G": "LCK", "Bilibili Gaming": "LPL", "FlyQuest": "LCS"}
+
+    def home_league(self, team):
+        return self.HOME.get(team)
+
+    def known_teams(self, league=None):
+        return sorted(t for t, lg in self.HOME.items() if league is None or lg == league)
+
+
+class PregameLeagueRules(unittest.TestCase):
+    """坑: 把国内的赛前/BP 后模型原样搬到国际赛上。
+
+    Stage 1/2 的特征全是赛区内的相对量, 看不见赛区之间的差距, 训练集里也没有一场跨赛区的比赛。
+    research/gate_international.py: 523 局历史跨赛区国际赛上准确率约 50%、校准斜率约 0, 却和国内
+    一样自信; 同母赛区的国际赛 (314 局) 则和国内一样。所以只有同母赛区才给, 且按母赛区算。
+    """
+
+    def test_四大赛区原样返回(self):
+        from api import pregame_league
+        s = _StubStore()
+        self.assertEqual(pregame_league(s, "T1", "Gen.G", "LCK"), "LCK")
+        self.assertEqual(pregame_league(s, "T1", "Bilibili Gaming", "LCK"), "LCK",
+                         "国内比赛一点都不变 —— 哪怕两队母赛区不同")
+        self.assertEqual(pregame_league(s, None, None, "LPL"), "LPL")
+
+    def test_国际赛同母赛区按母赛区算(self):
+        from api import pregame_league
+        self.assertEqual(pregame_league(_StubStore(), "T1", "Gen.G", "Worlds"), "LCK")
+        self.assertEqual(pregame_league(_StubStore(), "Gen.G", "T1", "Esports World Cup"), "LCK")
+
+    def test_跨赛区不给(self):
+        from api import pregame_league
+        self.assertIsNone(pregame_league(_StubStore(), "T1", "Bilibili Gaming", "Worlds"))
+        self.assertIsNone(pregame_league(_StubStore(), "FlyQuest", "T1", "DCGI"))
+
+    def test_有队不认识不给(self):
+        from api import pregame_league
+        self.assertIsNone(pregame_league(_StubStore(), "T1", None, "MSI"))
+        self.assertIsNone(pregame_league(_StubStore(), "GAM Esports", "GAM Esports", "MSI"),
+                          "两个 None 母赛区不能被当成'同一个赛区'")
+        self.assertIsNone(pregame_league(None, "T1", "Gen.G", "Worlds"), "没有特征库就定不下来")
+
+
+class IngameIntlLeagueEncoding(unittest.TestCase):
+    """坑: 国际赛给局内模型传母赛区 (或别的四大名字) 当 league。
+
+    Stage 4 在全部赛区上训练, 国际赛那几千个快照的 is_lpl/lck/lec/lcs 全是 0。线上若把"同母赛区"
+    的 LCK 传进来, 编码就和训练时对不上, 不报错。看板必须给 Stage 4 传赛事本身的名字。
+    """
+
+    def test_国际赛的is全为0(self):
+        from ingame_service import IngameModel
+        m = IngameModel.__new__(IngameModel)
+        m.slices, m.scaling, m.features, m.has_xpdiff = [10, 15, 20, 25], {}, [], False
+        for lg in ("DCGI", "Worlds", "MSI", "First Stand", "Esports World Cup"):
+            row, warns = m.make_row(minute=20, golddiff=1500, xpdiff=None, csdiff=20, blue_kills=5,
+                                    red_kills=3, gold_total=35000, league=lg)
+            self.assertEqual([row[k] for k in ("is_lpl", "is_lck", "is_lec", "is_lcs")], [0, 0, 0, 0], lg)
+            self.assertFalse(any("LPL" in w for w in warns), "LPL 样本偏薄那条警告只给 LPL")
+
+
+class OeLeagueNameIsCaseInsensitive(unittest.TestCase):
+    """坑: 同一个赛区两种写法 —— LEAGUE_IDS 的键是 "WORLDS", 采集 meta 和预测留档存的是上游原样
+    "Worlds"。LEAGUE_TO_OE 只收一种, 另一条路径就一局都配不上胜负, 不报错。
+    DCGI 故意不映射: OE 的 "DCup" 是 12 月 LPL 系的国内杯赛, 这届全球邀请赛它叫什么还不知道。
+    """
+
+    def test_国际赛大小写都换得到OE名字(self):
+        from backfill_late import oe_league
+        for k, v in (("WORLDS", "WLDs"), ("Worlds", "WLDs"), ("worlds", "WLDs"),
+                     ("FIRST STAND", "FST"), ("First Stand", "FST"),
+                     ("ESPORTS WORLD CUP", "EWC"), ("Esports World Cup", "EWC"),
+                     ("MSI", "MSI"), ("LCK", "LCK"), ("LCK Challengers", "LCKC"), ("EMEA Masters", "EM")):
+            self.assertEqual(oe_league(k), v, k)
+
+    def test_DCGI不映射(self):
+        from backfill_late import LEAGUE_TO_OE, oe_league
+        self.assertNotIn("DCGI", {k.upper() for k in LEAGUE_TO_OE})
+        self.assertNotEqual(oe_league("DCGI"), "DCup", "不能猜成国内杯赛的标签")
+
+    def test_国际赛进了回填的扫描范围(self):
+        from backfill_late import ALL_LEAGUES
+        for k in ("WORLDS", "MSI", "FIRST STAND", "DCGI", "ESPORTS WORLD CUP"):
+            self.assertIn(k, ALL_LEAGUES)
+
+
+class InternationalBoard(unittest.TestCase):
+    """坑: 跨赛区的国际赛照旧显示赛前/BP 后、照旧把它渐变进局内头条; 队名不认识的比赛整块看板没有胜率。
+
+    跨赛区上 Stage 1/2 没有预测力 (见 PregameLeagueRules), 渐变 3-15 分钟会把它带进局内曲线。
+    这里用假的数据源走一遍 api.esports_board: 跨赛区不能有 p1/p2/渐变; 队名不认识要有局内胜率,
+    但不能写留档 (lolesports 原名永远配不上 OE, 是一条永远没有结果的行)。
+    """
+
+    def setUp(self):
+        import api
+        from esports_feed import EsportsFeed, LiveState, Match, TeamRef
+        from ingame_service import IngameModel
+        try:
+            self.ig = IngameModel("_live")
+        except Exception as e:                       # artifacts 不在 (比如刚克隆) 就跳过
+            self.skipTest(f"局内模型文件不在: {e}")
+        self.api = api
+        self.logged, self.calls = [], []
+        self._old = (dict(api.STATE), api.log_prediction)
+
+        def _log(**k):
+            # calls 记每一次调用; logged 和真的 log_prediction 一样, probability_blue 为 None 时不写
+            self.calls.append(k)
+            if k.get("probability_blue") is not None:
+                self.logged.append(k)
+        api.log_prediction = _log
+
+        class Stages:                                 # Stage 1/2 一被调用就让测试失败
+            def __getitem__(s, k):
+                raise AssertionError(f"不该算 {k}")
+
+        api.STATE.clear()
+        api.STATE.update(store=_StubStore(), stages=Stages(), ingame=None, ingame_live=self.ig)
+
+        def make_feed(league, names, minute):
+            g = {"id": "G1", "number": 1, "state": "inProgress",
+                 "teams": [{"id": "1", "side": "blue"}, {"id": "2", "side": "red"}]}
+            st = LiveState(game_id="G1", game_state="in_game", minute=minute, golddiff=2500, csdiff=30,
+                           blue_kills=6, red_kills=2, gold_total=30000,
+                           frame_time="2026-10-03T08:20:00.000Z", live=True)
+
+            class Feed:
+                live_ttl = 20
+                downsample = staticmethod(EsportsFeed.downsample)
+
+                def live(s):
+                    return [Match("M1", league, "2026-10-03T08:00:00Z", "inProgress", 3,
+                                  [TeamRef(n, n[:3]) for n in names])]
+
+                def schedule(s, lg, known=None):
+                    return []
+
+                def games(s, mid):
+                    return [g]
+
+                def probe_games(s, mid):
+                    return [(g, st)]
+
+                def current_game(s, mid):
+                    return g, st
+
+                def window(s, gid, **k):
+                    return st
+
+                def _get(s, url, ttl):
+                    return {"data": {"event": {"match": {"teams": [
+                        {"id": "1", "name": names[0]}, {"id": "2", "name": names[1]}]}}}}
+
+                def frame_sides(s, gid):
+                    return {"blue": "1", "red": "2"}
+
+                def ddragon_version(s):
+                    return "16.16.1"
+
+                def players(s, gid):
+                    return []
+
+                def game_metadata(s, gid):
+                    return {}
+
+                def match_wins(s, mid):
+                    return {}
+
+                def gold_timeline(s, gid, upto=None):
+                    return [{"minute": float(m), "golddiff": 200 * m, "blue_kills": m // 3, "red_kills": 1,
+                             "csdiff": 2 * m, "blue_gold": 1800 * m} for m in range(1, minute + 1)]
+
+            return Feed()
+
+        self.make_feed = make_feed
+
+    def tearDown(self):
+        if hasattr(self, "_old"):
+            self.api.STATE.clear()
+            self.api.STATE.update(self._old[0])
+            self.api.log_prediction = self._old[1]
+
+    def _board(self, league, names, minute):
+        self.api.STATE["feed"] = self.make_feed(league, names, minute)
+        return self.api.esports_board("M1", curves=True, points=60)
+
+    def test_跨赛区没有赛前和BP后也不渐变(self):
+        out = self._board("Worlds", ["T1", "BILIBILI GAMING"], 8)
+        self.assertEqual([t["model_name"] for t in out["match"]["teams"]], ["T1", "Bilibili Gaming"],
+                         "国际赛按四大赛区的并集映射队名, 别名照换")
+        self.assertIsNone(out["match"]["pregame_league"])
+        pr = out["prediction"]
+        self.assertIsNotNone(pr.get("probability_blue"), "局内模型照常给数")
+        for k in ("pregame_probability_blue", "postdraft_probability_blue", "shift_from_pregame",
+                  "blend_weight", "ingame_probability_blue"):
+            self.assertNotIn(k, pr, f"跨赛区不该有 {k}")
+        self.assertTrue(pr["warnings"][0].startswith("跨赛区对阵: "), pr["warnings"])
+        from ingame_service import NO_PRE_STATS
+        self.assertNotIn(NO_PRE_STATS, pr["warnings"],
+                         "赛前特征是故意不带的, 不能再说一句'没有可用的赛前队伍统计'")
+        self.assertTrue(any(p["probability_blue"] is not None for p in out["timeline"]), "曲线照画")
+        self.assertEqual([r["source"] for r in self.logged], ["ingame"], "两队都认识, 局内预测照常留档")
+        self.assertEqual(self.logged[0]["league"], "Worlds")
+
+    def test_跨赛区开局前没有任何概率并说明原因(self):
+        out = self._board("Worlds", ["T1", "BILIBILI GAMING"], 2)
+        pr = out["prediction"]
+        self.assertTrue(pr["too_early"])
+        self.assertIsNone(pr["probability_blue"])
+        self.assertIsNone(pr["source"])
+        self.assertIn("跨赛区对阵: ", pr["note"])
+        self.assertNotIn("这里显示的是", pr["note"], "不能声称显示了一个并不存在的概率")
+        self.assertEqual(self.calls, [], "没有数可记就不调留档 (source 也会和响应里的 null 对不上)")
+
+    def test_队名不认识也有局内胜率但不留档(self):
+        out = self._board("DCGI", ["GAM Esports", "T1"], 12)
+        self.assertFalse(out["match"]["predictable"])
+        self.assertIsNone(out["match"]["pregame_league"])
+        pr = out["prediction"]
+        self.assertIsNotNone(pr.get("probability_blue"), "队名映射不出来也要有 Stage 4")
+        self.assertEqual(pr["blue_team"], "GAM Esports", "原名只当标签用")
+        self.assertNotIn("blend_weight", pr)
+        self.assertEqual(pr["warnings"][0],
+                         "GAM Esports 不在四大赛区的数据里, 没有赛前和 BP 后预测; 开局 3 分钟起直接用局内模型")
+        self.assertTrue(any(p["probability_blue"] is not None for p in out["timeline"]))
+        from ingame_service import NO_PRE_STATS
+        self.assertNotIn(NO_PRE_STATS, pr["warnings"])
+        self.assertEqual(self.calls, [], "有队名映射不出来就不能写留档")
+
+    def test_同母赛区的提醒不删没有赛前统计那句(self):
+        from ingame_service import NO_PRE_STATS
+        w = ["本次没有经验差数据, 改用不含经验差的局内模型。", NO_PRE_STATS]
+        self.assertEqual(self.api._board_warnings(w, "cross_region", "X"), ["X", w[0]])
+        self.assertEqual(self.api._board_warnings(w, "unmapped", "Y"), ["Y", w[0]])
+        self.assertEqual(self.api._board_warnings(w, "intl_home", "Z"), ["Z"] + w,
+                         "同母赛区是真的想带赛前特征, 没拿到就该照实说")
+        self.assertEqual(self.api._board_warnings(w, None, None), w, "国内看板一个字都不变")
+
+    def test_一个赛区的赛程取不到不连累别的赛区(self):
+        # 坑: 九个赛区的赛程包在同一个 try 里, 排在前面的一个国际赛取不到 (FeedError),
+        # 四大的直播候选、看板的比赛信息就整批丢掉 —— 上游一次偶发失败, 国内比赛从直播列表消失
+        from esports_feed import FeedError
+        def broken_worlds(feed, home):
+            # 直播列表为空, WORLDS 的赛程取不到, 比赛只在 home 赛区的赛程里
+            m = feed.live()[0]
+
+            def schedule(lg, known=None):
+                if lg == "WORLDS":
+                    raise FeedError("模拟上游失败")
+                return [m] if lg == home else []
+            feed.live = lambda: []
+            feed.schedule = schedule
+            feed.live_by_frames = lambda cands: list(cands)
+            return feed
+
+        self.api.STATE["feed"] = broken_worlds(self.make_feed("LCK", ["T1", "Gen.G"], 12), "LCK")
+        self.assertEqual([x["match_id"] for x in self.api.esports_live()["matches"]], ["M1"])
+
+        # DCGI 在赛区表里排在 WORLDS 后面
+        self.api.STATE["feed"] = broken_worlds(self.make_feed("DCGI", ["T1", "BILIBILI GAMING"], 12), "DCGI")
+        out = self.api.esports_board("M1", curves=False)
+        self.assertIsNotNone(out["match"], "WORLDS 取不到不该让 DCGI 的比赛找不到")
+        self.assertEqual(out["match"]["league"], "DCGI")

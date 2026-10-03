@@ -121,7 +121,12 @@ also what gets deployed — `research/`, `tools/`, `attic/` are not needed at ru
   thin wrappers over those two.
 - **`esports_feed.py`** wraps the unofficial lolesports endpoints and is the only place that knows
   about their quirks (lagged `startingTime`, the schedule's stale `state`, broadcast-vs-game start,
-  team-name aliases). `/esports/board` in `api.py` is the big consumer.
+  team-name aliases). `/esports/board` in `api.py` is the big consumer. `LEAGUE_IDS` is the league
+  whitelist for live detection and schedules: the four majors plus Worlds / MSI / First Stand / DCGI /
+  Esports World Cup, keyed by the upstream `league.name.upper()` (`live()` filters on exactly that),
+  while `Match.league` keeps the upstream casing (`"Worlds"`). `is_major()` is the single
+  major/non-major test; `research/backfill_late.oe_league()` the single lolesports→OE league lookup
+  (both case-insensitive).
 - **`explain.py`** turns field names into sentences. Raw field names must never reach a response
   unless `raw_features: true`; a field with no template is dropped, not shown raw.
 - **`debate.py`** (Stage 3) runs the 4-round protocol against NVIDIA NIM. `agents.py` is the older
@@ -190,6 +195,11 @@ guards. If one goes red, work out whether that trap is back before changing the 
   numbers to the other without any error.
 - **No fuzzy team matching.** `TEAM_ALIASES` is explicit; an unmapped name returns `None` so the
   caller can fail loudly. A `difflib` fallback once mapped `Beijing JDG Esports` onto `LNG Esports`.
+  Only `known=None` means "no validation": `map_team(x, [])` is `None`, and so is an alias whose
+  target is not in `known` (it used to be `if known:`, so the always-empty
+  `known_teams("Worlds")` let every international name through unchecked). Every call site gets
+  its list from `api._known_for(league)` — the league's own known teams for a major, the union of
+  all four (`store.known_teams(None)`, exported as `teams.json` → `known_all`) otherwise.
 - **Stage 3 never changes the probability.** The number always comes from Stage 2 or Stage 4;
   the agents emit classified risk points only, and `external_fact` entries without a URL are
   downgraded.
@@ -200,8 +210,33 @@ guards. If one goes red, work out whether that trap is back before changing the 
   scripts share `load_year`, which returns `None` for a missing file rather than raising, so a
   script that builds its own path is how a year gets dropped from a comparison.
 - Stage 4 trains on **all leagues, not just the four majors** (`TARGET = None` in
-  `ingame_model.py`, gated at `t = +5.19`), while inference in `api.py` still only accepts the four.
+  `ingame_model.py`, gated at `t = +5.19`), while `/predict`, `/predict/ingame` and `/debate` still
+  only accept the four (the board also serves international events — see the next bullet).
   Narrowing the training pool back to the majors would undo a measured gain.
+- **International events: Stage 1/2 only for same-home-league matchups, Stage 4 always.**
+  `api.pregame_league(store, blue, red, league)` (mirrored by `web/` and pinned by
+  `golden/intl_cases.json`) decides, and is exposed as `match.pregame_league`: a major returns its
+  league unchanged (domestic boards do not change at all); an international match whose two teams
+  share a home league (`FeatureStore.home_league` = league of the team's latest game) returns that
+  home league, and every Stage 1/2 number on the board (too_early, post-draft line, blend anchor,
+  curve) is computed **with the home league**; anything else (cross-region, or a team with no
+  major-league history) returns `None` → no Stage 1/2 anywhere on the board, and Stage 4 runs with
+  `include_pre=False` (no `diff_pre_*`, no silent fallback to `_pre_context`) and without the
+  3–15 minute blend. Stage 4 always gets the **event** league, so `is_*` stay all-zero exactly as
+  international rows were encoded in training — passing the home league there would not error.
+  Measured in `research/gate_international.py` with the live artifacts: on 523 historical
+  cross-region games Stage 1/2 have no predictive value (accuracy ~50%, calibration slope ~0, yet
+  as confident as domestically; significantly worse than a constant only in 2022-24, about equal to
+  it out-of-sample in 2025/26); the 314 same-home-league international games behave like domestic
+  ones; Stage 4 beats a constant on international games (t +2.7 to +9.6 per slice, cross-region
+  t = +3.43, n = 102 — a degradation smaller than ~0.055 Brier is undetectable at that n), and
+  nulling its `diff_pre_*` inputs changes nothing measurable (t = +0.15). A board with an unmapped
+  team still shows Stage 4 (the lolesports name is only a label, never looked up) but must not
+  call `log_prediction` — `prediction_log.resolve` could never match it. DCGI is deliberately not in
+  `LEAGUE_TO_OE`: OE's `DCup` was the December LPL cup, and how OE will label DCGI is unknown.
+  `test:diff` only replays final frames, so the first three minutes never reach it: the too_early
+  payload and the reason sentences are pure functions (`_early_prediction`, `_pregame_reason`,
+  `_board_warnings` and their `web/board.ts` twins) pinned by `golden/intl_cases.json` instead.
 - **Isotonic calibration is Stage 4 only. Do not generalise it to Stage 1/2.** Same change, opposite
   verdicts, because the calibration sets differ by 20×: Stage 4 has ~35k snapshots (Brier
   `t = +6.91`, ECE `t = +7.12`, 8/8 folds), Stage 1/2 have 1716 games (Brier `t = -4.74`, 6/6 folds

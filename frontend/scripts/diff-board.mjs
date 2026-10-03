@@ -12,6 +12,9 @@
  * 不参与比对的字段 (都有理由, 不是为了让测试变绿):
  *   live.stale_seconds                     "此刻减帧时刻", 两边取数的时刻不同
  *
+ * 赛区按 LEAGUE_IDS 走, 国际赛也在内 —— 跨赛区 / 队名不认识的看板 (只有局内模型、不带赛前特征、
+ * 不渐变) 和同母赛区的看板 (赛前按母赛区算) 都由这里和 Python 逐字段对上。
+ *
  *   node scripts/diff-board.mjs                 最近 4 天, 每赛区最多 3 场
  *   node scripts/diff-board.mjs --days 7 --per 4
  */
@@ -20,12 +23,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { buildBoard, liveList, upcomingList } from "../src/web/board.ts";
+import { buildBoard, knownFor, liveList, upcomingList } from "../src/web/board.ts";
 import { Feed, LEAGUE_IDS } from "../src/web/feed.ts";
 import { loadIngame } from "../src/web/ingame.ts";
 import { loadStage1 } from "../src/web/stage1.ts";
 import { loadStage2 } from "../src/web/stage2.ts";
-import { knownTeams, localToday } from "../src/web/teams.ts";
+import { localToday } from "../src/web/teams.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (p) => JSON.parse(readFileSync(join(here, p), "utf8"));
@@ -92,7 +95,7 @@ function normalize(b) {
 const now = Date.now();
 const targets = [];
 for (const [lg] of LEAGUE_IDS) {
-  const ms = (await feed.schedule(lg, knownTeams(teams, lg)))
+  const ms = (await feed.schedule(lg, knownFor(teams, lg)))
     .filter((m) => m.state === "completed" && now - Date.parse(m.start_time) < DAYS * 86_400_000)
     .sort((a, b) => (a.start_time < b.start_time ? 1 : -1))
     .slice(0, PER);

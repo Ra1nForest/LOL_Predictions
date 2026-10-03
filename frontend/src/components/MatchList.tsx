@@ -1,5 +1,5 @@
 import type { Match, TeamRef } from "../api/types";
-import { T } from "../i18n";
+import { T, leagueName } from "../i18n";
 
 function Crest({ team }: { team: TeamRef }) {
   if (team.image) {
@@ -48,20 +48,27 @@ function Card({
   const wins = match.teams.map((t) => t.game_wins ?? 0);
   const done = need != null && wins.some((w) => w >= need);
   const live = kind === "live" && !done;
-  const usable = match.predictable && !!a && !!b;
+  // **没有赛前 ≠ 不能预测。** pregame_league 为 null 的是国际赛里跨赛区的对阵 (赛前和 BP 后模型
+  // 在那上面没有预测力, 后端不给), 或者有队不在四大赛区的数据里 —— 这两种开局 3 分钟起都有局内
+  // 胜率, 卡片要能点开, 只是说清楚赛前不预测。待定的队 (TBD) 不算: 那时连谁打都不知道。
+  // 四大赛区的 pregame_league 恒为本赛区, 所以国内比赛的卡片和原来一模一样。
+  const tbd = (t: TeamRef | undefined) => !t || !t.name || t.name === "TBD";
+  const noPregame = !tbd(a) && !tbd(b) && match.pregame_league === null;
+  const usable = !!a && !!b && (match.predictable || noPregame);
+  const noPregameText = T("赛前不预测 · 开局后有局内胜率");
 
   return (
     <button
       className="card"
       disabled={!usable}
       onClick={() => usable && onOpen(match)}
-      title={usable ? "" : T("缺少历史数据, 无法预测")}
+      title={noPregame ? noPregameText : usable ? "" : T("缺少历史数据, 无法预测")}
     >
       <div className="side">
         {a && <Crest team={a} />}
         <div style={{ minWidth: 0 }}>
           <div className="team-name">{a?.name ?? "TBD"}</div>
-          {a && !a.known && <div className="team-sub">{T("无历史数据")}</div>}
+          {a && !a.known && !noPregame && <div className="team-sub">{T("无历史数据")}</div>}
         </div>
       </div>
 
@@ -76,16 +83,17 @@ function Card({
         <div className="tags">
           {live && <span className="tag live">{T("进行中")}</span>}
           {done && <span className="tag">{T("已结束")}</span>}
-          <span className="tag">{match.league}</span>
+          <span className="tag">{leagueName(match.league)}</span>
           {match.best_of != null && <span className="tag">BO{match.best_of}</span>}
         </div>
+        {noPregame && <div className="note">{noPregameText}</div>}
       </div>
 
       <div className="side right">
         {b && <Crest team={b} />}
         <div style={{ minWidth: 0 }}>
           <div className="team-name">{b?.name ?? "TBD"}</div>
-          {b && !b.known && <div className="team-sub">{T("无历史数据")}</div>}
+          {b && !b.known && !noPregame && <div className="team-sub">{T("无历史数据")}</div>}
         </div>
       </div>
     </button>

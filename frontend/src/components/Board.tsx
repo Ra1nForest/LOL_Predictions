@@ -8,7 +8,7 @@ import { Scoreboard } from "./Scoreboard";
 import { ThemeToggle } from "./ThemeToggle";
 import { DebatePanel } from "./DebatePanel";
 import { PreMatch } from "./PreMatch";
-import { T } from "../i18n";
+import { T, tx } from "../i18n";
 import { useFineTimeline, useLivePlayback } from "./useLivePlayback";
 import { mergeFine } from "./chartKit";
 
@@ -207,19 +207,34 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
   const league = data?.match?.league ?? initial?.league;
   const bm = teams[0]?.model_name;
   const rm = teams[1]?.model_name;
+  // 赛前按哪个赛区算 —— **不是** match.league。国际赛两队同一个母赛区时是那个母赛区 (Stage 1 只认
+  // 四大赛区, 拿 "Worlds" 去问只会报错); null = 这场不给赛前 (跨赛区: 历史上没有预测力; 或有队
+  // 不认识), 那就不发。字段缺席 (undefined) 只可能是还没更新的旧后端, 那时退回比赛赛区, 和原来一样。
+  const m0 = data?.match ?? initial;
+  const pgLeague = m0 ? (m0.pregame_league === undefined ? m0.league : m0.pregame_league) : undefined;
   useEffect(() => {
     // hasEarly 时也不发 —— 看板自己已经带回了 BP 后概率, 再去问一次
     // /predict 拿的是信息更少的 Stage 1, 白花一次调用还会闪一下。
-    if (hasLive || hasEarly || !data || !bm || !rm || !league) return;
+    if (hasLive || hasEarly || !data || !bm || !rm || !pgLeague) return;
     let alive = true;
     mutations
-      .predict({ blue_team: bm, red_team: rm, league })
+      .predict({ blue_team: bm, red_team: rm, league: pgLeague })
       .then((r) => alive && setPre(r))
       .catch(() => alive && setPre(null));
     return () => {
       alive = false;
     };
-  }, [hasLive, data, bm, rm, league]);
+  }, [hasLive, data, bm, rm, pgLeague]);
+  // 这场不给赛前 (见上): 还没开打时把原因说出来, 而不是一句"暂无预测数据"
+  const noPregame = teams.length === 2 && pgLeague === null;
+  // 国际赛同母赛区: 赛前是按两队母赛区的内战口径算的 (pgLeague 不等于比赛赛区), 必须说出来, 否则
+  // 一个按 LCK 内战算的数就冒充了世界赛的赛前概率。开局头 3 分钟那一屏后端在 prediction.warnings
+  // 里带着这句; 开打前的 PreMatch 用的是 /predict 的响应, 没有它 —— 这里补上**同一句话**
+  // (api._pregame_reason 的 intl_home), 走生成句子的翻译 (tx), 不另写一份英文。
+  const intlNote =
+    m0 && pgLeague && pgLeague !== m0.league
+      ? tx(`国际赛: 赛前和 BP 后按两队所在的 ${pgLeague} 内战口径计算, 国际赛的场次不计入近况`)
+      : null;
 
   // 局标签按进度**增量**长出来, 不是一进页面就摆满 BO5 的五个空位 ——
   // 那五个里有四个还不存在, 摆出来只是让人以为已经打了五局。
@@ -278,7 +293,10 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
   }
   // hasEarly 时不写 —— 那一段**已经开打了** (只是局内模型还没启用),
   // 写"尚未开始"是错的, 而"第几分钟"上面那一屏自己会说。
-  if (!hasLive && !hasEarly) {
+  // too_early 但没有概率 (跨赛区 / 队名不认识的国际赛开局头 3 分钟) 同理: 已经开打了,
+  // 那时 played 不为空, 不拦的话这里会写成"局间休息"。
+  const tooEarly = !!pr?.too_early;
+  if (!hasLive && !hasEarly && !tooEarly) {
     // 同样**不看 match.state**: 实测 2026-09-04 LPL LGD vs AL 打到第 3 局
     // (1-1 的 BO5) 而 state 已是 completed —— 局间休息时这里就会报"已结束",
     // 而系列赛根本没打完。按比分对 BO 算, 和后端 _clinched 同一套。
@@ -293,7 +311,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
     );
   }
   // 已经开打但局内模型还没启用: 报第几分钟, 让人知道"在等什么"
-  if (hasEarly && pr?.minute != null) {
+  if ((hasEarly || tooEarly) && pr?.minute != null) {
     meta.push(T("第 {n} 分钟", { n: pr.minute }));
   }
 
@@ -319,6 +337,9 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
       : lv.stalled || lv.game_state === "paused"
         ? "paused"
         : "live";
+
+  // too_early 通常不带 warnings (类型里是可选的); 局内那段总有
+  const warns = pr?.warnings ?? [];
 
   const footnotes = [
     card?.note,
@@ -457,7 +478,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
           一旦有了 BP 后概率 (hasEarly), 上面那一屏已经把当前概率讲完了,
           再叠一个赛前视图就是同一件事说两遍, 而且两个数还不一样。 */}
       {!hasLive && !hasEarly && pre && (
-        <PreMatch data={pre} blueName={blueName} redName={redName} />
+        <PreMatch data={pre} blueName={blueName} redName={redName} notes={intlNote ? [intlNote] : undefined} />
       )}
 
       <div className="stack">
@@ -473,11 +494,25 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
         {error && <div className="panel pad err">{error}</div>}
         {lv?.note && <div className="warn">{lv.note}</div>}
 
+        {/* 开局头 3 分钟 (hasEarly) 的提醒。too_early 平时不带 warnings; 国际赛同母赛区时带一句口径
+            说明 ("按 LCK 内战口径计算") —— 上面那一屏显示的正是按这个口径算的数, 不能只在局内阶段
+            的折叠说明里才看得到。 */}
+        {hasEarly &&
+          warns.map((w, i) => (
+            <div className="warn" key={i}>
+              {w}
+            </div>
+          ))}
+
         {/* hasEarly 时不显示 —— 那句 note 讲的是"局内模型还没启用", 而上面
             的 shift 已经说过同一件事了。 */}
         {!hasLive && !hasEarly && !pre && (
           <div className="panel pad empty">
-            {loading ? T("加载中…") : (pr?.note ?? pr?.error ?? T("暂无预测数据"))}
+            {loading
+              ? T("加载中…")
+              : (pr?.note ??
+                pr?.error ??
+                T(noPregame ? "赛前不预测 · 开局后有局内胜率" : "暂无预测数据"))}
           </div>
         )}
 
@@ -523,9 +558,11 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
 
         {/* AI 复核。要能跑必须凑齐: 队名映射得上 + 有当前局面。
             champs 从选手表里取本局英雄 —— 后端靠它算阵容强势期。
-            静态版 (GitHub Pages) 没有它: 要调 NVIDIA 的 API, key 不能放进网页。 */}
+            静态版 (GitHub Pages) 没有它: 要调 NVIDIA 的 API, key 不能放进网页。
+            国际赛也没有 (pgLeague !== league): /debate 只收四大赛区, 而且它以 BP 后概率为底,
+            跨赛区上那一段没有预测力、同母赛区时的口径也和看板头条不同。 */}
         {(() => {
-          if (IS_STATIC || !hasLive || !bm || !rm || !league) return null;
+          if (IS_STATIC || !hasLive || !bm || !rm || !league || pgLeague !== league) return null;
           const champs = (side: "blue" | "red") =>
             lv!.players.filter((p) => p.side === side).map((p) => p.champion).filter(Boolean) as string[];
           const bc = champs("blue");
@@ -566,7 +603,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
         {/* 模型的局限**不删, 只是默认收起**。这个项目的立身之本就是把
             不确定性讲清楚 (见 README), 但界面不该一上来就糊一脸术语。
             想看的人点开就有, 不看的人也不会被误导成"这数字很确定"。 */}
-        {hasLive && (footnotes.length > 0 || pr!.warnings.length > 0) && (
+        {hasLive && (footnotes.length > 0 || warns.length > 0) && (
           <details className="fineprint">
             <summary>
               {T("准确率约")}{" "}
@@ -574,15 +611,15 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
                 ? `${Math.round(card!.overall_accuracy * 100)}%`
                 : "—"}{" "}
               · {T("模型说明")}
-              {pr!.warnings.length > 0 && T(" 与 {n} 条提醒", { n: pr!.warnings.length })}
+              {warns.length > 0 && T(" 与 {n} 条提醒", { n: warns.length })}
             </summary>
             {/* 两类说明合到一处: 上面原本还有一块"N 条模型说明"的折叠框, 和
                 这里讲的是同一件事 (模型的局限), 分成两处只是让人多点一次。
                 提醒在前 —— 它们是**针对这一次预测**的 (切片外推、缺了某个
                 特征), 比通用的准确率说明更该先看到。 */}
-            {pr!.warnings.length > 0 && (
+            {warns.length > 0 && (
               <ul className="fine-warns">
-                {pr!.warnings.map((w, i) => (
+                {warns.map((w, i) => (
                   <li key={i}>{w}</li>
                 ))}
               </ul>

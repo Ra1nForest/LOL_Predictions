@@ -37,6 +37,11 @@ ROLES = ["top", "jng", "mid", "bot", "sup"]
 # 复算: research/audit_gold_total.py
 GOLD_TOTAL_MEDIAN = {10: 15918, 15: 25037, 20: 34597, 25: 43854}
 
+# make_row 拿不到赛前特征时的那句提醒。单独成常量, 是因为看板要认得它: 跨赛区 / 队名不认识时
+# 看板是**故意**不带赛前特征 (include_pre=False), 这句"没有可用的统计"就说错了原因, 还和看板放在
+# 第一条的说明重复 —— api._board_warnings 按原文把它去掉。浏览器版是 web/ingame.ts 的 NO_PRE_STATS。
+NO_PRE_STATS = "没有可用的赛前队伍统计, 本次只看局内数据。"
+
 
 class IngameModel:
     """variant="" 是完整模型; variant="_live" 是不含经验差特征的实时变体。
@@ -184,7 +189,7 @@ class IngameModel:
                 if k in self.features:
                     m[k] = v
         else:
-            warn.append("没有可用的赛前队伍统计, 本次只看局内数据。")
+            warn.append(NO_PRE_STATS)
         return m, warn
 
     def calibrate(self, raw: float) -> float:

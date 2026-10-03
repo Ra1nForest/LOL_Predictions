@@ -50,10 +50,12 @@ for _s in (sys.stdout, sys.stderr):
     if _s is not None and hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
 
-# 回填要扫的联赛。**比 esports_feed.LEAGUE_IDS 宽** —— 那个只有四大赛区,
-# 是给线上推理用的 (api.py 也只接受四大); 而模型从 2026-08-17 起就在用全部
+# 回填要扫的联赛。**比 esports_feed.LEAGUE_IDS 宽** —— 那个只有四大赛区和国际赛,
+# 是给线上看板用的 (直播检测、赛程); 而模型从 2026-08-17 起就在用全部
 # 联赛训练了 (research/gate_league_mix.py, t=+5.19, 五折全正), 所以回填也
 # 该覆盖同样的范围, 否则训练集的两头补得不一致。
+# LEAGUE_IDS 加了国际赛之后 ALL_LEAGUES 自动带上它们: 能配上 OE 的照常回填, 配不上的
+# (OE 还没登记, 或者是 DCGI 这种不知道 OE 会叫什么的) 和以前一样跳过、不记进 done。
 #
 # 这些 id 来自 getLeagues, 且都在 Oracle's Elixir 里有数据 (能配上标签)。
 # 不动 esports_feed.LEAGUE_IDS: 那会连带改变直播检测和赛程接口的行为。
@@ -80,13 +82,42 @@ ALL_LEAGUES = {**LEAGUE_IDS, **EXTRA_LEAGUES}
 # lolesports 的赛区名 -> Oracle's Elixir 的赛区名。只有对不上的才列。
 # 名字对不上**不会报错**, 只会一局都配不上 —— 和队名那个坑同一类, 所以
 # 同样显式列出、不做模糊匹配。
+#
+# **查这张表一律走 oe_league(), 大小写无关。** 同一个赛区在项目里有两种写法: LEAGUE_IDS 的键是
+# 大写 ("WORLDS"), 而 Match.league —— 也就是采集 meta 和预测留档里存的 —— 是上游原样 ("Worlds")。
+# 只收其中一种的话, 另一条路径一局都配不上, 也不报错。
 LEAGUE_TO_OE = {
     "LCK Challengers": "LCKC",
     "EMEA Masters": "EM",
+    # 国际赛 (MSI 两边同名, 不用列)
+    "WORLDS": "WLDs",
+    "FIRST STAND": "FST",
+    "ESPORTS WORLD CUP": "EWC",
 }
 # LTA North / South 故意不收: oe_index() 已经把 "LTA N" 并进 LCS, 再从 API
 # 单独扒一遍只会和已有的 LCS 数据重复; LTA South 也只有 220 局, 不值得为它
 # 引入第二套映射 —— 映射错了不报错, 只会静默配错标签。
+#
+# DCGI (德玛西亚杯全球邀请赛, 2026) 故意不收: OE 里的 "DCup" 一直是 12 月 LPL 系的国内杯赛
+# (2022/2023/2025 都只有 LPL + LDL 的队), 这届全球邀请赛 OE 会不会沿用 DCup、还是另起一个名字,
+# 现在不知道。猜成 DCup 的话, 一旦 OE 另起名字就一局都配不上 (不报错); 更糟的是同一个标签底下
+# 混着两种赛事。所以 DCGI 不进这张表: oe_league 原样返回 "DCGI", OE 里没有这个标签, 这些局就
+# 留着不配 —— 回填跳过、留档的 y 一直是 None、采集的胜负停在比分推断 (provisional)。等 OE 登记后
+# 看清它叫什么; 不叫 DCGI 的话再在这里加一行。
+_OE_BY_UPPER = {k.upper(): v for k, v in LEAGUE_TO_OE.items()}
+
+
+def oe_league(league):
+    """lolesports 的赛区名 (任意大小写) -> OE 的赛区名; 表里没有就原样返回 (四大赛区两边同名)。
+
+    原样返回而不是返回 None: 没列的赛区多半就是同名的, 名字不对的话 find_oe 自然配不上, 结果和
+    "不配"一样。回填 (backfill_late.main)、采集核对 (collect_live.oe_correct)、留档回填
+    (prediction_log.resolve) 三处都走这里。
+    """
+    if not league:
+        return league
+    return _OE_BY_UPPER.get(str(league).upper(), league)
+
 
 OUT = _ROOT / "backfill"
 ROWS = OUT / "snapshots.jsonl"
@@ -274,7 +305,7 @@ def main():
             red_api = id2n.get(sides.get("red"))
             blue = TEAM_ALIASES.get(blue_api, blue_api)
             red = TEAM_ALIASES.get(red_api, red_api)
-            row = find_oe(oe, LEAGUE_TO_OE.get(lg, lg), ts,
+            row = find_oe(oe, oe_league(lg), ts,
                           blue, red, g.get("number"))
             if row is None:
                 # **不记进 done**: 配不上多半是 OE 还没收录这场 (它的数据比

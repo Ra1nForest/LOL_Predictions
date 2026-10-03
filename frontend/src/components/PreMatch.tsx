@@ -13,10 +13,16 @@ export function PreMatch({
   data,
   blueName,
   redName,
+  notes,
 }: {
   data: PredictResponse;
   blueName: string;
   redName: string;
+  /**
+   * 外层补的说明, 排在 /predict 自己的提醒前面。目前只有一种: 国际赛同母赛区时"按 LCK 内战口径
+   * 计算" —— /predict 只知道自己被要求按 LCK 算, 不知道这其实是一场世界赛
+   */
+  notes?: string[];
 }) {
   const key = data.final.probability_source;
   const stage = data.stages[key];
@@ -57,6 +63,11 @@ export function PreMatch({
       </div>
 
       <div className="stack" style={{ marginTop: 26 }}>
+        {notes?.map((w, i) => (
+          <div className="warn" key={`n${i}`}>
+            {w}
+          </div>
+        ))}
         {data.warnings?.map((w, i) => (
           <div className="warn" key={i}>
             {w}

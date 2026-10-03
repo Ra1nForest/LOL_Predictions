@@ -60,7 +60,8 @@ const fillVars = (s: string, vars?: Record<string, string | number>) =>
 const UI: Record<string, string> = {
   // 首页
   胜率预测: "Win Probability",
-  "四大赛区比赛的实时胜率预测。": "Live win probabilities for LPL, LCK, LEC and LCS matches.",
+  "四大赛区和国际赛的实时胜率预测。":
+    "Live win probabilities for LPL, LCK, LEC and LCS matches and international events.",
   正在进行: "Live now",
   当前没有进行中的比赛: "No matches are live right now",
   即将开始: "Upcoming",
@@ -69,6 +70,13 @@ const UI: Record<string, string> = {
   "明天 {hm}": "Tomorrow {hm}",
   "缺少历史数据, 无法预测": "Not enough history to predict",
   无历史数据: "No history",
+  "赛前不预测 · 开局后有局内胜率": "No pre-match odds · in-game odds once the game starts",
+  // 国际赛的显示名 (leagueName): match.league 本身保持上游原样, 只在显示时换
+  全球总决赛: "Worlds",
+  季中冠军赛: "MSI",
+  先锋赛: "First Stand",
+  德玛西亚杯: "Demacia Cup",
+  电竞世界杯: "Esports World Cup",
   进行中: "Live",
   已结束: "Finished",
   暂停中: "Paused",
@@ -177,6 +185,27 @@ export function T(zh: string, vars?: Record<string, string | number>): string {
   const en = UI[zh];
   if (en === undefined) miss(zh);
   return fillVars(en ?? zh, vars);
+}
+
+/**
+ * 国际赛的中文名, 按 lolesports 的 league.name 转大写查 (和 LEAGUE_IDS 的键同一个口径)。
+ * 四大赛区和不认识的名字不在表里, 原样显示。
+ */
+const LEAGUE_ZH: Record<string, string> = {
+  WORLDS: "全球总决赛",
+  MSI: "季中冠军赛",
+  "FIRST STAND": "先锋赛",
+  DCGI: "德玛西亚杯",
+  "ESPORTS WORLD CUP": "电竞世界杯",
+};
+
+/**
+ * 赛区的显示名 —— 只用于显示, **绝不拿它改 match.league**: 那个字段要原样传回后端、
+ * 拿去查 LEAGUE_IDS 和判断是不是四大赛区。
+ */
+export function leagueName(league: string | null | undefined): string {
+  const zh = league ? LEAGUE_ZH[league.toUpperCase()] : undefined;
+  return zh ? T(zh) : (league ?? "");
 }
 
 // ══════════════════════════════════════════════════════════
@@ -388,6 +417,13 @@ const RULES: [string, string][] = [
   ["这一局的数据流已经 {n} 分钟没有更新了 —— 帧里还写着 {state}, 但它停在 {t}, 不是实时战况", "This game's feed hasn't updated for {n} min — the frames still say {state} but stopped at {t}; this isn't live"],
   ["赛程也已经把这一局标为结束", "The schedule has also marked this game as finished"],
   ["局内分钟数 {m} 超出局内模型的输入范围 (3-60)", "In-game minute {m} is outside the in-game model's input range (3–60)"],
+  // 国际赛: 为什么没有赛前/BP 后 (board.ts pregameReason / api._pregame_reason)。
+  // 必须排在 "{what}: {err}" 前面 —— 带冒号的两句会被它整句吞掉。两个队名的那句排在一个队名的前面
+  ["这一局算不出赛前和 BP 后的概率, 开局 3 分钟起才有局内胜率", "No pre-match or after-draft probability for this game; in-game odds start at minute 3"],
+  ["{a} 和 {b} 不在四大赛区的数据里, 没有赛前和 BP 后预测; 开局 3 分钟起直接用局内模型", "{a} and {b} aren't in the data for the four major leagues, so there's no pre-match or after-draft prediction; the in-game model takes over from minute 3"],
+  ["{name} 不在四大赛区的数据里, 没有赛前和 BP 后预测; 开局 3 分钟起直接用局内模型", "{name} isn't in the data for the four major leagues, so there's no pre-match or after-draft prediction; the in-game model takes over from minute 3"],
+  ["跨赛区对阵: 赛前和 BP 后模型只在赛区内战上验证过, 在历史跨赛区国际赛上没有预测力, 这里不显示; 开局 3 分钟起直接用局内模型", "Cross-region matchup: the pre-match and after-draft models were only validated on games within one league and had no predictive power on past cross-region international games, so they aren't shown; the in-game model takes over from minute 3"],
+  ["国际赛: 赛前和 BP 后按两队所在的 {lg} 内战口径计算, 国际赛的场次不计入近况", "International event: pre-match and after-draft odds treat this as an {lg} game, since both teams play in {lg}; international games don't count toward recent form"],
   // 选边说明: 界面上目前不显示 (见 Board.tsx 的 side_warning 注释), 但响应里有, 一并翻
   ["以帧里的 gameState 为准, persisted_state 会滞后", "Frame gameState is authoritative; persisted_state lags behind"],
   ["按本局选边调整了左右", "Left/right adjusted to this game's sides"],

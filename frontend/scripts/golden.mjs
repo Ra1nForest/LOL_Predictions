@@ -7,6 +7,14 @@
  *   3. 赛前整条响应     POST /predict —— 赛前页面
  *   4. BP 后            api._board_draft + api._predict_core —— 看板那条"BP 后"参考线。
  *                      名字对齐 (选手去战队前缀、英雄 id 归一化) 和特征向量逐位核对
+ *   5. 国际赛         api.pregame_league (赛前/BP 后按哪个赛区算)、api._known_for (映射队名用
+ *                      哪份表)、esports_feed.map_team (空表必须返回 null) 逐条对账; 外加看板的
+ *                      api._pregame_reason (为什么没有赛前/BP 后)、api._early_prediction (开局头
+ *                      3 分钟那一段 —— test:diff 只取终局帧, 碰不到它)、api._board_warnings
+ *
+ * 局内的国际赛用例 (src 以 "syn:intl:" 打头) 输入里多两个键, 取法和 api._ingame_core 一字不差:
+ *   include_pregame: false   不带赛前特征 (看板在跨赛区 / 队名不认识时这样调)
+ *   pre_league               赛前特征按它算, 不给就按 league (国际赛同母赛区时是两队的母赛区)
  *
  * 期望值由 tools/export_web_model.py 调线上真函数生成, 不另写一份。
  *
@@ -25,14 +33,16 @@ import { fileURLToPath } from "node:url";
 import { buildRow, ingameResponse, loadIngame, predictRow } from "../src/web/ingame.ts";
 import { loadStage1, preContext, predictResponse } from "../src/web/stage1.ts";
 import { draftVector, loadStage2, makeDraftRow, predictCore } from "../src/web/stage2.ts";
-import { draftFromMeta } from "../src/web/board.ts";
+import { boardWarnings, draftFromMeta, earlyPrediction, knownFor, pregameLeague, pregameReason } from "../src/web/board.ts";
+import { MAJORS } from "../src/web/feed.ts";
+import { knownTeams, mapTeam } from "../src/web/teams.ts";
 import { oePlayerName } from "../src/web/names.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (p) => JSON.parse(readFileSync(join(here, p), "utf8"));
 const TOL = 1e-6;
 
-let model, s1, s2, teams, ex, gi, gs, g2;
+let model, s1, s2, teams, ex, gi, gs, g2, g5;
 try {
   model = loadIngame(read("../public/web/ingame_live.json"));
   s1 = loadStage1(read("../public/web/stage1_pre.json"));
@@ -42,6 +52,7 @@ try {
   gi = read("golden/ingame_cases.json");
   gs = read("golden/stage1_cases.json");
   g2 = read("golden/stage2_cases.json");
+  g5 = read("golden/intl_cases.json");
 } catch (e) {
   console.error(`读不到导出文件: ${e.message}\n先跑: python tools/export_web_model.py`);
   process.exit(2);
@@ -90,9 +101,10 @@ let exactRaw = 0;
 for (const c of gi.cases) {
   const i = c.in;
   let pre = null;
-  if (i.blue && i.red) {
+  // include_pregame=false: 不带赛前特征; 否则按 pre_league (没给就按 league) 算 —— 同 _ingame_core
+  if (i.blue && i.red && i.include_pregame !== false) {
     try {
-      pre = preContext(s1, teams, i.blue, i.red, i.league, gi.today).preRow;
+      pre = preContext(s1, teams, i.blue, i.red, i.pre_league ?? i.league, gi.today).preRow;
     } catch {
       pre = null; // 和 _pre_context 抛异常时一样: 不带赛前特征
     }
@@ -152,6 +164,8 @@ for (const c of gi.cases) {
       },
       blueChamps: i.blue_champs,
       redChamps: i.red_champs,
+      includePregame: i.include_pregame ?? true,
+      preLeague: i.pre_league ?? null,
     },
     gi.today,
   );
@@ -213,6 +227,40 @@ for (const c of g2.cases) {
   }
 }
 
+// ── 5. 国际赛 ───────────────────────────────────────────────
+// 四大赛区的名单两边各写了一份 (feed.ts 的 MAJORS / feature_store.LEAGUES): 拿导出的 known 的键核对
+const f5 = { majors: [], pregame: [], known: [], map: [], reason: [], early: [], warns: [] };
+const knownKeys = Object.keys(teams.known).sort();
+if (knownKeys.join("|") !== [...MAJORS].sort().join("|")) f5.majors.push({ js: [...MAJORS], py: knownKeys });
+for (const c of g5.pregame_league) {
+  const js = pregameLeague(teams, c.in[0], c.in[1], c.in[2]);
+  if (js !== c.out) f5.pregame.push({ in: c.in, js, py: c.out });
+}
+for (const c of g5.known_for) {
+  const d = diff(knownFor(teams, c.in), c.out);
+  if (d) f5.known.push({ in: c.in, ...d });
+}
+// spec: null = 不校验, [] = 空表 (必须返回 null), "*" = 并集, 赛区名 = 该赛区的表 (store.known_teams(赛区))
+const knownOf = (spec) =>
+  spec === null || Array.isArray(spec) ? spec : spec === "*" ? teams.known_all : knownTeams(teams, spec);
+for (const c of g5.map_team) {
+  const js = mapTeam(teams, c.in[0], knownOf(c.in[1]));
+  if (js !== c.out) f5.map.push({ in: c.in, js, py: c.out });
+}
+// 看板的几句说明和开局那一段: 整个返回值逐字段比 (键的有无、句子一字不差)
+for (const c of g5.pregame_reason) {
+  const d = diff(pregameReason(c.in[0], c.in[1], c.in[2]), c.out);
+  if (d) f5.reason.push({ in: c.in, ...d });
+}
+for (const c of g5.early) {
+  const d = diff(earlyPrediction(c.in[0], c.in[1], c.in[2], c.in[3], c.in[4]), c.out);
+  if (d) f5.early.push({ in: c.in, ...d });
+}
+for (const c of g5.board_warnings) {
+  const d = diff(boardWarnings(c.in[0], c.in[1], c.in[2]), c.out);
+  if (d) f5.warns.push({ in: c.in, ...d });
+}
+
 // ── 报告 ────────────────────────────────────────────────────
 const fmt = (v) => v.toExponential(2);
 const n1 = gi.cases.length;
@@ -223,6 +271,15 @@ console.log(`2. 局内整条响应   ${n2} 条   不一致 ${f2.length}`);
 console.log(`3. 赛前整条响应   ${gs.cases.length} 条   不一致 ${f3.length}`);
 console.log(`4. BP 后          ${g2.cases.length} 局阵容 (算出概率 ${n4p})  选手名 ${g2.names.length} 条`);
 console.log(`     名字不一致 ${f4.names.length}  BP 不一致 ${f4.draft.length}  特征不一致 ${f4.x.length}  概率超差 ${f4.p.length}  max |Δp| ${fmt(max4)}`);
+console.log(
+  `5. 国际赛        pregame_league ${g5.pregame_league.length} 条  known_for ${g5.known_for.length} 条  map_team ${g5.map_team.length} 条`,
+);
+console.log(
+  `     四大名单不一致 ${f5.majors.length}  pregame_league 不一致 ${f5.pregame.length}  known_for 不一致 ${f5.known.length}  map_team 不一致 ${f5.map.length}`,
+);
+console.log(
+  `     看板说明 ${g5.pregame_reason.length} 条 不一致 ${f5.reason.length}  开局 ${g5.early.length} 条 不一致 ${f5.early.length}  局内提醒 ${g5.board_warnings.length} 条 不一致 ${f5.warns.length}`,
+);
 
 const show = (title, arr) => {
   if (!arr.length) return;
@@ -239,9 +296,18 @@ show("4 选手名", f4.names);
 show("4 BP", f4.draft);
 show("4 特征", f4.x);
 show("4 概率", f4.p);
+show("5 四大名单", f5.majors);
+show("5 pregame_league", f5.pregame);
+show("5 known_for", f5.known);
+show("5 map_team", f5.map);
+show("5 看板说明", f5.reason);
+show("5 开局", f5.early);
+show("5 局内提醒", f5.warns);
 
 const total =
   f1.features.length + f1.warnings.length + f1.slice.length + f1.prob.length + f2.length + f3.length +
-  f4.names.length + f4.draft.length + f4.x.length + f4.p.length;
+  f4.names.length + f4.draft.length + f4.x.length + f4.p.length +
+  f5.majors.length + f5.pregame.length + f5.known.length + f5.map.length +
+  f5.reason.length + f5.early.length + f5.warns.length;
 console.log(total ? "\n✗ 未通过" : "\n✓ 通过 —— 浏览器版和 Python 线上是同一套模型");
 process.exit(total ? 1 : 0);

@@ -403,6 +403,14 @@ button {
   margin-top: 7px;
   flex-wrap: wrap;
 }
+/* "赛前不预测 · 开局后有局内胜率" 这类一句话说明: 限宽换行, 不把两边的队名挤掉 */
+.mid .note {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--ink-3);
+  margin: 6px auto 0;
+  max-width: 150px;
+}
 .tag {
   font-size: 10.5px;
   letter-spacing: 0.04em;

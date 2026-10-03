@@ -18,7 +18,7 @@
  */
 import type { BoardResponse, Player as PlayerJson, Prediction, TimelinePoint } from "../api/types.ts";
 import type { Models } from "./board.ts";
-import { lanesOf } from "./board.ts";
+import { boardPlan, boardWarnings, lanesOf } from "./board.ts";
 import type { Feed } from "./feed.ts";
 import { DDRAGON, teamObjectives } from "./feed.ts";
 import { ingameResponse } from "./ingame.ts";
@@ -268,34 +268,47 @@ export function liveView(board: BoardResponse, pf: PlayFrame, ctx: ViewCtx): Boa
     return { ...board, live };
   }
 
+  // 队名、赛区、赛前口径和看板头条同一个取法 (boardPlan): 队名映射不出来时原名只当标签,
+  // 没有赛前口径 (跨赛区 / 队名不认识) 就不带赛前特征、不渐变, 并且照头条把原因放在提醒第一条
+  const m = board.match;
+  const plan = boardPlan(
+    m.teams.map((t) => ({ api: t.name, model: t.model_name })),
+    m.league,
+    m.pregame_league,
+  );
+  if (!plan) return { ...board, live };
   const champs = (side: string) => players.filter((p) => p.side === side && p.champion).map((p) => p.champion!);
   const bch = champs("blue");
   const rch = champs("red");
-  const res = ingameResponse(
+  const base = {
+    blue: plan.blue,
+    red: plan.red,
+    league: plan.league,
+    state: {
+      minute,
+      golddiff,
+      csdiff: teams.blue.cs - teams.red.cs,
+      blueKills: teams.blue.kills,
+      redKills: teams.red.kills,
+      goldTotal: teams.blue.gold,
+    },
+    blueChamps: bch.length === 5 ? bch : null,
+    redChamps: rch.length === 5 ? rch : null,
+  };
+  const raw = ingameResponse(
     ctx.models.ingame,
     ctx.models.s1,
     ctx.teams,
     ctx.models.ex,
-    {
-      blue: board.match.teams[0]!.model_name!,
-      red: board.match.teams[1]!.model_name!,
-      league: board.match.league,
-      state: {
-        minute,
-        golddiff,
-        csdiff: teams.blue.cs - teams.red.cs,
-        blueKills: teams.blue.kills,
-        redKills: teams.red.kills,
-        goldTotal: teams.blue.gold,
-      },
-      blueChamps: bch.length === 5 ? bch : null,
-      redChamps: rch.length === 5 ? rch : null,
-      // 同看板头条: 开局那段从 BP 后渐变过渡到局内模型
-      blend: true,
-      blendWith: pr.postdraft_probability_blue ?? null,
-    },
+    plan.preLeague !== null
+      ? // 同看板头条: 开局那段从 BP 后渐变过渡到局内模型
+        { ...base, blend: true, blendWith: pr.postdraft_probability_blue ?? null, preLeague: plan.preLeague }
+      : { ...base, includePregame: false },
     ctx.today,
-  ) as unknown as Prediction;
+  );
+  // 同看板头条: 原因放第一条, 故意不带赛前特征时去掉"没有可用的赛前队伍统计"
+  raw.warnings = boardWarnings(raw.warnings as string[], plan.whyKind, plan.why);
+  const res = raw as unknown as Prediction;
   const prediction: Prediction = { ...res, postdraft_probability_blue: pr.postdraft_probability_blue ?? null };
 
   // 走势图按秒记: 回放每走过 1 秒游戏时间, 往轨迹末尾追加一个点。打开页面之前的部分

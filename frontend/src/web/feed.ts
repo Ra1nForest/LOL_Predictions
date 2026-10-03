@@ -23,13 +23,39 @@ export const PERSISTED = "https://esports-api.lolesports.com/persisted/gw";
 export const FEED = "https://feed.lolesports.com/livestats/v1";
 /** 公开的共享 key, lolesports.com 前端自己就用这个。不是机密。 */
 export const API_KEY = "0TvQnueqKa5mxJntVWt0w4LpLfEkrV1Ta8rQBb9Z";
-/** 有序 —— 和 Python 的 dict 顺序一致, 列表里比赛的先后取决于它 */
+/**
+ * 直播检测和赛程接口的赛区白名单: 四大赛区 + 国际赛 (esports_feed.LEAGUE_IDS, 同样的顺序)。
+ * 有序 —— 和 Python 的 dict 顺序一致, 列表里比赛的先后取决于它。
+ *
+ * **键必须等于 lolesports 的 league.name.toUpperCase()**: live() 按 m.league.toUpperCase() 过滤,
+ * 键写成 "WLDS" 这类缩写不会报错, 只会把正在打的国际赛静默丢掉。Match.league 保留上游原样的
+ * 大小写 ("Worlds"), 只有查这张表时才转大写。国际赛的赛前/BP 后怎么算见 board.ts 的 pregameLeague。
+ */
 export const LEAGUE_IDS: [string, string][] = [
   ["LCK", "98767991310872058"],
   ["LPL", "98767991314006698"],
   ["LEC", "98767991302996019"],
   ["LCS", "98767991299243165"],
+  ["WORLDS", "98767975604431411"],
+  ["MSI", "98767991325878492"],
+  ["FIRST STAND", "113464388705111224"],
+  ["DCGI", "117126995932274206"],
+  ["ESPORTS WORLD CUP", "116838530616006090"],
 ];
+
+/**
+ * 四大赛区 = feature_store.LEAGUES: Stage 1/2 只在这四个赛区的内战上训练过, 队伍表也只装了它们。
+ * 和 teams.json 的 known 的键是同一份名单, test:golden 会核对两者一致。
+ */
+export const MAJORS: ReadonlySet<string> = new Set(["LPL", "LCK", "LEC", "LCS"]);
+
+/**
+ * esports_feed.is_major: 这个赛区是不是四大赛区之一 (大小写无关)。
+ * 浏览器版里"四大 / 非四大"的判断只走这一处。空串和 null 都是 false。
+ */
+export function isMajor(league: string | null | undefined): boolean {
+  return !!league && MAJORS.has(String(league).toUpperCase());
+}
 export const DDRAGON = "https://ddragon.leagueoflegends.com";
 const DDRAGON_FALLBACK_VER = "16.16.1";
 
@@ -76,8 +102,17 @@ export interface Match {
   best_of: number | null;
   teams: TeamRef[];
   between_games: boolean;
+  /**
+   * 赛前 / BP 后 (Stage 1/2) 按哪个赛区的口径算; null = 这场不给赛前和 BP 后。
+   * 要查队伍表才定得下来 (两队的母赛区), 由 board.ts 的 pregameOf 填。
+   */
+  pregame_league: string | null;
 }
 
+/**
+ * Match.predictable: 两队都映射得出模型队名。**不等于"有赛前预测"** —— 跨赛区的国际赛两队都认识,
+ * 但赛前和 BP 后不给, 那由 pregame_league 决定。
+ */
 export const predictable = (m: Match) => m.teams.length === 2 && m.teams.every((t) => t.model_name !== null);
 
 export interface TeamObjectives {
@@ -359,6 +394,7 @@ export class Feed {
         best_of: orObj(m.strategy).count ?? null,
         teams,
         between_games: false,
+        pregame_league: null,
       });
     }
     return out;

@@ -33,6 +33,12 @@ import type { TeamsFile } from "./teams.ts";
 import type { Forest, TreeModelFile } from "./xgb.ts";
 import { loadForest, predictRaw, toVector } from "./xgb.ts";
 
+/**
+ * make_row 拿不到赛前特征时的那句提醒 (ingame_service.NO_PRE_STATS)。看板要认得它: 跨赛区 / 队名
+ * 不认识时是故意不带赛前特征, 这句说错了原因 —— board.ts 的 boardWarnings 按原文把它去掉
+ */
+export const NO_PRE_STATS = "没有可用的赛前队伍统计, 本次只看局内数据。";
+
 // ══════════════════════════════════════════════════════════
 //  文件格式 (由 tools/export_web_model.py 生成)
 // ══════════════════════════════════════════════════════════
@@ -242,7 +248,7 @@ export function buildRow(model: IngameModel, preRow: Record<string, number> | nu
       if (model.forest.featureSet.has(k)) row[k] = v;
     }
   } else {
-    warn.push("没有可用的赛前队伍统计, 本次只看局内数据。");
+    warn.push(NO_PRE_STATS);
   }
   return { row, T, warnings: warn };
 }
@@ -360,10 +366,22 @@ export interface IngameState {
 export interface IngameArgs {
   blue: string;
   red: string;
+  /** 局内模型自己的赛区 (is_* 和 LPL 那条警告)。国际赛就是赛事本身, is_* 全 0, 和训练时一样 */
   league: string;
   state: IngameState;
   blueChamps: string[] | null;
   redChamps: string[] | null;
+  /**
+   * api._ingame_core 的 include_pre, 默认 true。false = **不带**赛前特征: 不用 preCtx, 也不会
+   * 退回按赛区去算 preContext。看板在跨赛区 / 队名不认识时这样调 —— 跨赛区上赛前那套特征
+   * 没有预测力, 而不认识的队名根本不能拿去查队伍表。
+   */
+  includePregame?: boolean;
+  /**
+   * api._ingame_core 的 pre_league: 赛前特征按哪个赛区算, 不给就同 league。国际赛同母赛区对阵时
+   * 看板传两队的母赛区, 而 league 仍是赛事本身 —— 见 board.ts 的 pregameLeague。
+   */
+  preLeague?: string | null;
   /** 调用方已经算好的赛前上下文 (曲线每个点共用一份)。不给就在这里算。 */
   preCtx?: PreCtx | null;
   /** 看板用: 开局那段从 blendWith (BP 后概率; 没有就赛前) 渐变过渡到局内模型, 见 blendPrior */
@@ -386,8 +404,8 @@ export function blendPrior(prior: number, ingame: number, minute: number): [numb
 }
 
 /**
- * api._ingame_core 的浏览器版 (include_pregame=True, raw=False) —— 看板头条和
- * 走势图每个点用的都是它。返回的对象和服务器的 prediction 逐字段相同。
+ * api._ingame_core 的浏览器版 (raw=False) —— 看板头条和走势图每个点用的都是它。
+ * 返回的对象和服务器的 prediction 逐字段相同。include_pre 由 includePregame 给, 默认 true。
  */
 export function ingameResponse(
   model: IngameModel,
@@ -400,13 +418,14 @@ export function ingameResponse(
   let preRow: Record<string, number> | null = null;
   let preP: number | null = null;
   const warns: string[] = [];
-  if (a.preCtx) {
+  const includePre = a.includePregame !== false;
+  if (includePre && a.preCtx) {
     preRow = a.preCtx.preRow;
     preP = a.preCtx.preP;
     warns.push(...a.preCtx.warnings);
-  } else {
+  } else if (includePre) {
     try {
-      const c = preContext(s1, teams, a.blue, a.red, a.league, today);
+      const c = preContext(s1, teams, a.blue, a.red, a.preLeague ?? a.league, today);
       preRow = c.preRow;
       preP = c.preP;
       warns.push(...c.warnings);

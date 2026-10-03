@@ -26,11 +26,14 @@ explain.py 改一句话, 重新导出就跟上了。
   frontend/public/web/ingame_live.json     局内模型 (树) + 保序表 + 阵容强势期表
   frontend/public/web/stage1_pre.json      赛前模型 (树) + Platt 系数
   frontend/public/web/stage2_post.json     BP 后模型 (树) + Platt + 英雄/选手-英雄的胜场场数表
-  frontend/public/web/teams.json           每队一行的滚动统计 + 各赛区已知队伍 + 队名别名
+  frontend/public/web/teams.json           每队一行的滚动统计 (含母赛区) + 各赛区已知队伍及其并集 + 队名别名
   frontend/public/web/explain.json         explain.py 的文案表
   frontend/scripts/golden/ingame_cases.json    黄金用例 (不发布)
   frontend/scripts/golden/stage1_cases.json
   frontend/scripts/golden/stage2_cases.json
+  frontend/scripts/golden/intl_cases.json      国际赛: pregame_league / _known_for / map_team,
+                                               以及看板的 _pregame_reason / _early_prediction (开局
+                                               头 3 分钟, test:diff 碰不到) / _board_warnings
 
     python tools/export_web_model.py
     npm --prefix frontend run test:golden
@@ -226,13 +229,18 @@ def export_teams(store) -> dict:
             v = float(s.get(c, float("nan")))
             vals.append(None if math.isnan(v) else v)
         teams[name] = {"v": vals, "n": int(s["_n_games"]),
-                       "last": str(pd.Timestamp(s["_last_date"]).date())}
+                       "last": str(pd.Timestamp(s["_last_date"]).date()),
+                       # 母赛区 (FeatureStore.home_league) —— 国际赛判断两队是不是同一个赛区出来的
+                       "home": store.home_league(name)}
     return {
         "format": "teams-v1",
         "roll_cols": cols,
         "sum_feats": list(SUM_FEATS),
         "teams": teams,
         "known": {lg: store.known_teams(lg) for lg in LEAGUES},
+        # 四大赛区的并集 = store.known_teams(None)。国际赛映射队名用它 (api._known_for);
+        # 显式导出而不是让 JS 拼 "known" 的四张表, 免得两边对"并集"的理解不一样
+        "known_all": store.known_teams(None),
         "league_last": {lg: str(pd.Timestamp(d).date()) for lg, d in store.league_last.items()},
         "aliases": dict(TEAM_ALIASES),
         "data_through": str(store.last_date.date()),
@@ -284,8 +292,19 @@ def _pre_row(api, cache, blue, red, league):
     return cache[key]
 
 
+def _pre_for(api, cache, inp):
+    """这条输入的赛前特征行, 取法和 api._ingame_core 一字不差:
+    include_pregame=False 就不带 (看板在跨赛区 / 队名不认识时这样调); 否则按 pre_league 算,
+    没给 pre_league 就按 league (国际赛同母赛区时看板给的是两队的母赛区, league 仍是赛事本身)。
+    这两个键只出现在国际赛的合成用例里, 老用例的输入一个字节都不变。"""
+    if inp.get("include_pregame", True) is False:
+        return None
+    lg = inp.get("pre_league")
+    return _pre_row(api, cache, inp["blue"], inp["red"], inp["league"] if lg is None else lg)
+
+
 def _expect(ig, api, cache, inp) -> dict:
-    pre = _pre_row(api, cache, inp["blue"], inp["red"], inp["league"])
+    pre = _pre_for(api, cache, inp)
     m, warns = ig.make_row(
         minute=inp["minute"], golddiff=inp["golddiff"], xpdiff=None,
         csdiff=inp["csdiff"], blue_kills=inp["blue_kills"], red_kills=inp["red_kills"],
@@ -301,12 +320,15 @@ def _expect(ig, api, cache, inp) -> dict:
 
 
 def _ingame_resp(api, inp) -> dict:
-    """api._ingame_core 的真实输出 —— 看板头条调它的方式 (include_pregame=True, 不带 pre_ctx)。"""
+    """api._ingame_core 的真实输出 —— 看板头条调它的方式 (不带 pre_ctx)。include_pregame 默认
+    True; 国际赛用例另带 include_pregame=False (不带赛前特征) 或 pre_league (赛前特征按母赛区算)。"""
     st = api.IngameState(minute=inp["minute"], golddiff=inp["golddiff"], xpdiff=None,
                          csdiff=inp["csdiff"], blue_kills=inp["blue_kills"],
                          red_kills=inp["red_kills"], gold_total=inp["gold_total"])
     out, _row = api._ingame_core(inp["blue"], inp["red"], inp["league"], st,
-                                 inp["blue_champs"], inp["red_champs"], True)
+                                 inp["blue_champs"], inp["red_champs"],
+                                 inp.get("include_pregame", True),
+                                 pre_league=inp.get("pre_league"))
     return _jsonable(out)
 
 
@@ -316,13 +338,14 @@ def real_inputs(store) -> list[tuple[str, dict]]:
     参数的取法照 api.esports_board 的走势图那段: minute 夹到 [3, 60],
     gold_total 用蓝方总经济, 阵容要凑满 5+5 才传。
     """
-    from esports_feed import map_team
+    from esports_feed import is_major, map_team
 
     out = []
     for mp in sorted(COLLECTED.glob("*.meta.json")):
         meta = json.loads(mp.read_text(encoding="utf-8"))
         lg = meta.get("league")
-        if lg not in MAJORS:
+        # 真实用例只取四大赛区 —— 国际赛的走法 (不带赛前特征 / 按母赛区) 由 intl_inputs 的合成用例覆盖
+        if not is_major(lg):
             continue
         gid = mp.name[: -len(".meta.json")]
         jl = mp.with_name(f"{gid}.jsonl")
@@ -398,6 +421,121 @@ def synthetic_inputs(base: dict) -> list[tuple[str, dict]]:
     return out
 
 
+def intl_inputs(base: dict, store) -> list[tuple[str, dict]]:
+    """国际赛看板喂给局内模型的三种输入 (见 api.esports_board / api.pregame_league):
+
+      · 跨赛区或队名不认识: include_pregame=False —— 不带赛前特征; league 是赛事本身, is_* 全 0
+      · 队名不认识: 蓝方用 lolesports 原名, 只当标签 (摘要、理由), 不进任何查表
+      · 同母赛区: league 是赛事本身, 赛前特征按 pre_league = 两队母赛区算
+
+    src 用 "syn:intl:" 打头, 和其余合成用例一样带整条响应。
+    """
+    out = []
+    for lg in ("DCGI", "Worlds"):
+        for mn in (3, 10, 20, 25, 34.5):
+            out.append((f"syn:intl:{lg}@{mn}:无赛前",
+                        {**base, "league": lg, "minute": mn, "include_pregame": False}))
+        for gd in (-6000, 6000):
+            out.append((f"syn:intl:{lg}:golddiff={gd}:无赛前",
+                        {**base, "league": lg, "minute": 22, "golddiff": gd, "include_pregame": False}))
+    out.append(("syn:intl:DCGI:不认识的队当标签",
+                {**base, "league": "DCGI", "blue": "GAM Esports", "include_pregame": False}))
+    out.append(("syn:intl:Worlds:无赛前:无阵容",
+                {**base, "league": "Worlds", "include_pregame": False,
+                 "blue_champs": None, "red_champs": None}))
+    hb, hr = store.home_league(base["blue"]), store.home_league(base["red"])
+    if hb is None or hb != hr:
+        raise SystemExit(f"合成用例的底子 {base['blue']} / {base['red']} 不是同一个母赛区, 造不出同母赛区的国际赛用例")
+    for lg in ("Worlds", "Esports World Cup"):
+        out.append((f"syn:intl:{lg}:同母赛区按{hb}",
+                    {**base, "league": lg, "pre_league": hb}))
+    return out
+
+
+def intl_cases(api, store) -> dict:
+    """国际赛的几张小表 (golden/intl_cases.json), 给浏览器版逐条对账:
+
+      pregame_league  api.pregame_league —— 赛前/BP 后按哪个赛区算, null = 不给
+      known_for       api._known_for —— 映射队名用哪份已知队伍表 (四大按本赛区, 其余按并集)
+      map_team        esports_feed.map_team —— known 的三种形状: null (不校验)、[] (空表, 必须返回
+                      null)、"*" (并集) 或赛区名 (该赛区的表)
+      pregame_reason  api._pregame_reason —— 看板上"为什么没有赛前/BP 后"那几句 (四大、同母赛区、
+                      跨赛区、一队/两队不认识)
+      early           api._early_prediction —— 开局头 3 分钟的 prediction (note 结尾三选一、source
+                      可能为 null、同母赛区时的 warnings)。test:diff 只取终局帧, 碰不到这一段
+      board_warnings  api._board_warnings —— 局内阶段提醒的顺序, 以及故意不带赛前特征时去掉那句
+                      "没有可用的赛前队伍统计"
+    """
+    from esports_feed import TEAM_ALIASES, map_team
+    from feature_store import LEAGUES
+
+    k = {lg: store.known_teams(lg) for lg in LEAGUES}
+    few = next((t for t in sorted(store.team_history) if t not in store.known_teams(None)), None)
+    pairs = [(k["LCK"][0], k["LCK"][1]), (k["LPL"][1], k["LPL"][0]), (k["LEC"][0], k["LEC"][1]),
+             (k["LCS"][0], k["LCS"][1]),
+             (k["LCK"][0], k["LPL"][0]), (k["LEC"][0], k["LCS"][0]),       # 跨赛区
+             (k["LCK"][0], None), (None, None), ("GAM Esports", k["LCK"][0]),
+             ("GAM Esports", "RED Kalunga")]
+    if few:                                    # 在队伍史里、但场次不够进已知队伍表的
+        pairs.append((few, few))
+    leagues = ["LCK", "lck", "LPL", "LEC", "LCS", "Worlds", "WORLDS", "MSI", "First Stand",
+               "Esports World Cup", "DCGI", "LCK Challengers", "", None]
+    pg = [{"in": [b, r, lg], "out": api.pregame_league(store, b, r, lg)}
+          for b, r in pairs for lg in leagues]
+
+    kf = [{"in": lg, "out": api._known_for(lg)} for lg in leagues]
+
+    names = list(dict.fromkeys(
+        sorted(TEAM_ALIASES)[:4] + ["Cloud9 Kia", "Team Liquid Alienware", k["LCK"][0],
+                                    k["LCK"][0].upper(), k["LPL"][0].lower(), "GAM Esports",
+                                    "RED Kalunga", "TBD", "", None]))
+    specs = [None, [], "*", "LCK", "LPL", "LCS"]
+
+    def known_of(spec):
+        if spec is None or isinstance(spec, list):
+            return spec
+        return store.known_teams(None if spec == "*" else spec)
+
+    mt = [{"in": [n, spec], "out": map_team(n, known_of(spec))} for n in names for spec in specs]
+
+    # 看板上"为什么没有赛前/BP 后"那几句、开局头 3 分钟的 prediction、局内阶段的提醒顺序 ——
+    # test:diff 只取终局帧, 开局那一段 (too_early) 不在它的范围里, 这三张表逐条对账。
+    # 队伍形状: [lolesports 原名, 模型队名]; 模型队名为 None = 映射不出来
+    import esports_feed as EF
+    from ingame_service import NO_PRE_STATS
+    hb = lambda lg: k[lg][0]                    # noqa: E731
+    shapes = [
+        ([("A", hb("LCK")), ("B", k["LCK"][1])], "LCK"),
+        ([("A", hb("LCK")), ("B", k["LCK"][1])], "Worlds"),             # 同母赛区
+        ([("A", hb("LPL")), ("B", k["LPL"][1])], "Esports World Cup"),
+        ([("A", hb("LCK")), ("B", hb("LPL"))], "MSI"),                  # 跨赛区
+        ([("A", hb("LEC")), ("B", hb("LCS"))], "DCGI"),
+        ([("GAM Esports", None), ("B", hb("LCK"))], "DCGI"),            # 一队不认识
+        ([("RED Kalunga", None), ("NAVI", None)], "DCGI"),              # 两队都不认识
+        ([("TBD", None), ("TBD", None)], "LCK"),                        # 国内也可能映射不出来
+        ([("X", None), ("B", hb("LCK"))], "LCK"),
+        ([("A", hb("LCK"))], "LCK"),                                    # 不是两队
+    ]
+    reasons = []
+    for ts, lg in shapes:
+        m = EF.Match(match_id="x", league=lg, start_time="", state="unstarted", best_of=1,
+                     teams=[EF.TeamRef(api_name=a, code="", model_name=mn) for a, mn in ts])
+        api._pregame_of(m)
+        reasons.append({"in": [[{"api": a, "model": mn} for a, mn in ts], lg, m.pregame_league],
+                        "out": list(api._pregame_reason(m))})
+
+    kinds = list(dict.fromkeys((r["out"][0], r["out"][1]) for r in reasons))
+    early = [{"in": [mn, p1, p2, wk, why], "out": api._early_prediction(mn, p1, p2, wk, why)}
+             for wk, why in kinds for mn in (None, 0, 2)
+             for p1, p2 in ((None, None), (0.6123456789, None), (None, 0.4321), (0.6123456789, 0.4321))]
+    warns0 = [["本次没有经验差数据, 改用不含经验差的局内模型。", NO_PRE_STATS, "概率已经触到…"],
+              [NO_PRE_STATS], [], ["别的提醒"]]
+    bw = [{"in": [w, wk, why], "out": api._board_warnings(w, wk, why)}
+          for wk, why in kinds for w in warns0]
+    return {"pregame_league": pg, "known_for": kf, "map_team": mt,
+            "pregame_reason": reasons, "early": early, "board_warnings": bw}
+
+
 def stage1_cases(api, store) -> list[dict]:
     """POST /predict 的真实响应 —— 各赛区已知队伍两两对阵, 外加跨赛区、季后赛、不认识的队。"""
     from fastapi import HTTPException
@@ -418,8 +556,16 @@ def stage1_cases(api, store) -> list[dict]:
             for r in ks:
                 if b != r:
                     out.append(run(b, r, lg))
-    out.append(run(k["LCK"][0], k["LPL"][0], "LCK"))       # 国际赛: 跨赛区
+    out.append(run(k["LCK"][0], k["LPL"][0], "LCK"))       # 跨赛区的两队 (看板上国际赛跨赛区不给赛前)
     out.append(run(k["LEC"][0], k["LCS"][0], "LEC"))
+    # 国际赛同母赛区: 看板按 pregame_league (= 两队母赛区) 去问赛前, 即 Stage 1 拿到的 league
+    # 是母赛区, 不是赛事名。src 只是标注, 对账照常按 in / resp 比
+    for ev, hl in (("Worlds", "LCK"), ("MSI", "LPL"), ("Esports World Cup", "LEC")):
+        b, r = k[hl][2], k[hl][3]
+        lg = api.pregame_league(store, b, r, ev)
+        if lg != hl:
+            raise SystemExit(f"{b} / {r} 在 {ev} 上的 pregame_league 是 {lg}, 不是 {hl}")
+        out.append({**run(b, r, lg), "src": f"intl:{ev}→{lg}"})
     out.append(run(k["LPL"][0], k["LPL"][1], "LPL", True))  # 季后赛
     out.append(run(k["LCK"][1], k["LCK"][0], "LCK", True))
     out.append(run("Definitely Not A Team", k["LCK"][0], "LCK"))
@@ -440,7 +586,7 @@ def stage2_cases(api, store) -> dict:
     简称, 而这里只要两边拿到同样的输入)。另有一组合成用例专打别名英雄和认不出来的名字。
     """
     import os
-    from esports_feed import map_team, oe_player_name
+    from esports_feed import is_major, map_team, oe_player_name
 
     s2 = api.STATE["stages"]["post_draft"]
 
@@ -482,7 +628,7 @@ def stage2_cases(api, store) -> dict:
     for mp in sorted(COLLECTED.glob("*.meta.json")):
         meta = json.loads(mp.read_text(encoding="utf-8"))
         lg = meta.get("league")
-        if lg not in MAJORS:
+        if not is_major(lg):
             continue
         players = [{k: p.get(k) for k in ("summoner_name", "champion", "role", "side")}
                    for p in (meta.get("players") or {}).values()]
@@ -528,6 +674,16 @@ def stage2_cases(api, store) -> dict:
     ]
     for lg in MAJORS:
         cases.append(syn(f"赛区={lg}", league=lg))
+    # 国际赛同母赛区: 看板的 BP 后按 pregame_league (= 两队母赛区) 算, 英雄胜率查母赛区的表。
+    # in.league 就是传给 _predict_core 的那个 (母赛区); in.match_league 只是标注
+    for ev, hl in (("Worlds", "LCK"), ("Esports World Cup", "LPL")):
+        kk = store.known_teams(hl)
+        lg = api.pregame_league(store, kk[0], kk[1], ev)
+        if lg != hl:
+            raise SystemExit(f"{kk[0]} / {kk[1]} 在 {ev} 上的 pregame_league 是 {lg}, 不是 {hl}")
+        c = syn(f"国际赛同母赛区 {ev}→{lg}", blue=kk[0], red=kk[1], league=lg)
+        c["in"]["match_league"] = ev
+        cases.append(c)
 
     names = [["IGTheShy", ["IG", "AL"]], ["TH Hype", ["TH", "G2"]], ["T1Faker", ["T", "T1"]],
              ["Faker", ["IG", "AL"]], ["IG", ["IG"]], [None, ["IG"]], ["  IGRookie ", ["IG", None]],
@@ -583,7 +739,7 @@ def main():
                  and inp["red"] in store.team_history), None)
     if base is None:
         raise SystemExit("collected/ 里找不到一场阵容齐全、两队都认识的比赛当合成用例的底子")
-    syn = synthetic_inputs(base)
+    syn = synthetic_inputs(base) + intl_inputs(base, store)
 
     cache: dict = {}
     cases, n_resp = [], 0
@@ -614,6 +770,14 @@ def main():
     print(f"  stage2_cases.json  {n / 1024:>6,.0f} KB   {len(c2)} 局阵容, 其中 "
           f"{sum('p2' in c for c in c2)} 局算出 BP 后概率、{sum(not c['draft'] for c in c2)} 局凑不齐十人、"
           f"{sum('error' in c for c in c2)} 局预期报错")
+
+    gi = intl_cases(api, store)
+    n = _write(OUT_GOLD / "intl_cases.json", {"generated_at": _now(), "today": today, **gi})
+    print(f"  intl_cases.json    {n / 1024:>6,.0f} KB   pregame_league {len(gi['pregame_league'])} 条 "
+          f"(其中给赛前 {sum(c['out'] is not None for c in gi['pregame_league'])})  "
+          f"known_for {len(gi['known_for'])} 条  map_team {len(gi['map_team'])} 条  "
+          f"pregame_reason {len(gi['pregame_reason'])} 条  开局 {len(gi['early'])} 条  "
+          f"看板提醒 {len(gi['board_warnings'])} 条")
     print(f"完成, {time.time() - t0:.0f} 秒。下一步: npm --prefix frontend run test:golden")
 
 

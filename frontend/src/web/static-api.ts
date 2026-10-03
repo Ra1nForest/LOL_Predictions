@@ -19,7 +19,7 @@ import type {
   TimelinePoint,
 } from "../api/types.ts";
 import type { Models } from "./board.ts";
-import { buildBoard, fineTimeline, liveList, upcomingList } from "./board.ts";
+import { boardPlan, buildBoard, fineTimeline, liveList, upcomingList } from "./board.ts";
 import type { ExplainFile } from "./explain.ts";
 import { Feed } from "./feed.ts";
 import type { IngameModelFile } from "./ingame.ts";
@@ -136,9 +136,9 @@ export const staticApi = {
   async fine(board: BoardResponse, onPts: (pts: TimelinePoint[]) => void): Promise<void> {
     const lv = board.live;
     const m = board.match;
-    const blue = m?.teams[0]?.model_name;
-    const red = m?.teams[1]?.model_name;
-    if (!lv || !m || !blue || !red || !lv.frame_time) return;
+    // 队名、赛区、赛前口径和看板曲线同一个取法 (boardPlan): 队名映射不出来也画局内模型的线
+    const plan = m ? boardPlan(m.teams.map((t) => ({ api: t.name, model: t.model_name })), m.league, m.pregame_league) : null;
+    if (!lv || !m || !plan || !lv.frame_time) return;
     const gid = lv.game_id;
     const upto = Date.parse(lv.frame_time);
     const st = fineState.get(gid);
@@ -158,8 +158,16 @@ export const staticApi = {
         t,
         mo,
         localToday(),
-        // prior: 看板的 BP 后概率 —— 逐秒走势开局那段和头条同一个渐变
-        { gameId: gid, blue, red, league: m.league, upto, prior: board.prediction?.postdraft_probability_blue ?? null },
+        // prior: 看板的 BP 后概率 —— 逐秒走势开局那段和头条同一个渐变 (没有赛前口径时不渐变)
+        {
+          gameId: gid,
+          blue: plan.blue,
+          red: plan.red,
+          league: plan.league,
+          preLeague: plan.preLeague,
+          upto,
+          prior: board.prediction?.postdraft_probability_blue ?? null,
+        },
         (pts) => {
           all = pts as unknown as TimelinePoint[];
           if (!st) onPts(all);

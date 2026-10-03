@@ -16,10 +16,18 @@ export interface TeamsFile {
   roll_cols: string[];
   /** 这些列在赛前模型里还要算双方合计 (sum_X) */
   sum_feats: string[];
-  /** 模型队名 → {v: 各列滚动统计 (null = NaN), n: 历史场数, last: 最后一场日期} */
-  teams: Record<string, { v: (number | null)[]; n: number; last: string }>;
+  /**
+   * 模型队名 → {v: 各列滚动统计 (null = NaN), n: 历史场数, last: 最后一场日期,
+   * home: 母赛区 (FeatureStore.home_league) —— 国际赛判断两队是不是同一个赛区出来的}
+   */
+  teams: Record<string, { v: (number | null)[]; n: number; last: string; home: string | null }>;
   /** 赛区 → FeatureStore.known_teams(赛区) */
   known: Record<string, string[]>;
+  /**
+   * FeatureStore.known_teams(None) = 四大赛区的并集。国际赛映射队名用它 (board.ts 的 knownFor)。
+   * 由 Python 显式导出, 不在这边拼 known 的四张表 —— 免得两边对"并集"的理解不一样
+   */
+  known_all: string[];
   /** 赛区 → 该赛区数据截至哪天 (FeatureStore.league_last) */
   league_last: Record<string, string>;
   /** lolesports 队名 → 模型队名 (esports_feed.TEAM_ALIASES) */
@@ -45,8 +53,21 @@ export function snapshot(t: TeamsFile, name: string | null | undefined): Snapsho
   return { values, nGames: e.n, lastDate: e.last };
 }
 
+/**
+ * FeatureStore.known_teams(league): 该赛区场次够的队伍; 不认识的赛区 (含国际赛的赛事名、
+ * 小写的 "lck") 是空表。映射队名时别直接用它, 走 board.ts 的 knownFor —— 国际赛要用并集。
+ */
 export function knownTeams(t: TeamsFile, league: string): string[] {
   return own(t.known, league) ? t.known[league]! : [];
+}
+
+/**
+ * FeatureStore.home_league: 这支队的母赛区 (它在队伍表里最后一场所在的赛区); 不认识返回 null。
+ * 队伍表只装四大赛区, 所以结果只可能是四大之一。国际赛靠它判断两队是不是同一个赛区出来的。
+ */
+export function homeLeague(t: TeamsFile, name: string | null | undefined): string | null {
+  if (!name || !own(t.teams, name)) return null;
+  return t.teams[name]!.home ?? null;
 }
 
 /** esports_feed._norm: 小写后只留 a-z0-9 */
@@ -54,11 +75,22 @@ export function norm(s: string | null | undefined): string {
   return (s ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-/** esports_feed.map_team: API 队名 → 模型队名。映射不出来返回 null, 不猜。 */
+/**
+ * esports_feed.map_team: API 队名 → 模型队名。映射不出来返回 null, 不猜。
+ *
+ * known=null 表示"不校验" (别名照换, 其余原样返回); 给了 known —— **哪怕是空表** —— 结果就必须
+ * 落在 known 里, 别名也一样。早先这里写的是 `known && known.length > 0`, 空表于是直接落到最后
+ * 一行原样返回: 国际赛的队名 (按赛事名查到的已知队伍恒为空表) 不经任何校验就成了 model_name,
+ * 看板以为能预测。别名的目标不在 known 里同理 —— 会重新造出"可预测"的假象。
+ */
 export function mapTeam(t: TeamsFile, apiName: string | null | undefined, known: string[] | null): string | null {
   if (!apiName || apiName === "TBD") return null;
-  if (own(t.aliases, apiName)) return t.aliases[apiName]!;
-  if (known && known.length > 0) {
+  if (own(t.aliases, apiName)) {
+    const hit = t.aliases[apiName]!;
+    if (known !== null && !known.includes(hit)) return null;
+    return hit;
+  }
+  if (known !== null) {
     if (known.includes(apiName)) return apiName;
     const byNorm = new Map<string, string>();
     for (const k of known) byNorm.set(norm(k), k); // 同名归一化时后者覆盖前者, 和 dict 推导式一样

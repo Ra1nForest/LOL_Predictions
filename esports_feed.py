@@ -52,12 +52,38 @@ API_KEY = "0TvQnueqKa5mxJntVWt0w4LpLfEkrV1Ta8rQBb9Z"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")
 
+# 直播检测和赛程接口的赛区白名单: 四大赛区 + 国际赛。
+#
+# **键必须等于 lolesports 的 league.name.upper()** (getLeagues 实测: Worlds / MSI / First Stand /
+# DCGI / Esports World Cup)。live() 按 m.league.upper() in LEAGUE_IDS 过滤, 键写成 "WLDS" 或
+# "FIRSTSTAND" 不会报错, 只会把正在打的国际赛静默丢掉 —— 2026-10-03 DCGI 的 FlyQuest vs LGD 在
+# getLive 里是 inProgress, feed.live() 却返回 [] (那时表里只有四大)。
+# Match.league 保留上游原样的大小写 ("Worlds"), 只有查这张表时才 upper()。
+# 亚运会不收: 那是国家队, 队名在特征库里一个都对不上。
+# 浏览器版 frontend/src/web/feed.ts 的 LEAGUE_IDS 是同一张表, 同样的顺序。
 LEAGUE_IDS = {
     "LCK": "98767991310872058",
     "LPL": "98767991314006698",
     "LEC": "98767991302996019",
     "LCS": "98767991299243165",
+    # 国际赛 —— 赛前/BP 后怎么算见 api.pregame_league
+    "WORLDS": "98767975604431411",
+    "MSI": "98767991325878492",
+    "FIRST STAND": "113464388705111224",
+    "DCGI": "117126995932274206",
+    "ESPORTS WORLD CUP": "116838530616006090",
 }
+
+
+def is_major(league: Optional[str]) -> bool:
+    """这个赛区是不是四大赛区之一 (大小写无关)。全项目"四大 / 非四大"的判断只走这一处。
+
+    四大的名单是 feature_store.LEAGUES —— Stage 1/2 只在这四个赛区的内战上训练过, 特征库也只装了
+    它们。在函数里才 import: 本模块被 collect_live 这类每两分钟起一次的进程导入, 不该为一个
+    名单连带加载 pandas。浏览器版是 feed.ts 的 isMajor。
+    """
+    from feature_store import LEAGUES
+    return bool(league) and str(league).upper() in LEAGUES
 
 # ── 队名映射 ─────────────────────────────────────────────────────────
 # 由 API 实际返回的队名和 /teams 比对生成 (40 个里 18 个需要映射)。
@@ -73,6 +99,7 @@ TEAM_ALIASES = {
     "NONGSHIM RED FORCE": "Nongshim RedForce",
     "kt Rolster": "KT Rolster",
     # LPL
+    "AG.AL": "Anyone's Legend",                   # 电竞世界杯 2026 的赞助名; 按日期+对手和 OE 的 EWC 局核对过
     "BILIBILI GAMING": "Bilibili Gaming",
     "Beijing JDG Esports": "JD Gaming",          # 缩写, 规则推不出来
     "EDWARD GAMING": "EDward Gaming",
@@ -122,12 +149,23 @@ def _https(url: Optional[str]) -> Optional[str]:
 
 
 def map_team(api_name: str, known: Optional[list[str]] = None) -> Optional[str]:
-    """API 队名 -> 模型队名。映射不出来返回 None, 不猜。"""
+    """API 队名 -> 模型队名。映射不出来返回 None, 不猜。
+
+    known=None 表示"不校验" (别名照换, 其余原样返回); 给了 known —— **哪怕是空表** —— 结果就必须
+    落在 known 里, 别名也一样。早先这里写的是 `if known:`, 空表是假值, 于是直接落到最后一行
+    原样返回: 国际赛的队名 (known_teams("Worlds") 恒为 []) 不经任何校验就成了 model_name,
+    看板以为能预测, 错误要到 make_row 深处才抛出来又被吞掉 (实测 map_team("GAM Esports", [])
+    返回 "GAM Esports")。别名的目标不在 known 里同理: 给不在特征库里的队加别名, 会重新造出
+    "可预测"的假象。浏览器版是 web/teams.ts 的 mapTeam。
+    """
     if not api_name or api_name == "TBD":
         return None
     if api_name in TEAM_ALIASES:
-        return TEAM_ALIASES[api_name]
-    if known:
+        hit = TEAM_ALIASES[api_name]
+        if known is not None and hit not in known:
+            return None
+        return hit
+    if known is not None:
         if api_name in known:
             return api_name
         by_norm = {_norm(k): k for k in known}
@@ -161,9 +199,14 @@ class Match:
     best_of: Optional[int]
     teams: list[TeamRef] = field(default_factory=list)
     between_games: bool = False       # 系列赛进行中, 但此刻没有一局有帧
+    # 赛前 / BP 后 (Stage 1/2) 按哪个赛区的口径算; None = 这场不给赛前和 BP 后。
+    # 要查特征库才定得下来 (两队的母赛区), 本模块没有特征库, 由 api.pregame_league 填。
+    pregame_league: Optional[str] = None
 
     @property
     def predictable(self) -> bool:
+        """两队都映射得出模型队名。**不等于"有赛前预测"** —— 跨赛区的国际赛两队都认识,
+        但赛前和 BP 后不给, 那由 pregame_league 决定。"""
         return len(self.teams) == 2 and all(t.usable for t in self.teams)
 
 
@@ -381,7 +424,7 @@ class EsportsFeed:
     def schedule(self, league: str, known: Optional[list[str]] = None,
                  league_id: Optional[str] = None) -> list[Match]:
         """league_id 显式给出时不查 LEAGUE_IDS —— 回填要扫二十多个次级联赛,
-        而 LEAGUE_IDS 只有四大赛区 (它同时决定直播检测的范围, 不该为回填加宽)。"""
+        而 LEAGUE_IDS 只有四大赛区和国际赛 (它同时决定直播检测的范围, 不该为回填加宽)。"""
         lid = league_id or LEAGUE_IDS.get(league.upper())
         if not lid:
             raise FeedError(f"未知赛区 {league}")

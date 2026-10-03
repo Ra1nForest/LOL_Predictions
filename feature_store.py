@@ -197,7 +197,21 @@ class FeatureStore:
         wr = float(np.mean(p)) if len(p) >= 3 else np.nan
         return wr, len(p)
 
+    def home_league(self, team: str) -> str | None:
+        """这支队的母赛区 = 它在特征库里最后一场比赛所在的赛区; 不认识返回 None。
+
+        特征库只装四大赛区 (from_csv 按 LEAGUES 过滤), 所以结果只可能是四大之一 —— 国际赛的
+        场次根本不在库里, 不会把"最后一场"带偏。known_teams(league) 用的是同一个口径。
+        国际赛靠它判断两队是不是同一个赛区出来的, 见 api.pregame_league。
+        """
+        t = self.team_history.get(team)
+        if t is None or t.empty:
+            return None
+        return str(t["league"].iloc[-1])
+
     def known_teams(self, league: str | None = None) -> list[str]:
+        """场次够 (>= 3) 的队伍。league=None 是四大赛区的并集 —— 国际赛映射队名时用它
+        (按赛事名去查恒为空表, 见 esports_feed.map_team)。"""
         out = []
         for tm, t in self.team_history.items():
             if league and t["league"].iloc[-1] != league:
