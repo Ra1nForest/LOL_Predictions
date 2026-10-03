@@ -16,7 +16,7 @@
  *   node scripts/diff-board.mjs --days 7 --per 4
  */
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -36,6 +36,12 @@ const arg = (k, d) => {
 const DAYS = arg("--days", 4);
 const PER = arg("--per", 3);
 const ORACLE = join(here, "..", "..", "tools", "board_oracle.py");
+// 标准答案必须用项目 venv 的 Python 算: 计划任务和 export_web_model.py 都跑在它上面。
+// 本机裸 `python` 是另一个系统解释器, XGBoost 版本不同 (3.3.0 对 3.4.1), 拿它当标准答案,
+// 比的就不是线上那套了。没有 venv 的机器 (比如别人刚克隆) 才退回 PATH 上的 python。
+const VENV_PY = ["Scripts/python.exe", "bin/python"].map((p) => join(here, "..", "..", ".venv", p)).find(existsSync);
+const PY = VENV_PY ?? "python";
+if (!VENV_PY) console.warn("找不到 .venv, 标准答案改用 PATH 上的 python —— XGBoost 版本可能和线上不同");
 
 const teams = read("../public/web/teams.json");
 const models = {
@@ -103,7 +109,7 @@ console.log("浏览器版和全新 Python 进程同时开算 (Python 要先加�
 
 // ── 两边同时算 ──
 const oracleP = promisify(execFile)(
-  "python",
+  PY,
   [ORACLE, ...targets.map((x) => `${x.m.match_id}:${x.g.id}`), "--lists"],
   { encoding: "utf8", maxBuffer: 512 * 1024 * 1024, env: { ...process.env, PYTHONIOENCODING: "utf-8" } },
 );

@@ -8,12 +8,19 @@ operational and structural things that are spread across several files.
 
 ## Commands
 
+Use the project venv: `.venv\Scripts\python.exe` (the scheduled tasks run it via `sys.executable`).
+A bare `python` on this machine is a separate system Python 3.13 with a **different XGBoost**
+(3.3.0 vs the venv's 3.4.1) — models trained or golden cases exported with it will not match what
+the tasks produce. `frontend/scripts/diff-board.mjs` resolves `.venv` itself for the oracle and
+falls back to bare `python` (with a warning) only when there is no venv.
+
 ```bash
 pip install -r requirements.txt
 
 python fetch_data.py --years 2025 2026     # refresh season CSVs from Oracle's Elixir (Drive)
 python fetch_data.py --list                # list remote files without downloading
 python fetch_data.py --auth                # one-time OAuth, needed because the anon quota is shared
+python fetch_data.py --auth --force        # re-auth; the token dies every 7 days while the Cloud app is in Testing
 
 python train.py                            # Stage 1 + 2  -> artifacts/model_{pre,post}_draft.json
 python ingame_train.py                     # Stage 4      -> artifacts/model_ingame{,_live}.json
@@ -21,8 +28,8 @@ python ingame_train.py                     # Stage 4      -> artifacts/model_ing
 uvicorn api:app --reload --port 8000       # UI at /, OpenAPI at /docs
 ```
 
-Tests — stdlib `unittest`, no pytest, no extra dependency (deliberate; even the front end has no
-build step). They run in ~8s and need neither network nor API keys; the debate tests stub the LLM.
+Tests — stdlib `unittest`, no pytest, no extra dependency (deliberate). They run in ~9s and
+need neither network nor API keys; the debate tests stub the LLM.
 
 ```bash
 python -m unittest discover -s tests -v
@@ -55,6 +62,10 @@ after a successful model swap; the outcome lands in `update_status.json` → `we
 `/health`. It only ever commits `frontend/public/web/`, and refuses to push if any other local
 commit is unpushed or the remote is ahead — it is an unattended push to a public repo.
 
+CI runs only `build:pages` (the CSS-variable check + `tsc`). **`test:golden` and `test:diff` never
+run in CI** — the training data is not in the repo, so CI cannot export the golden cases. A push
+that changes `frontend/src/web/` deploys without either check, so run both locally first.
+
 One class or one test (test method names are Chinese, so `-k` on the class is usually easier):
 
 ```bash
@@ -67,6 +78,7 @@ Research gates and ad-hoc tools are run from the project root, never from inside
 python research/gate_league_mix.py --folds 5 --seeds 3
 python research/harness.py
 python tools/debate_dryrun.py --dump       # exercises the whole Stage 3 protocol with stubs, no key
+node research/gate_smoothing.mjs           # gates for display-only changes import frontend/src/web/*.ts directly
 ```
 
 Unattended pipeline (what the local Windows scheduled tasks run — see Deployment):
@@ -103,7 +115,7 @@ also what gets deployed — `research/`, `tools/`, `attic/` are not needed at ru
   `coef`/`intercept` purely so an older service build can still load it. `IngameModel.calibrate()`
   falls back to Platt when `calibrator` is absent, so code and artifacts can be rolled out
   separately.
-- **`api.py`** is the whole HTTP surface (~1300 lines, all routes in one file). Models, the feature
+- **`api.py`** is the whole HTTP surface (~1500 lines, all routes in one file). Models, the feature
   store, the session store, and the esports feed are built once in the `lifespan` handler and live
   in the module-level `STATE` dict. Inference is `_predict_core` / `_ingame_core`; the routes are
   thin wrappers over those two.
@@ -207,7 +219,9 @@ guards. If one goes red, work out whether that trap is back before changing the 
   made from the final frame (p = 0.01 / 0.99) into `predictions/log.jsonl` — the file used to
   score the model. A diff run against the live service wrote four such rows on 2026-09-12
   (removed; backup `log.jsonl.bak-before-cleanup-*`). `tools/board_oracle.py` replaces
-  `log_prediction` with a no-op for exactly this reason.
+  `log_prediction` with a no-op for exactly this reason. The unattended writer is
+  `collect_live.log_predictions`, which requests `/esports/board/{id}?curves=false` **only for
+  matches with an `in_game` game** — any new caller of the board needs the same guard.
 - **`daily_update.run()` forces `PYTHONIOENCODING=utf-8` on its children.** On Chinese Windows a
   piped child writes GBK; read back as UTF-8, `fetch_data.py`'s "已更新" never matched, so every
   local run from 2026-09-04 reported "数据没有变化" and never retrained — and every run logged
@@ -232,6 +246,15 @@ guards. If one goes red, work out whether that trap is back before changing the 
   adopted for continuity, not accuracy (`research/gate_anchor.py`: t = +0.83, never worse; the
   minute-3 jump fell from 14.3 to 0.1 points). Change it in both implementations — `test:diff`
   catches a mismatch.
+- **Collected winners are provisional until Oracle's Elixir confirms them.** `collect_live.py`
+  infers a game's winner from the series-score increment, which in LPL once credited one point to
+  two games. `oe_correct()` overwrites collected labels with OE results every 6 h
+  (`source="oe"`, the old value kept in `was`). Do not train on collected labels that skip it.
+- **Do not smooth the win-probability curve over time.** A trailing average removes the
+  per-second chatter (XGBoost is piecewise-constant in golddiff, plus slice switches at
+  12.5/17.5/22.5 min) but lags exactly when the game is being decided: Brier `t = -13.25` over 150
+  held-out games (`research/gate_smoothing.mjs`). Any de-chattering has to happen in feature space
+  (e.g. averaging over a golddiff neighbourhood) and pass the same gate.
 - **A failed start calibration is not a result.** `_game_start` (and `gameStart` in
   `frontend/src/web/feed.ts`) retries every `START_RETRY_SEC` until the calibration windows have
   settled; only then does it accept `frames[0]`. Caching the first-sight failure put every live
@@ -248,7 +271,8 @@ guards. If one goes red, work out whether that trap is back before changing the 
 - `LOL_ARTIFACTS` redirects training output; `daily_update.py` uses it to train into
   `artifacts_staging/` without touching what is live. Other env vars: `NVIDIA_API_KEY` (Stage 3),
   `TAVILY_API_KEY` / `BRAVE_API_KEY` / `SERPER_API_KEY` (retrieval), `DEBATE_KEY` (gates `/debate`
-  behind an `X-Debate-Key` header), `LOL_STALE_DAYS`, `LOL_PRED_LOG`. See
+  behind an `X-Debate-Key` header), `LOL_STALE_DAYS`, `LOL_PRED_LOG`, `LOL_API` (where
+  `collect_live.py` reaches the API, default `http://127.0.0.1:8000`). See
   `deploy/service.env.example`.
 - `agent_config.json` is generated by `research/screen_agents.py` and its keys are the Chinese role
   names (`协调者` / `补充者` / `验证者` / `质疑者`). It overrides `_DEFAULTS` in `debate.py`, and the
@@ -299,8 +323,7 @@ service). Note that systemd unit files do not support trailing comments.
 
 `lol-predict` binds **127.0.0.1**, not the public interface — `/esports/board` fans out to upstream
 with the shared lolesports key, and getting that key rate-limited kills the data source. Reach it
-over an SSH tunnel or an authenticated reverse proxy. README's "Exposure" section describes the
-earlier public-port setup and is stale on this point.
+over an SSH tunnel or an authenticated reverse proxy.
 
 Neither machine's data is authoritative by default: the server's OAuth token once died for ten days
 (2026-08-31 → 09-09) while the local copy kept updating. Check `/health` → `data_through` and the
