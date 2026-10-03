@@ -18,10 +18,11 @@
  */
 import type { BoardResponse, Player as PlayerJson, Prediction, TimelinePoint } from "../api/types.ts";
 import type { Models } from "./board.ts";
-import { boardPlan, boardWarnings, lanesOf } from "./board.ts";
+import { boardPlan, boardWarnings, lanesOf, planXrOf } from "./board.ts";
 import type { Feed } from "./feed.ts";
 import { DDRAGON, teamObjectives } from "./feed.ts";
 import { ingameResponse } from "./ingame.ts";
+import { pyRound } from "./pyfmt.ts";
 import type { TeamsFile } from "./teams.ts";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -269,12 +270,14 @@ export function liveView(board: BoardResponse, pf: PlayFrame, ctx: ViewCtx): Boa
   }
 
   // 队名、赛区、赛前口径和看板头条同一个取法 (boardPlan): 队名映射不出来时原名只当标签,
-  // 没有赛前口径 (跨赛区 / 队名不认识) 就不带赛前特征、不渐变, 并且照头条把原因放在提醒第一条
+  // 没有赛前口径 (跨赛区 / 队名不认识) 就不带赛前特征、不渐变, 并且照头条把原因放在提醒第一条。
+  // 看板带着跨赛区模型 C 的数 (board.xregion) 时: 同样不带赛前特征, 但开局那段从 C 渐变, 同头条
   const m = board.match;
   const plan = boardPlan(
     m.teams.map((t) => ({ api: t.name, model: t.model_name })),
     m.league,
     m.pregame_league,
+    planXrOf(board),
   );
   if (!plan) return { ...board, live };
   const champs = (side: string) => players.filter((p) => p.side === side && p.champion).map((p) => p.champion!);
@@ -303,9 +306,16 @@ export function liveView(board: BoardResponse, pf: PlayFrame, ctx: ViewCtx): Boa
     plan.preLeague !== null
       ? // 同看板头条: 开局那段从 BP 后渐变过渡到局内模型
         { ...base, blend: true, blendWith: pr.postdraft_probability_blue ?? null, preLeague: plan.preLeague }
-      : { ...base, includePregame: false },
+      : plan.xr !== null
+        ? // 同看板头条: 跨赛区模型 C 当锚
+          { ...base, includePregame: false, blend: true, blendWith: plan.xr }
+        : { ...base, includePregame: false },
     ctx.today,
   );
+  if (plan.preLeague === null && plan.xr !== null) {
+    raw.pregame_probability_blue = pyRound(plan.xr, 4);
+    raw.pregame_source = "xregion";
+  }
   // 同看板头条: 原因放第一条, 故意不带赛前特征时去掉"没有可用的赛前队伍统计"
   raw.warnings = boardWarnings(raw.warnings as string[], plan.whyKind, plan.why);
   const res = raw as unknown as Prediction;

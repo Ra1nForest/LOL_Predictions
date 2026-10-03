@@ -29,6 +29,7 @@ from ingame_service import IngameModel, SessionStore, NO_PRE_STATS
 import websearch as WS
 import explain as EX
 import esports_feed as EF
+import xregion as XR
 from prediction_log import log_prediction
 
 _ROOT = Path(__file__).parent
@@ -98,9 +99,33 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         STATE["ingame"] = STATE["ingame_live"] = None
         print(f"  ingame model 未加载 ({type(e).__name__}) — 先跑 ingame_train.py")
+    _load_xregion()
     print("  ready")
     yield
     STATE.clear()
+
+
+def _load_xregion():
+    """跨赛区模型 C 的导出状态 (artifacts/xregion.json, 日更和其他模型一起生成、一起换)。
+
+    读不到或过不了 sanity_check 就是 None: 跨赛区看板保持原来的行为 (不给赛前数), 不拿一个坏状态出数。
+    """
+    STATE["xregion"] = STATE["xregion_known"] = None
+    p = ART / "xregion.json"
+    try:
+        st = XR.load_state(p)
+        bad = XR.sanity_check(st)
+        if bad:
+            print(f"  xregion 状态没过健全性检查, 跨赛区不给赛前数: {bad[:3]}")
+            return None
+    except Exception as e:
+        print(f"  xregion 状态未加载 ({type(e).__name__}: {e}) — 跑 python xregion.py --build")
+        return None
+    STATE["xregion"] = st
+    # 映射队名用的已知表: C 状态里的全部 OE 队名 (包括四大之外的)。Stage 1/2 的映射仍走 _known_for
+    STATE["xregion_known"] = sorted(st["teams"])
+    print(f"  xregion: OE 截至 {st['oe_asof']}, {len(st['teams'])} 队")
+    return st
 
 
 app = FastAPI(title="LoL Match Prediction", version="1.0", lifespan=lifespan)
@@ -195,10 +220,13 @@ def health():
     except Exception as e:
         upd = {"level": "unknown", "message": f"读取日更留档失败: {type(e).__name__}: {e}"}
 
+    xs = STATE.get("xregion")
     return {"status": "ok" if st else "loading",
             "stages": {k: v.metrics for k, v in st.items()},
             "data_through": str(store.last_date.date()) if store else None,
             "data_freshness": fresh,
+            # 跨赛区模型 C 的状态: null = 没加载, 跨赛区看板不给赛前数
+            "xregion": ({"oe_asof": xs.get("oe_asof"), "built_at": xs.get("built_at")} if xs else None),
             "update": upd}
 
 
@@ -283,6 +311,32 @@ def _pregame_of(m):
 _CROSS_REGION_NOTE = ("跨赛区对阵: 赛前和 BP 后模型只在赛区内战上验证过, 在历史跨赛区国际赛上没有预测力, "
                       "这里不显示; 开局 3 分钟起直接用局内模型")
 
+# 跨赛区模型 C 出数时, 上面那句换成这句 (why_kind = "xregion")。数字来自 research/gate_cross_region.py 的
+# HOLDOUT (2025-01 起 450 局): 准确率约 65%, 给 0.8-0.9 的局实际只赢约 76% —— 冻结的参数不变, 这两个数就不变;
+# 重新过闸要回来改这句。浏览器版 board.ts 一字不差, i18n.ts 有对应的英文模板。
+_XREGION_NOTE = ("跨赛区对阵: 赛前数字来自跨赛区模型 (只看两队和所在赛区的历史战绩, 不看英雄), "
+                 "历史上准确率约 65%, 而且偏自信 —— 它说 85% 的局实际约赢 76%")
+
+
+def _xregion_note(no_history) -> str:
+    """C 的那句说明; 母赛区在导出的状态里没有跨赛区国际赛记录 (偏移全靠先验) 的, 点名补一句。纯函数。"""
+    s = _XREGION_NOTE
+    if no_history:
+        s += f"; {' 和 '.join(no_history)} 此前没有跨赛区国际赛记录, 这个数主要靠先验"
+    return s
+
+
+def _xregion_pregame(p, why):
+    """这一局还没有帧 (没开打) 时看板的 prediction: 只有 C 的赛前数。
+
+    原来这时看板不给 prediction, 前端自己拿 Stage 1 去问 /predict —— 跨赛区的比赛 pregame_league 为 null,
+    它就什么都不显示。C 的数要重放本赛事的赛程才算得出来, 只能由看板带回去。没有 BP 后那条线: 加英雄胜率的
+    候选 D 在 HOLDOUT 上没过闸 (见 xregion.py)。浏览器版是 board.ts 的 xregionPregame。
+    """
+    return {"too_early": False, "minute": None, "pregame_probability_blue": p,
+            "postdraft_probability_blue": None, "probability_blue": p, "source": "xregion",
+            "warnings": [why]}
+
 
 def _pregame_reason(m):
     """(kind, 一句话) 或 (None, None)。kind:
@@ -313,9 +367,10 @@ def _board_warnings(warns, why_kind, why):
     重复。这两种情况下按原文去掉那一句。只在看板这一层做: /predict/ingame 的响应和 test:golden
     的局内用例都不受影响。头条和直播回放 (web/player.ts) 共用; 浏览器版是 board.ts 的 boardWarnings,
     由 test:golden 的 intl_cases 对账。
+    跨赛区模型 C 出数时 (xregion) 同样不带赛前特征 (局内模型只拿 C 的数当开局渐变的锚), 也去掉那一句。
     """
     out = list(warns)
-    if why_kind in ("unmapped", "cross_region"):
+    if why_kind in ("unmapped", "cross_region", "xregion"):
         out = [w for w in out if w != NO_PRE_STATS]
     if why:
         out.insert(0, why)
@@ -328,6 +383,8 @@ def _early_prediction(minute, p1, p2, why_kind, why):
     单独拿出来是为了对账: test:diff 只取已完赛的终局帧 (分钟数一定 >= 3), 这一段从来不在它的
     范围里; 抽成纯函数后 test:golden 的 intl_cases 逐条比对 note / source / warnings。
     浏览器版是 board.ts 的 earlyPrediction。
+    why_kind = "xregion" (跨赛区模型 C 出数): p1 是 C 的赛前数, source 写 "xregion", 那句说明放进 warnings
+    (和同母赛区一样 —— note 说的是"显示的是赛前概率", 口径由 warnings 交代)。
     """
     head = ((f"开局第 {minute} 分钟, " if minute is not None
              else "刚开局 (局内时间还没同步出来), ")
@@ -347,10 +404,10 @@ def _early_prediction(minute, p1, p2, why_kind, why):
         "postdraft_probability_blue": p2,
         "probability_blue": p2 if p2 is not None else p1,
         "source": ("post_draft" if p2 is not None
-                   else "pre_draft" if p1 is not None else None),
+                   else ("xregion" if why_kind == "xregion" else "pre_draft") if p1 is not None else None),
         "note": head + tail,
     }
-    if why_kind == "intl_home":
+    if why_kind in ("intl_home", "xregion"):
         out["warnings"] = [why]
     return out
 
@@ -709,6 +766,142 @@ def _playable_games(games: list[dict], framed: dict) -> list[dict]:
             or g.get("id") in framed]
 
 
+# ══════════════════════════════════════════════════════════
+#  跨赛区模型 C (xregion.py) 在看板上的那一段
+#
+#  只在"非四大赛区、pregame_league 为 null (跨赛区, 或有队不在四大)"的看板上用; 国内看板和同母赛区的国际赛
+#  看板一个字节都不变 (连上游请求都不多发)。闸门只认赛事内在线更新的版本, 所以必须重放本赛事 OE 还没收录的
+#  已完成局 —— 赛程取不到就不给 C, 不退回"只用 OE"的那个没过闸的版本。重放的规则全在 xregion.board_predict
+#  (纯函数), 这里只取数。浏览器版是 board.ts 的 xregionBoard, test:diff 对整块看板逐字段对账。
+# ══════════════════════════════════════════════════════════
+
+def _xregion_series(feed, minfo, xknown):
+    """本赛事 (同一个 lolesports tournament) 已完赛的系列赛 + 当前系列赛 → xregion.board_predict 的输入。
+
+    赛程取不到 (tournament 定不下来、getCompletedEvents / getEventDetails 没有数据) 返回 None。
+    别的系列赛: 队名、比分取 getCompletedEvents; 当前系列赛: 队序和比分取 getEventDetails (20 秒缓存, 和页面
+    顶上的比分同一份), 队名取赛程那一份 (minfo) —— getEventDetails 有时把队名写成全大写, 别名表是按赛程的
+    写法收的 ("Beijing JDG Esports" 的全大写版本就映射不到 JD Gaming)。
+    """
+    tid = feed.event_tournament(minfo.match_id) or feed.league_tournament(minfo.league, minfo.start_time)
+    if not tid:
+        return None
+    evs = feed.completed_events(tid)
+    det = feed.match_detail(minfo.match_id)
+    if evs is None or det is None or len(det["teams"]) != 2 or not minfo.start_time:
+        return None
+    series = []
+    for e in evs:
+        m = e.get("match") or {}
+        ts = m.get("teams") or []
+        if not m.get("id") or str(m["id"]) == str(minfo.match_id) or len(ts) != 2 or not e.get("startTime"):
+            continue
+        series.append({"match_id": str(m["id"]), "start": e["startTime"],
+                       "best_of": (m.get("strategy") or {}).get("count"),
+                       "teams": [{"name": t.get("name"), "code": t.get("code"),
+                                  "oe": EF.map_team(t.get("name"), xknown),
+                                  "wins": int((t.get("result") or {}).get("gameWins") or 0), "id": None}
+                                 for t in ts]})
+    names = {}
+    for t in minfo.teams:
+        for k in (t.code, t.api_name):
+            if k:
+                names[EF._norm(k)] = t.api_name
+    cur = []
+    for t in det["teams"]:
+        nm = names.get(EF._norm(t["name"])) or names.get(EF._norm(t["code"])) or t["name"]
+        cur.append({"name": nm, "code": t["code"], "oe": EF.map_team(nm, xknown),
+                    "wins": int(t["wins"] or 0), "id": t["id"]})
+    series.append({"match_id": str(minfo.match_id), "start": minfo.start_time, "best_of": minfo.best_of,
+                   "teams": cur})
+    return series
+
+
+def _xregion_frames(feed, series, need, current_id):
+    """把 replay_frames_needed 列出的终局帧取好, 填进 series[*]["frames"]["<局号>"]。
+
+    别的系列赛先取一次局号 → gameId、队伍 id (feed.match_ids: 照常的 20 秒缓存, id 齐了另记一份, 以后不再请求 ——
+    不能把共用的 getEventDetails 按一小时缓存, 见 match_ids); 当前系列赛用 match_detail (和页面顶上的比分同一份)。
+    任何一步取不到就记 None —— 那个系列赛在 decode_series 里整体退回交替序, 不让一个请求失败拖掉整块看板的 C。
+    """
+    by = {s["match_id"]: s for s in series}
+    gids: dict = {}
+    for mid, i in need:
+        s = by[mid]
+        if mid not in gids:
+            gids[mid] = {}
+            try:
+                det = feed.match_detail(mid) if mid == current_id else feed.match_ids(mid)
+            except Exception as e:
+                _warn(f"跨赛区模型取 {mid} 的对局详情失败, 这个系列赛按交替序", e)
+                det = None
+            if det:
+                for t in s["teams"]:
+                    if t.get("id"):
+                        continue
+                    hit = next((d for d in det["teams"]
+                                if EF._norm(d["name"]) == EF._norm(t["name"])
+                                or (d["code"] and EF._norm(d["code"]) == EF._norm(t.get("code")))), None)
+                    t["id"] = hit["id"] if hit else None
+                gids[mid] = {int(g["number"]): g["id"] for g in det["games"] if g.get("number") and g.get("id")}
+        fr = None
+        gid = gids[mid].get(i)
+        if gid:
+            try:
+                fr = feed.final_frame(gid)
+            except Exception as e:
+                _warn(f"跨赛区模型取 {gid} 的终局帧失败, 这个系列赛按交替序", e)
+        s.setdefault("frames", {})[str(i)] = fr
+
+
+def _xregion_board(feed, minfo, chosen, sides_known):
+    """这块看板上跨赛区模型 C 的赛前数, 或 None (= 保持原来的行为和原来的每一句话)。
+
+    调用方已判断: 非四大赛区、pregame_league 为 null、两队。这里再要求: 状态已加载、这个赛区键有系数、两队都能
+    映射成 C 状态里的队名 (map_team 的 known = 状态里的全部队名)、本赛事赛程取得到、两队母赛区都查得到且不同、
+    当前系列赛的比分跟得上局号 (withheld, 见 xregion 看板那一段)。
+    局号: 选中的那一局; 还没有选中的局 (没开打) 就是比分之和 + 1。蓝红按 minfo.teams 的顺序 —— 有帧时已经按
+    本局选边排过 (sides_known); 没帧时那只是赛程顺序, 不是选边, 给两种选边的平均 (xregion.board_predict)。
+    返回 {"p", "why", "public"}: public 原样放进看板响应的 "xregion"。
+    """
+    state = STATE.get("xregion")
+    if not state:
+        return None
+    key = str(minfo.league).upper()
+    if key not in state["coefficients"]:
+        return None
+    xknown = STATE.get("xregion_known") or sorted(state["teams"])
+    blue = EF.map_team(minfo.teams[0].api_name, xknown)
+    red = EF.map_team(minfo.teams[1].api_name, xknown)
+    if not blue or not red:
+        return None
+    try:
+        series = _xregion_series(feed, minfo, xknown)
+        if series is None:
+            print(f"  跨赛区模型: 取不到 {minfo.match_id} 所在赛事的赛程, 这场不给 C", flush=True)
+            return None
+        cur = series[-1]
+        number = int(chosen["number"]) if chosen and chosen.get("number") else sum(XR.series_wins(cur)) + 1
+        al = EF.TEAM_ALIASES
+        _xregion_frames(feed, series, XR.replay_frames_needed(state, series, minfo.match_id, number, al),
+                        minfo.match_id)
+        res = XR.board_predict(state, key, blue, red, series, minfo.match_id, number, al, sides_known)
+    except Exception as e:
+        _warn("跨赛区模型重放失败, 这场不给 C", e)
+        return None
+    if res["withheld"] == "score_lag":
+        print(f"  跨赛区模型: {minfo.match_id} 第 {number} 局开打了, 比分还没算上前一局, 这次不给 C", flush=True)
+    p = res["probability_blue"]
+    if p is None:
+        return None
+    return {"p": p, "why": _xregion_note(res["no_history"]),
+            "public": {"probability_blue": p, "game_number": number, "blue": blue, "red": red,
+                       "home_blue": res["home_blue"], "home_red": res["home_red"],
+                       "no_history": res["no_history"], "side_neutral": res["side_neutral"],
+                       "replayed": res["replayed"], "updated": res["updated"], "deduped": res["deduped"],
+                       "oe_asof": state["oe_asof"]}}
+
+
 @app.get("/esports/board/{match_id}")
 def esports_board(match_id: str, game_id: Optional[str] = None,
                   curves: bool = True, points: int = 60):
@@ -883,7 +1076,19 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
         "timeline": [],
         "note": ("以帧里的 gameState 为准, persisted_state 会滞后。"),
     }
+    # 跨赛区模型 C (见 _xregion_board): 只看非四大赛区、pregame_league 为 null 的两队对阵。算得出来才多一个
+    # "xregion" 键; 国内和同母赛区的看板根本不进这个分支 (也不多发任何上游请求)。
+    xr = None
+    if (minfo is not None and len(minfo.teams) == 2 and not EF.is_major(minfo.league)
+            and _pregame_of(minfo) is None):
+        # 有帧 = 左右已按本局的帧排成蓝 / 红; 没帧时只是赛程顺序 (C 改给两种选边的平均)
+        xr = _xregion_board(feed, minfo, chosen, bool(chosen and st))
+        if xr is not None:
+            out["xregion"] = xr["public"]
     if not chosen or not st:
+        # 还没有帧: 原来这里不给 prediction (前端自己拿 Stage 1 问 /predict); C 的数只有看板算得出来
+        if xr is not None:
+            out["prediction"] = _xregion_pregame(xr["p"], xr["why"])
         return out
 
     out["live"] = {
@@ -945,6 +1150,8 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
     #            四大赛区里 pregame_league 就是比赛赛区, 所以 use_pre == predictable, 国内看板不变。
     # 国际赛的 Stage 4 仍拿**比赛本身**的赛区 (minfo.league): is_* 全 0, 和训练时国际赛的编码一样;
     # 只有赛前特征 (pre_league) 按两队的母赛区算。
+    #   xr       (上面算过) 跨赛区模型 C 的赛前数: use_pre 不成立的国际赛上才可能有。有它时赛前 = C、开局
+    #            3-15 分钟以 C 为锚渐变, 局内模型照旧不带赛前特征; 没有 BP 后 (候选 D 没过闸)。
     two = bool(minfo) and len(minfo.teams) == 2
     pg_lg = _pregame_of(minfo) if minfo else None
     use_pre = two and minfo.predictable and pg_lg is not None
@@ -953,11 +1160,16 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
         bl = minfo.teams[0].model_name or minfo.teams[0].api_name
         rl = minfo.teams[1].model_name or minfo.teams[1].api_name
     why_kind, why = _pregame_reason(minfo) if two else (None, None)
+    # C 出数时 (xr) 原来那句"跨赛区不显示 / 不在四大赛区的数据里"换成 C 的说明; 算不出 C 就一字不改
+    if xr is not None:
+        why_kind, why = "xregion", xr["why"]
     if st.minute is None or st.minute < MIN_MINUTE:
         # 局内模型给不了不等于没有概率可给 —— 赛前和 BP 后这两段一直有效,
         # 而且开局几分钟局势本来就接近它们。之前这里直接不给数, 界面上就成了
         # "前十分钟不预测", 那是把能给的也藏了。
         p1 = p2 = None
+        if xr is not None:
+            p1 = xr["p"]             # 跨赛区: 赛前就是 C 的数, 没有 BP 后 (候选 D 没过闸)
         if use_pre:
             try:
                 _row, p1, _w = _pre_context(bl, rl, pg_lg)
@@ -973,8 +1185,9 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
         out["prediction"] = _early_prediction(st.minute, p1, p2, why_kind, why)
         # 留档: 赛前/BP 后的概率整局不变, minute=None 让它每局只记一次。
         # 有队名映射不出来就不记 —— 留档里的队名要拿去和 OE 配胜负 (prediction_log.resolve),
-        # lolesports 原名永远配不上, 记了也是一条永远没有结果的行。两段都没算出来 (跨赛区本来就
-        # 不算) 也不调: 没有数可记, source 也和响应里的 null 对不上。
+        # lolesports 原名永远配不上, 记了也是一条永远没有结果的行。两段都没算出来 (跨赛区算不出 C 时)
+        # 也不调: 没有数可记, source 也和响应里的 null 对不上。C 的数 source 记 "xregion", 规则同上
+        # (predictable = 两队都在四大的已知队伍里; GAM 这种四大之外的队即使 C 认识也不记)。
         pr0 = out["prediction"]
         if minfo and minfo.predictable and pr0["probability_blue"] is not None:
             log_prediction(match_id=match_id, game_id=st.game_id,
@@ -1019,6 +1232,14 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
             if use_pre:
                 pred, _row = _ingame_core(bl, rl, minfo.league, sd, bch, rch, True,
                                           blend=True, blend_with=p2, pre_league=pg_lg)
+            elif xr is not None:
+                # 跨赛区模型 C: 局内模型照旧不带赛前特征 (同下), 但开局 3-15 分钟从 C 的赛前数渐变过渡 ——
+                # 和国内看板拿 BP 后当锚是同一个 _blend_prior。采纳理由同国内 ("不显著变差 + 连续"):
+                # 跨赛区历史局上渐变对硬切系列赛 t +2.27 (方向是变好), 第 3 分钟的跳变 18.6 → 0.11 个百分点。
+                pred, _row = _ingame_core(bl, rl, minfo.league, sd, bch, rch, False,
+                                          blend=True, blend_with=xr["p"])
+                pred["pregame_probability_blue"] = round(xr["p"], 4)
+                pred["pregame_source"] = "xregion"
             else:
                 # 没有赛前口径 (跨赛区 / 队名不认识): 不带赛前特征、不渐变, 第 3 分钟起就是局内模型
                 # 自己的数。include_pre=False 是显式的 —— 不能让 _ingame_core 退回按比赛赛区去算
@@ -1104,6 +1325,10 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                                                      pre_ctx=pre_ctx,
                                                      blend=True, blend_with=board_p2,
                                                      pre_league=pg_lg)
+                        elif xr is not None:
+                            res, _row = _ingame_core(bl, rl, minfo.league, sd,
+                                                     c_bch, c_rch, False,
+                                                     blend=True, blend_with=xr["p"])
                         else:
                             res, _row = _ingame_core(bl, rl, minfo.league, sd,
                                                      c_bch, c_rch, False)

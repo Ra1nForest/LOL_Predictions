@@ -10,7 +10,10 @@
  *   · 两队同一个母赛区: 赛前 / BP 后按母赛区算 (pregameLeague), 局内模型仍拿赛事本身当赛区
  *   · 跨赛区, 或有队名映射不出来: 没有赛前和 BP 后, 局内模型不带赛前特征、不渐变, 第 3 分钟起
  *     就是它自己的数; 映射不出来的队用 lolesports 原名当标签, 绝不拿去查队伍表
- * 四大赛区两队都认识时这些分支一个都不走, 国内看板和原来逐字段相同。
+ *   · 其中两队都能映射进跨赛区模型 C 的状态 (xregion.json, 含四大之外的队)、本赛事赛程取得到、两队母赛区
+ *     不同时: 赛前数来自 C (xregionBoard, = api._xregion_board), 开局 3-15 分钟以它为锚渐变, 局内模型仍不带
+ *     赛前特征; 没有 BP 后 (加英雄胜率的候选 D 没过闸)。C 算不出来就一字不改地保持上一条
+ * 四大赛区两队都认识时这些分支一个都不走, 国内看板和原来逐字段相同 (也不多发任何上游请求)。
  */
 import type { ExplainFile } from "./explain.ts";
 import type { IngameModel } from "./ingame.ts";
@@ -25,6 +28,8 @@ import type { LiveState, Match, MetaEntry, TimelineRow } from "./feed.ts";
 import { DDRAGON, Feed, LEAGUE_IDS, PERSISTED, isMajor, parseTs19, predictable, toState } from "./feed.ts";
 import { oePlayerName } from "./names.ts";
 import { pyRound } from "./pyfmt.ts";
+import type { Series, XregionState } from "./xregion.ts";
+import { boardPredict, coefficientsFor, replayFramesNeeded, seriesWins, xregionKnown } from "./xregion.ts";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Json = any;
@@ -34,6 +39,11 @@ export interface Models {
   s1: Stage1;
   s2: Stage2;
   ex: ExplainFile;
+  /**
+   * 跨赛区模型 C 的状态 (public/web/xregion.json)。null / 缺席 = 没加载 (下载失败等):
+   * 跨赛区看板保持原来的行为, 和服务器读不到 artifacts/xregion.json 时一样
+   */
+  xr?: XregionState | null;
 }
 
 /** 看板/列表失败时带状态码的错误, 对应服务器的 HTTPException */
@@ -134,7 +144,39 @@ const CROSS_REGION_NOTE =
   "跨赛区对阵: 赛前和 BP 后模型只在赛区内战上验证过, 在历史跨赛区国际赛上没有预测力, " +
   "这里不显示; 开局 3 分钟起直接用局内模型";
 
-export type PregameKind = "unmapped" | "cross_region" | "intl_home";
+/**
+ * 跨赛区模型 C 出数时, 上面那句换成这句 (whyKind = "xregion")。和 api._XREGION_NOTE 一字不差, 数字来自
+ * research/gate_cross_region.py 的 HOLDOUT; i18n.ts 有对应的英文模板。
+ */
+const XREGION_NOTE =
+  "跨赛区对阵: 赛前数字来自跨赛区模型 (只看两队和所在赛区的历史战绩, 不看英雄), " +
+  "历史上准确率约 65%, 而且偏自信 —— 它说 85% 的局实际约赢 76%";
+
+/** api._xregion_note: C 的那句说明; 母赛区在状态里没有跨赛区国际赛记录 (偏移全靠先验) 的, 点名补一句 */
+export function xregionNote(noHistory: string[]): string {
+  let s = XREGION_NOTE;
+  if (noHistory.length) s += `; ${noHistory.join(" 和 ")} 此前没有跨赛区国际赛记录, 这个数主要靠先验`;
+  return s;
+}
+
+/**
+ * api._xregion_pregame: 这一局还没有帧 (没开打) 时看板的 prediction —— 只有 C 的赛前数。原来这时看板不给
+ * prediction, 界面自己拿 Stage 1 去问 /predict; 跨赛区的比赛 pregame_league 为 null, 什么都不显示。C 的数要
+ * 重放本赛事的赛程才算得出来, 只能由看板带回去。没有 BP 后那条线 (候选 D 没过闸)。
+ */
+export function xregionPregame(p: number, why: string): Record<string, unknown> {
+  return {
+    too_early: false,
+    minute: null,
+    pregame_probability_blue: p,
+    postdraft_probability_blue: null,
+    probability_blue: p,
+    source: "xregion",
+    warnings: [why],
+  };
+}
+
+export type PregameKind = "unmapped" | "cross_region" | "intl_home" | "xregion";
 
 /**
  * api._pregame_reason: [kind, 一句话] 或 [null, null]。kind:
@@ -169,10 +211,13 @@ export function pregameReason(
  * api._board_warnings: 看板局内阶段的提醒, "为什么没有赛前/BP 后"放第一条。跨赛区 / 队名不认识时
  * 是**故意**不带赛前特征, 局内模型那句"没有可用的赛前队伍统计"说错了原因又和第一条重复, 按原文去掉。
  * 只在看板这一层做 (头条和 player.ts 的直播回放共用), ingameResponse 本身不动。
+ * 跨赛区模型 C 出数时 (xregion) 同样不带赛前特征 (C 的数只当开局渐变的锚), 也去掉那一句。
  */
 export function boardWarnings(warns: string[], whyKind: PregameKind | null, why: string | null): string[] {
   let out = [...warns];
-  if (whyKind === "unmapped" || whyKind === "cross_region") out = out.filter((w) => w !== NO_PRE_STATS);
+  if (whyKind === "unmapped" || whyKind === "cross_region" || whyKind === "xregion") {
+    out = out.filter((w) => w !== NO_PRE_STATS);
+  }
   if (why) out.unshift(why);
   return out;
 }
@@ -180,6 +225,7 @@ export function boardWarnings(warns: string[], whyKind: PregameKind | null, why:
 /**
  * api._early_prediction: 开局头 3 分钟 (局内模型还用不上) 那一段的 prediction, 纯函数。
  * test:diff 只取终局帧, 碰不到这一段; 由 test:golden 的 intl_cases 逐条对账。
+ * whyKind = "xregion" (C 出数): p1 是 C 的赛前数, source 写 "xregion", 那句说明放进 warnings (同 intl_home)。
  */
 export function earlyPrediction(
   minute: number | null,
@@ -207,10 +253,10 @@ export function earlyPrediction(
     pregame_probability_blue: p1,
     postdraft_probability_blue: p2,
     probability_blue: p2 ?? p1,
-    source: p2 !== null ? "post_draft" : p1 !== null ? "pre_draft" : null,
+    source: p2 !== null ? "post_draft" : p1 !== null ? (whyKind === "xregion" ? "xregion" : "pre_draft") : null,
     note: head + tail,
   };
-  if (whyKind === "intl_home") pred.warnings = [why];
+  if (whyKind === "intl_home" || whyKind === "xregion") pred.warnings = [why];
   return pred;
 }
 
@@ -222,6 +268,8 @@ export function earlyPrediction(
  *   preLeague   use_pre 成立时 = pregame_league: Stage 1/2 按它算、局内模型带赛前特征、开局渐变;
  *               null = 都不做 (跨赛区 / 有队名不认识)。四大赛区两队都认识时就是比赛赛区,
  *               国内看板不变
+ *   xr          跨赛区模型 C 的赛前数 (preLeague 为 null 时才可能有): 不带赛前特征, 但开局 3-15 分钟以它为
+ *               锚渐变; whyKind / why 换成 C 的说明。null = 没有 C, 和原来一样
  * 不是两队 (null) 就什么都不算。
  */
 export interface BoardPlan {
@@ -229,23 +277,66 @@ export interface BoardPlan {
   red: string;
   league: string;
   preLeague: string | null;
+  xr: number | null;
   whyKind: PregameKind | null;
   why: string | null;
+}
+
+/** 看板响应里 C 的那一块 (api._xregion_board 的 public): 回放器和逐秒走势从这里拿锚和说明 */
+export interface XregionPublic {
+  probability_blue: number;
+  game_number: number;
+  blue: string;
+  red: string;
+  home_blue: string | null;
+  home_red: string | null;
+  no_history: string[];
+  /** 这一局还没有帧 (不知道谁蓝方): probability_blue 是两种选边的平均, 不能当按帧选边的局内渐变锚 */
+  side_neutral: boolean;
+  replayed: number;
+  updated: number;
+  deduped: number;
+  oe_asof: string;
+}
+
+/** boardPlan 的 xr 参数: C 的数 (未舍入) 和没有跨赛区记录的母赛区 */
+export interface PlanXr {
+  p: number;
+  noHistory: string[];
+}
+
+/**
+ * 看板响应 → boardPlan 的 xr 参数 (player.ts / static-api.fine 用; 看板里没有 C 就是 null)。
+ * 两种选边的平均 (side_neutral: 看板取到时这一局还没有帧) 不当锚: 回放器手里已经有帧、知道谁蓝方, 拿一个
+ * "不知道谁蓝方"的数去渐变会差出半个蓝方优势。看板一有帧就按帧的选边重算, 下一轮轮询就换上。
+ */
+export function planXrOf(board: {
+  xregion?: { probability_blue: number; no_history: string[]; side_neutral?: boolean } | null;
+}): PlanXr | null {
+  const x = board.xregion;
+  return x && typeof x.probability_blue === "number" && !x.side_neutral
+    ? { p: x.probability_blue, noHistory: x.no_history ?? [] }
+    : null;
 }
 
 export function boardPlan(
   ts: { api: string | null | undefined; model: string | null | undefined }[],
   league: string,
   pgLeague: string | null | undefined,
+  xr: PlanXr | null = null,
 ): BoardPlan | null {
   if (ts.length !== 2) return null;
   const usePre = ts.every((t) => t.model != null) && pgLeague != null;
-  const [whyKind, why] = pregameReason(ts, league, pgLeague);
+  let [whyKind, why] = pregameReason(ts, league, pgLeague) as [PregameKind | null, string | null];
+  // C 出数时原来那句 ("跨赛区不显示" / "不在四大赛区的数据里") 换成 C 的说明; 没有 C 就一字不改
+  const useXr = !usePre && xr !== null;
+  if (useXr) [whyKind, why] = ["xregion", xregionNote(xr.noHistory)];
   return {
     blue: ts[0]!.model || ts[0]!.api || "",
     red: ts[1]!.model || ts[1]!.api || "",
     league,
     preLeague: usePre ? pgLeague! : null,
+    xr: useXr ? xr.p : null,
     whyKind,
     why,
   };
@@ -449,6 +540,8 @@ interface CurveCtx {
   ln: [string[], string[]] | null;
   /** BP 后概率 (没有就 null, 渐变退回赛前) —— 曲线和头条同一个渐变 */
   prior: number | null;
+  /** 跨赛区模型 C 的赛前数 (boardPlan.xr): preLeague 为 null 时以它为锚渐变, 同头条 */
+  xr: number | null;
 }
 
 async function curveCtx(
@@ -462,6 +555,7 @@ async function curveCtx(
   today: string,
   gameId: string,
   prior: number | null,
+  xr: number | null = null,
 ): Promise<CurveCtx> {
   // 赛前特征只和队伍有关, 整条曲线算一次就够。没有赛前口径时不算 (同头条)
   let preCtx: PreCtx | null = null;
@@ -478,7 +572,7 @@ async function curveCtx(
   } catch (e) {
     warn("曲线取阵容失败, 曲线会偏离头条", e);
   }
-  return { blue, red, league, preLeague, preCtx, ln, prior };
+  return { blue, red, league, preLeague, preCtx, ln, prior, xr };
 }
 
 /** 曲线上一行的胜率, 和看板头条同一个函数。失败给 null, 调用方沿用上一个点 */
@@ -499,7 +593,8 @@ function curveProb(m: Models, teams: TeamsFile, today: string, c: CurveCtx, row:
       blueChamps: c.ln ? c.ln[0] : null,
       redChamps: c.ln ? c.ln[1] : null,
     };
-    // 有赛前口径: 带赛前特征 (和头条一致) + 从 BP 后渐变; 没有: 局内模型自己的数, 同头条
+    // 有赛前口径: 带赛前特征 (和头条一致) + 从 BP 后渐变; 没有但有 C: 不带赛前特征, 从 C 渐变;
+    // 都没有: 局内模型自己的数。三种都同头条
     const res = ingameResponse(
       m.ingame,
       m.s1,
@@ -507,7 +602,9 @@ function curveProb(m: Models, teams: TeamsFile, today: string, c: CurveCtx, row:
       m.ex,
       c.preLeague !== null
         ? { ...base, preCtx: c.preCtx, blend: true, blendWith: c.prior, preLeague: c.preLeague }
-        : { ...base, includePregame: false },
+        : c.xr !== null
+          ? { ...base, includePregame: false, blend: true, blendWith: c.xr }
+          : { ...base, includePregame: false },
       today,
     );
     return { p: res.probability_blue };
@@ -537,11 +634,25 @@ export async function fineTimeline(
     preLeague: string | null;
     upto: number;
     prior: number | null;
+    /** 跨赛区模型 C 的赛前数 (看板响应的 xregion.probability_blue, 经 boardPlan); 没有就 null */
+    xr?: number | null;
   },
   onBatch: (pts: Json[]) => void,
   memo: Map<string, { p: unknown } | null> = new Map(),
 ): Promise<void> {
-  const c = await curveCtx(feed, teams, models.s1, a.blue, a.red, a.league, a.preLeague, today, a.gameId, a.prior);
+  const c = await curveCtx(
+    feed,
+    teams,
+    models.s1,
+    a.blue,
+    a.red,
+    a.league,
+    a.preLeague,
+    today,
+    a.gameId,
+    a.prior,
+    a.xr ?? null,
+  );
   await feed.fineRows(a.gameId, a.upto, (rows) => {
     let lastP: unknown = null;
     onBatch(
@@ -604,6 +715,165 @@ async function boardDraft(feed: Feed, gameId: string, minfo: Match): Promise<Dra
     (await feed.gameMetadata(gameId)).values(),
     minfo.teams.map((t) => t.code),
   );
+}
+
+// ══════════════════════════════════════════════════════════
+//  跨赛区模型 C (xregion.ts) 在看板上的那一段 —— api._xregion_series / _xregion_frames / _xregion_board
+//
+//  只在"非四大赛区、pregame_league 为 null (跨赛区, 或有队不在四大)"的看板上用; 国内看板和同母赛区的国际赛
+//  看板根本不进来 (连上游请求都不多发)。闸门只认赛事内在线更新的版本, 所以必须重放本赛事 OE 还没收录的已完成局
+//  —— 赛程取不到就不给 C, 不退回"只用 OE"的那个没过闸的版本。重放规则全在 xregion.ts (纯函数), 这里只取数。
+// ══════════════════════════════════════════════════════════
+
+/**
+ * api._xregion_series: 本赛事 (同一个 lolesports tournament) 已完赛的系列赛 + 当前系列赛 → boardPredict 的输入。
+ * 赛程取不到返回 null。别的系列赛的队名 / 比分取 getCompletedEvents; 当前系列赛的队序和比分取 getEventDetails
+ * (20 秒缓存, 和页面顶上的比分同一份), 队名取赛程那一份 (minfo) —— getEventDetails 有时把队名写成全大写,
+ * 别名表是按赛程的写法收的。
+ */
+async function xregionSeries(feed: Feed, teams: TeamsFile, minfo: Match, xknown: string[]): Promise<Series[] | null> {
+  const tid = (await feed.eventTournament(minfo.match_id)) || (await feed.leagueTournament(minfo.league, minfo.start_time));
+  if (!tid) return null;
+  const evs = await feed.completedEvents(tid);
+  const det = await feed.matchDetail(minfo.match_id);
+  if (evs === null || det === null || det.teams.length !== 2 || !minfo.start_time) return null;
+  const series: Series[] = [];
+  for (const e of evs) {
+    const m = e && typeof e === "object" && e.match && typeof e.match === "object" ? e.match : {};
+    const ts: Json[] = Array.isArray(m.teams) ? m.teams : [];
+    if (!m.id || String(m.id) === String(minfo.match_id) || ts.length !== 2 || !e.startTime) continue;
+    series.push({
+      match_id: String(m.id),
+      start: e.startTime,
+      best_of: (m.strategy && typeof m.strategy === "object" ? m.strategy.count : null) ?? null,
+      teams: ts.map((t: Json) => ({
+        name: t.name ?? null,
+        code: t.code ?? null,
+        oe: mapTeam(teams, t.name, xknown),
+        wins: Math.trunc(Number((t.result && typeof t.result === "object" ? t.result.gameWins : 0) || 0)),
+        id: null,
+      })),
+    });
+  }
+  const names = new Map<string, string>();
+  for (const t of minfo.teams) for (const k of [t.code, t.api_name]) if (k) names.set(norm(k), t.api_name);
+  const cur = det.teams.map((t) => {
+    const nm = names.get(norm(t.name)) || names.get(norm(t.code)) || t.name;
+    return { name: nm, code: t.code, oe: mapTeam(teams, nm, xknown), wins: Math.trunc(Number(t.wins || 0)), id: t.id };
+  });
+  series.push({ match_id: String(minfo.match_id), start: minfo.start_time, best_of: minfo.best_of, teams: cur });
+  return series;
+}
+
+/**
+ * api._xregion_frames: 把 replayFramesNeeded 列出的终局帧取好, 填进 series[*].frames["<局号>"]。
+ * 别的系列赛先取一次局号 → gameId、队伍 id (feed.matchIds: 照常的 20 秒缓存, id 齐了另记一份, 不把共用的
+ * getEventDetails 按一小时缓存); 当前系列赛用 matchDetail。任何一步取不到就记 null —— 那个系列赛在
+ * decodeSeries 里整体退回交替序, 不让一个请求失败拖掉整块看板的 C。
+ */
+async function xregionFrames(feed: Feed, series: Series[], need: [string, number][], currentId: string): Promise<void> {
+  const by = new Map(series.map((s) => [s.match_id, s]));
+  const gids = new Map<string, Map<number, string>>();
+  for (const [mid, i] of need) {
+    const s = by.get(mid)!;
+    if (!gids.has(mid)) {
+      gids.set(mid, new Map());
+      let det: { teams: { id: string | null; name: string | null; code: string | null }[]; games: { number: number | null; id: string | null }[] } | null = null;
+      try {
+        det = mid === currentId ? await feed.matchDetail(mid) : await feed.matchIds(mid);
+      } catch (e) {
+        warn(`跨赛区模型取 ${mid} 的对局详情失败, 这个系列赛按交替序`, e);
+        det = null;
+      }
+      if (det) {
+        for (const t of s.teams) {
+          if (t.id) continue;
+          const hit = det.teams.find(
+            (d) => norm(d.name) === norm(t.name) || (!!d.code && norm(d.code) === norm(t.code)),
+          );
+          t.id = hit ? hit.id : null;
+        }
+        const g = new Map<number, string>();
+        for (const x of det.games) if (x.number && x.id) g.set(Math.trunc(Number(x.number)), x.id);
+        gids.set(mid, g);
+      }
+    }
+    let fr = null;
+    const gid = gids.get(mid)!.get(i);
+    if (gid) {
+      try {
+        fr = await feed.finalFrame(gid);
+      } catch (e) {
+        warn(`跨赛区模型取 ${gid} 的终局帧失败, 这个系列赛按交替序`, e);
+      }
+    }
+    (s.frames ??= {})[String(i)] = fr;
+  }
+}
+
+/**
+ * api._xregion_board: 这块看板上 C 的赛前数, 或 null (= 保持原来的行为和原来的每一句话)。
+ * 调用方已判断: 非四大赛区、pregame_league 为 null、两队。这里再要求: 状态已加载、这个赛区键有系数、两队都能
+ * 映射成 C 状态里的队名、本赛事赛程取得到、两队母赛区都查得到且不同、当前系列赛的比分跟得上局号。局号: 选中的
+ * 那一局; 还没有选中的局 (没开打) 就是比分之和 + 1。蓝红按 minfo.teams 的顺序 —— 有帧时已经按本局选边排过
+ * (sidesKnown); 没帧时那只是赛程顺序, 给两种选边的平均 (boardPredict)。
+ */
+async function xregionBoard(
+  feed: Feed,
+  teams: TeamsFile,
+  state: XregionState | null | undefined,
+  minfo: Match,
+  chosen: Json,
+  sidesKnown: boolean,
+): Promise<{ p: number; why: string; public: XregionPublic } | null> {
+  if (!state) return null;
+  const key = String(minfo.league).toUpperCase();
+  if (coefficientsFor(state, key) === null) return null;
+  const xknown = xregionKnown(state);
+  const blue = mapTeam(teams, minfo.teams[0]!.api_name, xknown);
+  const red = mapTeam(teams, minfo.teams[1]!.api_name, xknown);
+  if (!blue || !red) return null;
+  let res;
+  let number: number;
+  try {
+    const series = await xregionSeries(feed, teams, minfo, xknown);
+    if (series === null) {
+      console.warn(`跨赛区模型: 取不到 ${minfo.match_id} 所在赛事的赛程, 这场不给 C`);
+      return null;
+    }
+    const cur = series[series.length - 1]!;
+    number =
+      chosen && chosen.number ? Math.trunc(Number(chosen.number)) : seriesWins(cur).reduce((a, b) => a + b, 0) + 1;
+    const al = teams.aliases;
+    await xregionFrames(feed, series, replayFramesNeeded(state, series, minfo.match_id, number, al), minfo.match_id);
+    res = boardPredict(state, key, blue, red, series, minfo.match_id, number, al, sidesKnown);
+  } catch (e) {
+    warn("跨赛区模型重放失败, 这场不给 C", e);
+    return null;
+  }
+  if (res.withheld === "score_lag") {
+    console.warn(`跨赛区模型: ${minfo.match_id} 第 ${number} 局开打了, 比分还没算上前一局, 这次不给 C`);
+  }
+  const p = res.probability_blue;
+  if (p === null) return null;
+  return {
+    p,
+    why: xregionNote(res.no_history),
+    public: {
+      probability_blue: p,
+      game_number: number,
+      blue,
+      red,
+      home_blue: res.home_blue,
+      home_red: res.home_red,
+      no_history: res.no_history,
+      side_neutral: res.side_neutral,
+      replayed: res.replayed,
+      updated: res.updated,
+      deduped: res.deduped,
+      oe_asof: state.oe_asof,
+    },
+  };
 }
 
 /** GET /esports/board/{match_id} */
@@ -739,7 +1009,19 @@ export async function buildBoard(
     timeline: [],
     note: "以帧里的 gameState 为准, persisted_state 会滞后。",
   };
-  if (!chosen || !st) return out;
+  // 跨赛区模型 C (见 xregionBoard): 只看非四大赛区、pregame_league 为 null 的两队对阵。算得出来才多一个
+  // "xregion" 键; 国内和同母赛区的看板根本不进这个分支 (也不多发任何上游请求)。
+  let xr: { p: number; why: string; public: XregionPublic } | null = null;
+  if (minfo && minfo.teams.length === 2 && !isMajor(minfo.league) && pregameOf(teams, minfo) === null) {
+    // 有帧 = 左右已按本局的帧排成蓝 / 红; 没帧时只是赛程顺序 (C 改给两种选边的平均)
+    xr = await xregionBoard(feed, teams, models.xr, minfo, chosen, !!(chosen && st));
+    if (xr) out.xregion = xr.public;
+  }
+  if (!chosen || !st) {
+    // 还没有帧: 原来这里不给 prediction (界面自己拿 Stage 1 问赛前); C 的数只有看板算得出来
+    if (xr) out.prediction = xregionPregame(xr.p, xr.why);
+    return out;
+  }
 
   const live: Record<string, unknown> = {
     game_id: st.game_id,
@@ -776,16 +1058,19 @@ export async function buildBoard(
   // 赛前 / BP 后能不能给、按哪个赛区算, 局内模型拿什么当队名 —— 见 boardPlan / pregameLeague。
   // plan 为 null = 不是两队, 什么都不算。plan.preLeague 为 null = 不算 Stage 1/2、不渐变、局内模型
   // 不带赛前特征; 队名映射不出来时 blue/red 是 lolesports 原名, 只当标签, 不进任何查表。
+  // xr: 跨赛区模型 C 的赛前数 (上面算过), 只可能出现在 preLeague 为 null 的看板上 —— 有它时赛前 = C、开局
+  // 3-15 分钟以 C 为锚渐变, 局内模型照旧不带赛前特征; 没有 BP 后 (候选 D 没过闸)
   const plan = minfo
     ? boardPlan(
         minfo.teams.map((t) => ({ api: t.api_name, model: t.model_name })),
         minfo.league,
         pregameOf(teams, minfo),
+        xr ? { p: xr.p, noHistory: xr.public.no_history } : null,
       )
     : null;
   if (st.minute === null || st.minute < MIN_MINUTE) {
-    // 局内模型给不了, 赛前和 BP 后这两段一直有效 —— 照给 (有赛前口径时)
-    let p1: number | null = null;
+    // 局内模型给不了, 赛前和 BP 后这两段一直有效 —— 照给 (有赛前口径时; 跨赛区有 C 时赛前就是 C 的数)
+    let p1: number | null = plan ? plan.xr : null;
     let p2: number | null = null;
     if (minfo && plan && plan.preLeague !== null) {
       try {
@@ -838,7 +1123,9 @@ export async function buildBoard(
         blueChamps: ln ? ln[0] : null,
         redChamps: ln ? ln[1] : null,
       };
-      // 没有赛前口径 (跨赛区 / 队名不认识): 不带赛前特征、不渐变, 第 3 分钟起就是局内模型自己的数。
+      // 没有赛前口径 (跨赛区 / 队名不认识): 不带赛前特征, 第 3 分钟起就是局内模型自己的数 —— 有 C 时开局
+      // 3-15 分钟从 C 的数渐变过渡 (采纳理由同国内的 BP 后锚: 不显著变差 + 连续; 跨赛区历史局上对硬切
+      // 系列赛 t +2.27, 方向是变好, 第 3 分钟的跳变 18.6 → 0.11 个百分点)。
       // includePregame=false 是显式的 —— 不能让 ingameResponse 退回按比赛赛区去算 preContext
       const pred = ingameResponse(
         ingame,
@@ -847,9 +1134,15 @@ export async function buildBoard(
         ex,
         plan.preLeague !== null
           ? { ...base, blend: true, blendWith: p2, preLeague: plan.preLeague }
-          : { ...base, includePregame: false },
+          : plan.xr !== null
+            ? { ...base, includePregame: false, blend: true, blendWith: plan.xr }
+            : { ...base, includePregame: false },
         today,
       ) as Record<string, unknown>;
+      if (plan.preLeague === null && plan.xr !== null) {
+        pred.pregame_probability_blue = pyRound(plan.xr, 4);
+        pred.pregame_source = "xregion";
+      }
       // 原因放第一条; 故意不带赛前特征时去掉局内模型那句"没有可用的赛前队伍统计"
       pred.warnings = boardWarnings(pred.warnings as string[], plan.whyKind, plan.why);
       if (p2 !== null) pred.postdraft_probability_blue = p2;
@@ -875,6 +1168,7 @@ export async function buildBoard(
         today,
         st.game_id,
         boardP2,
+        plan.xr,
       );
       const series: Json[] = [];
       let lastP: unknown = null;

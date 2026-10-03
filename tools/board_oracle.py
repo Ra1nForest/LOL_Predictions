@@ -48,6 +48,9 @@ def main() -> int:
         api.STATE["stages"] = {n: api.Stage(n) for n in ("pre_draft", "post_draft")}
         api.STATE["ingame"], api.STATE["ingame_live"] = IngameModel.load_pair()
         api.STATE["feed"] = EF.EsportsFeed()
+        # 跨赛区模型 C 的状态 (artifacts/xregion.json) —— 和 lifespan 同一个加载函数; 浏览器版读的是
+        # export_web_model.py 复制过去的同一份 (frontend/public/web/xregion.json)
+        api._load_xregion()
 
         for a in args:
             mid, gid = a.split(":")

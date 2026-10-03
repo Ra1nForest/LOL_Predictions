@@ -101,9 +101,10 @@ LEAGUE_TO_OE = {
 # DCGI (德玛西亚杯全球邀请赛, 2026) 故意不收: OE 里的 "DCup" 一直是 12 月 LPL 系的国内杯赛
 # (2022/2023/2025 都只有 LPL + LDL 的队), 这届全球邀请赛 OE 会不会沿用 DCup、还是另起一个名字,
 # 现在不知道。猜成 DCup 的话, 一旦 OE 另起名字就一局都配不上 (不报错); 更糟的是同一个标签底下
-# 混着两种赛事。所以 DCGI 不进这张表: oe_league 原样返回 "DCGI", OE 里没有这个标签, 这些局就
-# 留着不配 —— 回填跳过、留档的 y 一直是 None、采集的胜负停在比分推断 (provisional)。等 OE 登记后
-# 看清它叫什么; 不叫 DCGI 的话再在这里加一行。
+# 混着两种赛事。所以 DCGI 不进这张表: oe_league 原样返回 "DCGI" —— OE 若就用这个代码 (和
+# xregion.INTL_EVENTS 同一个猜测), 回填、留档 (含 source "xregion" 的跨赛区赛前行) 自然配得上; 起了别的
+# 名字就留着不配 —— 回填跳过、留档的 y 一直是 None、采集的胜负停在比分推断 (provisional)。等 OE 登记后
+# 看清它叫什么; 不叫 DCGI 的话再在这里加一行 (xregion.py 的 INTL_EVENTS / LE_EVENT_CODES 也要跟着改)。
 _OE_BY_UPPER = {k.upper(): v for k, v in LEAGUE_TO_OE.items()}
 
 

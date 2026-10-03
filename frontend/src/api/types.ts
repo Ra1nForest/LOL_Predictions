@@ -181,9 +181,11 @@ export interface Prediction {
    *  `pr?.model.note` 这种写法在 too_early 时抛 TypeError, **整个 React 树
    *  卸载, 页面全白** —— 实测 2026-09-01 LCK 第 2 局开局那一刻。 */
   model?: ModelCard;
-  /** too_early 里通常**没有** (只有国际赛同母赛区时带一条口径说明); 局内那段总有 */
+  /** too_early 里通常**没有** (只有国际赛同母赛区、或跨赛区模型 C 出数时带一条口径说明); 局内那段总有 */
   warnings?: string[];
   pregame_probability_blue: number | null;
+  /** 局内那段的赛前数是谁算的: 只在跨赛区模型 C 出数时有, 值为 "xregion" (其余时候赛前就是 Stage 1) */
+  pregame_source?: string;
   postdraft_probability_blue: number | null;
   shift_from_pregame: number | null;
   shift_note: string | null;
@@ -192,7 +194,8 @@ export interface Prediction {
   /** 开局不足 3 分钟时后端只给赛前/BP 后概率 (算不出来或这场不给时 probability_blue 为 null) */
   too_early?: boolean;
   note?: string;
-  /** too_early 用的是哪一段: post_draft / pre_draft; 两段都没有时是 null */
+  /** too_early 用的是哪一段: post_draft / pre_draft / xregion (跨赛区模型 C); 都没有时是 null。
+   *  跨赛区模型 C 在还没有帧 (没开打) 时也带一份 prediction: too_early 为 false、minute 为 null、source 为 xregion */
   source?: string | null;
   error?: string;
 }
@@ -214,6 +217,25 @@ export interface GameRef {
   sides: { blue?: string; red?: string };
 }
 
+/** 看板上跨赛区模型 C 的那一块 (api._xregion_board 的 public)。没有这个键 = 这场不给 C */
+export interface XregionInfo {
+  /** 未舍入的赛前蓝方胜率 —— 开局渐变的锚 (头条、曲线、逐秒走势、直播回放同一个数) */
+  probability_blue: number;
+  game_number: number;
+  blue: string;
+  red: string;
+  home_blue: string | null;
+  home_red: string | null;
+  /** 母赛区在状态里没有跨赛区国际赛记录的 (这个数主要靠先验) */
+  no_history: string[];
+  /** 这一局还没有帧、不知道谁蓝方: probability_blue 是两种选边的平均 */
+  side_neutral: boolean;
+  replayed: number;
+  updated: number;
+  deduped: number;
+  oe_asof: string;
+}
+
 export interface BoardResponse {
   match_id: string;
   match: Match | null;
@@ -226,6 +248,7 @@ export interface BoardResponse {
   prediction: Prediction | null;
   timeline: TimelinePoint[];
   note: string | null;
+  xregion?: XregionInfo;
 }
 
 export interface StageMetrics {

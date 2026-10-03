@@ -10,8 +10,10 @@ interface Props {
   probabilityBlue: number;
   pMin: number | null;
   pMax: number | null;
-  /** Stage 1 —— 只看队伍历史 */
+  /** Stage 1 —— 只看队伍历史 (跨赛区模型 C 出数时是 C 的数, 见 pregameLabel) */
   pregame: number | null;
+  /** 赛前那一项的标签, 默认"赛前"; 跨赛区模型 C 出数时看板传"跨赛区赛前" */
+  pregameLabel?: string;
   /** Stage 2 —— 已计入双方阵容 */
   postdraft?: number | null;
   /** 有依据就把中间那个"胜率"变成可点的"胜率解析"。
@@ -35,6 +37,7 @@ export function ProbabilityScale({
   pMin,
   pMax,
   pregame,
+  pregameLabel,
   postdraft,
   reasons,
 }: Props) {
@@ -165,7 +168,7 @@ export function ProbabilityScale({
             写的正是两边各自的胜率, 39 哪个都对不上。 */}
         <span>
           {([
-            { lab: T("赛前"), v: pregame },
+            { lab: pregameLabel ?? T("赛前"), v: pregame },
             { lab: T("BP 后"), v: postdraft ?? null },
           ] as { lab: string; v: number | null }[])
             .filter((x) => x.v != null)

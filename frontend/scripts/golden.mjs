@@ -8,13 +8,17 @@
  *   4. BP 后            api._board_draft + api._predict_core —— 看板那条"BP 后"参考线。
  *                      名字对齐 (选手去战队前缀、英雄 id 归一化) 和特征向量逐位核对
  *   5. 国际赛         api.pregame_league (赛前/BP 后按哪个赛区算)、api._known_for (映射队名用
- *                      哪份表)、esports_feed.map_team (空表必须返回 null) 逐条对账; 外加看板的
- *                      api._pregame_reason (为什么没有赛前/BP 后)、api._early_prediction (开局头
- *                      3 分钟那一段 —— test:diff 只取终局帧, 碰不到它)、api._board_warnings
+ *                      哪份表)、esports_feed.map_team (空表必须返回 null; spec "xregion" = 跨赛区模型 C
+ *                      状态里的全部队名) 逐条对账; 外加看板的 api._pregame_reason (为什么没有赛前/BP 后)、
+ *                      api._early_prediction (开局头 3 分钟那一段 —— test:diff 只取终局帧, 碰不到它)、
+ *                      api._board_warnings、api._xregion_note / _xregion_pregame (C 的说明和没开打时的 prediction)
+ *   6. 跨赛区模型 C    xregion.py 的真函数逐位对账 (xregion_cases.json): 可移植的 exp、时间、终局帧判胜负、比分约束解码、
+ *                      OE 去重、引擎 (同一时间戳一组更新、衰减、新赛区先验)、predict、看板整条重放
  *
- * 局内的国际赛用例 (src 以 "syn:intl:" 打头) 输入里多两个键, 取法和 api._ingame_core 一字不差:
+ * 局内的国际赛用例 (src 以 "syn:intl:" 打头) 输入里多几个键, 取法和 api._ingame_core 一字不差:
  *   include_pregame: false   不带赛前特征 (看板在跨赛区 / 队名不认识时这样调)
  *   pre_league               赛前特征按它算, 不给就按 league (国际赛同母赛区时是两队的母赛区)
+ *   blend_with               开局渐变的锚 (blend=True): 跨赛区模型 C 出数时看板拿它当锚
  *
  * 期望值由 tools/export_web_model.py 调线上真函数生成, 不另写一份。
  *
@@ -24,6 +28,7 @@
  * 判据:
  *   特征向量  逐位相等          特征构造全是 float64 运算, 两边没有理由差一个比特
  *   概率      |Δ| < 1e-6        树和 sigmoid 在 float32 上, JS 只能模拟到一两个 ulp
+ *   C         逐位相等          全是 float64 的加减乘除和 exp, 运算顺序照抄 —— 差一个比特就是移植错了
  *   响应      逐字段相等        文案、round 过的数字、键的有无, 一处都不许差 ——
  *                              界面和 Stage 3 都会原样引用它们
  */
@@ -33,16 +38,26 @@ import { fileURLToPath } from "node:url";
 import { buildRow, ingameResponse, loadIngame, predictRow } from "../src/web/ingame.ts";
 import { loadStage1, preContext, predictResponse } from "../src/web/stage1.ts";
 import { draftVector, loadStage2, makeDraftRow, predictCore } from "../src/web/stage2.ts";
-import { boardWarnings, draftFromMeta, earlyPrediction, knownFor, pregameLeague, pregameReason } from "../src/web/board.ts";
+import {
+  boardWarnings,
+  draftFromMeta,
+  earlyPrediction,
+  knownFor,
+  pregameLeague,
+  pregameReason,
+  xregionNote,
+  xregionPregame,
+} from "../src/web/board.ts";
 import { MAJORS } from "../src/web/feed.ts";
 import { knownTeams, mapTeam } from "../src/web/teams.ts";
 import { oePlayerName } from "../src/web/names.ts";
+import * as XR from "../src/web/xregion.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (p) => JSON.parse(readFileSync(join(here, p), "utf8"));
 const TOL = 1e-6;
 
-let model, s1, s2, teams, ex, gi, gs, g2, g5;
+let model, s1, s2, teams, ex, gi, gs, g2, g5, xstate, g6;
 try {
   model = loadIngame(read("../public/web/ingame_live.json"));
   s1 = loadStage1(read("../public/web/stage1_pre.json"));
@@ -53,6 +68,8 @@ try {
   gs = read("golden/stage1_cases.json");
   g2 = read("golden/stage2_cases.json");
   g5 = read("golden/intl_cases.json");
+  xstate = read("../public/web/xregion.json");
+  g6 = read("golden/xregion_cases.json");
 } catch (e) {
   console.error(`读不到导出文件: ${e.message}\n先跑: python tools/export_web_model.py`);
   process.exit(2);
@@ -62,6 +79,13 @@ if (
   JSON.stringify(g2.features) !== JSON.stringify(s2.forest.features)
 ) {
   console.error("黄金用例和模型文件的特征列表不一致 —— 两者不是同一次导出, 重新导出");
+  process.exit(2);
+}
+if (g6.oe_asof !== xstate.oe_asof || g6.built_at !== xstate.built_at) {
+  console.error(
+    `跨赛区模型的黄金用例 (OE 截至 ${g6.oe_asof}, 构建于 ${g6.built_at}) 和 public/web/xregion.json ` +
+      `(${xstate.oe_asof}, ${xstate.built_at}) 不是同一份状态 —— 重新导出`,
+  );
   process.exit(2);
 }
 
@@ -166,6 +190,8 @@ for (const c of gi.cases) {
       redChamps: i.red_champs,
       includePregame: i.include_pregame ?? true,
       preLeague: i.pre_league ?? null,
+      // 带 blend_with 的 (跨赛区模型 C 当锚) 按看板的调法: blend=True; 其余不渐变, 同 _ingame_resp
+      ...("blend_with" in i ? { blend: true, blendWith: i.blend_with } : {}),
     },
     gi.today,
   );
@@ -229,7 +255,7 @@ for (const c of g2.cases) {
 
 // ── 5. 国际赛 ───────────────────────────────────────────────
 // 四大赛区的名单两边各写了一份 (feed.ts 的 MAJORS / feature_store.LEAGUES): 拿导出的 known 的键核对
-const f5 = { majors: [], pregame: [], known: [], map: [], reason: [], early: [], warns: [] };
+const f5 = { majors: [], pregame: [], known: [], map: [], reason: [], early: [], warns: [], xnote: [], xpre: [] };
 const knownKeys = Object.keys(teams.known).sort();
 if (knownKeys.join("|") !== [...MAJORS].sort().join("|")) f5.majors.push({ js: [...MAJORS], py: knownKeys });
 for (const c of g5.pregame_league) {
@@ -240,9 +266,16 @@ for (const c of g5.known_for) {
   const d = diff(knownFor(teams, c.in), c.out);
   if (d) f5.known.push({ in: c.in, ...d });
 }
-// spec: null = 不校验, [] = 空表 (必须返回 null), "*" = 并集, 赛区名 = 该赛区的表 (store.known_teams(赛区))
+// spec: null = 不校验, [] = 空表 (必须返回 null), "*" = 并集, 赛区名 = 该赛区的表 (store.known_teams(赛区)),
+// "xregion" = 跨赛区模型 C 状态里的全部队名 (看板映射 C 的队名用的那份, 文件顺序)
 const knownOf = (spec) =>
-  spec === null || Array.isArray(spec) ? spec : spec === "*" ? teams.known_all : knownTeams(teams, spec);
+  spec === null || Array.isArray(spec)
+    ? spec
+    : spec === "*"
+      ? teams.known_all
+      : spec === "xregion"
+        ? XR.xregionKnown(xstate)
+        : knownTeams(teams, spec);
 for (const c of g5.map_team) {
   const js = mapTeam(teams, c.in[0], knownOf(c.in[1]));
   if (js !== c.out) f5.map.push({ in: c.in, js, py: c.out });
@@ -259,6 +292,100 @@ for (const c of g5.early) {
 for (const c of g5.board_warnings) {
   const d = diff(boardWarnings(c.in[0], c.in[1], c.in[2]), c.out);
   if (d) f5.warns.push({ in: c.in, ...d });
+}
+for (const c of g5.xregion_note) {
+  const js = xregionNote(c.in);
+  if (js !== c.out) f5.xnote.push({ in: c.in, js, py: c.out });
+}
+for (const c of g5.xregion_pregame) {
+  const d = diff(xregionPregame(c.in[0], c.in[1]), c.out);
+  if (d) f5.xpre.push({ in: c.in, ...d });
+}
+
+// ── 6. 跨赛区模型 C ─────────────────────────────────────────
+// 比对一律逐位 (diff 对数字用 ===); 抛错的一侧记成 {error}, 和"不该抛错"一起算不一致
+const f6 = { consts: [], exp: [], epoch: [], gameT: [], verdict: [], decode: [], inOe: [], engine: [], predict: [], replay: [] };
+const tryJs = (fn) => {
+  try {
+    return fn();
+  } catch (e) {
+    return { error: e.message };
+  }
+};
+if (XR.S !== xstate.params.S) f6.consts.push({ what: "S", js: XR.S, py: xstate.params.S });
+// 看板传给去重的是 teams.json 的 aliases; 用例里的那份 (esports_feed.TEAM_ALIASES) 必须是同一张表
+if (JSON.stringify(g6.aliases) !== JSON.stringify(teams.aliases)) {
+  f6.consts.push({ what: "aliases", js: teams.aliases, py: g6.aliases });
+}
+// 引擎里所有 exp 都走 XR.exp (fdlibm 的移植), 不是 Math.exp —— 先单独核对它本身
+for (const c of g6.exp) {
+  const js = XR.exp(c.in);
+  if (!Object.is(js, c.out)) f6.exp.push({ in: c.in, js, py: c.out });
+}
+for (const c of g6.epoch) {
+  const js = tryJs(() => XR.epochS(c.in));
+  if (js !== c.out) f6.epoch.push({ in: c.in, js, py: c.out });
+}
+for (const c of g6.game_t) {
+  const js = tryJs(() => XR.gameT(c.in[0], c.in[1]));
+  if (js !== c.out) f6.gameT.push({ in: c.in, js, py: c.out });
+}
+for (const c of g6.frame_verdict) {
+  const d = diff(plain(XR.frameVerdict(c.in[0], c.in[1])), c.out);
+  if (d) f6.verdict.push({ in: c.in, ...d });
+}
+// decode: OE 已有的局 (known) 先扣配额; Python 抛 ValueError 的用例期望值是 {error: true}, 这边抛错同样记成它
+for (const c of g6.decode) {
+  let js;
+  try {
+    js = { needed: XR.framesNeeded(c.in, c.known), games: XR.decodeSeries(c.in, c.known) };
+  } catch {
+    js = { error: true };
+  }
+  const d = diff(plain(js), c.out);
+  if (d) f6.decode.push({ src: c.src, ...d });
+}
+for (const c of g6.in_oe) {
+  const js = tryJs(() => {
+    const idx = XR.oeIndex(c.in.state, c.in.aliases);
+    return { hit: XR.inOe(idx, ...c.in.q), lookup: XR.oeLookup(idx, ...c.in.q) };
+  });
+  const d = diff(plain(js), c.out);
+  if (d) f6.inOe.push({ src: c.src, ...d });
+}
+// engine: fromState → play → predict(该赛区键的系数), 再取走完之后的 o / oprior / olast / r ——
+// 取哪些赛区和队伍和 export_web_model.xregion_cases 的 run_engine 一样 (局里两队和 blue/red 的池子)
+for (const c of g6.engine) {
+  const i = c.in;
+  const js = tryJs(() => {
+    const e = XR.Engine.fromState(xstate);
+    const n = e.play(i.games);
+    const p = e.predict(XR.coefficientsFor(xstate, i.league_key), i.blue, i.red, i.t);
+    const teamsIn = new Set([...i.games.flatMap((g) => [g.blue, g.red]), i.blue, i.red]);
+    const Ls = new Set([...teamsIn].map((t) => e.pool.get(t)).filter(Boolean));
+    const pick = (m, keys) => Object.fromEntries([...keys].filter((k) => m.has(k)).map((k) => [k, m.get(k)]));
+    const inO = [...Ls].filter((L) => e.o.has(L));
+    return { n_upd: n, p, o: pick(e.o, inO), oprior: pick(e.oprior, inO), olast: pick(e.olast, inO), r: pick(e.r, teamsIn) };
+  });
+  const d = diff(plain(js), c.out);
+  if (d) f6.engine.push({ src: c.src, ...d });
+}
+for (const c of g6.predict) {
+  const js = tryJs(() => XR.predict(xstate, ...c.in));
+  if (js !== c.out) f6.predict.push({ in: c.in, js, py: c.out });
+}
+let n6given = 0;
+for (const c of g6.replay) {
+  const i = c.in;
+  // 别名表放在用例文件顶层 (= esports_feed.TEAM_ALIASES, 看板传的那一份); sides_known = false 是"还没有帧"
+  const al = i.aliases ? g6.aliases : null;
+  const js = tryJs(() => ({
+    needed: XR.replayFramesNeeded(xstate, i.series, i.current, i.number, al),
+    ...XR.boardPredict(xstate, i.league_key, i.blue, i.red, i.series, i.current, i.number, al, i.sides_known),
+  }));
+  if (js && typeof js.probability_blue === "number") n6given++;
+  const d = diff(plain(js), c.out);
+  if (d) f6.replay.push({ src: c.src, ...d });
 }
 
 // ── 报告 ────────────────────────────────────────────────────
@@ -279,6 +406,18 @@ console.log(
 );
 console.log(
   `     看板说明 ${g5.pregame_reason.length} 条 不一致 ${f5.reason.length}  开局 ${g5.early.length} 条 不一致 ${f5.early.length}  局内提醒 ${g5.board_warnings.length} 条 不一致 ${f5.warns.length}`,
+);
+console.log(
+  `     C 的说明 ${g5.xregion_note.length} 条 不一致 ${f5.xnote.length}  C 的赛前 prediction ${g5.xregion_pregame.length} 条 不一致 ${f5.xpre.length}`,
+);
+console.log(`6. 跨赛区模型 C   状态 OE 截至 ${xstate.oe_asof}  (${Object.keys(xstate.teams).length} 队)`);
+console.log(
+  `     exp ${g6.exp.length} 条 不一致 ${f6.exp.length}  时间 ${g6.epoch.length}+${g6.game_t.length} 条 不一致 ${f6.epoch.length + f6.gameT.length}  终局帧 ${g6.frame_verdict.length} 条 不一致 ${f6.verdict.length}  ` +
+    `解码 ${g6.decode.length} 条 不一致 ${f6.decode.length}  去重 ${g6.in_oe.length} 条 不一致 ${f6.inOe.length}`,
+);
+console.log(
+  `     引擎 ${g6.engine.length} 条 不一致 ${f6.engine.length}  predict ${g6.predict.length} 条 不一致 ${f6.predict.length}  ` +
+    `看板重放 ${g6.replay.length} 条 (给数 ${n6given}) 不一致 ${f6.replay.length}  常数不一致 ${f6.consts.length}`,
 );
 
 const show = (title, arr) => {
@@ -303,11 +442,24 @@ show("5 map_team", f5.map);
 show("5 看板说明", f5.reason);
 show("5 开局", f5.early);
 show("5 局内提醒", f5.warns);
+show("5 C 的说明", f5.xnote);
+show("5 C 的赛前 prediction", f5.xpre);
+show("6 常数", f6.consts);
+show("6 exp", f6.exp);
+show("6 epoch", f6.epoch);
+show("6 game_t", f6.gameT);
+show("6 终局帧", f6.verdict);
+show("6 解码", f6.decode);
+show("6 去重", f6.inOe);
+show("6 引擎", f6.engine);
+show("6 predict", f6.predict);
+show("6 看板重放", f6.replay);
 
 const total =
   f1.features.length + f1.warnings.length + f1.slice.length + f1.prob.length + f2.length + f3.length +
   f4.names.length + f4.draft.length + f4.x.length + f4.p.length +
   f5.majors.length + f5.pregame.length + f5.known.length + f5.map.length +
-  f5.reason.length + f5.early.length + f5.warns.length;
+  f5.reason.length + f5.early.length + f5.warns.length + f5.xnote.length + f5.xpre.length +
+  Object.values(f6).reduce((a, v) => a + v.length, 0);
 console.log(total ? "\n✗ 未通过" : "\n✓ 通过 —— 浏览器版和 Python 线上是同一套模型");
 process.exit(total ? 1 : 0);

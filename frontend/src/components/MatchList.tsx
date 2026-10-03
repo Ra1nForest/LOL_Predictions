@@ -50,12 +50,15 @@ function Card({
   const live = kind === "live" && !done;
   // **没有赛前 ≠ 不能预测。** pregame_league 为 null 的是国际赛里跨赛区的对阵 (赛前和 BP 后模型
   // 在那上面没有预测力, 后端不给), 或者有队不在四大赛区的数据里 —— 这两种开局 3 分钟起都有局内
-  // 胜率, 卡片要能点开, 只是说清楚赛前不预测。待定的队 (TBD) 不算: 那时连谁打都不知道。
+  // 胜率, 卡片要能点开。待定的队 (TBD) 不算: 那时连谁打都不知道。
+  // 赛前只可能来自跨赛区模型 C, 而它算不算得出来要看板重放本赛事才知道 (队名映射、赛程取得到) ——
+  // 列表不知道, 所以这里只说"赛前只看跨赛区模型": C 给了数、没给数都成立。原来写的"赛前不预测"在 C 上线后
+  // 多数时候是错的。
   // 四大赛区的 pregame_league 恒为本赛区, 所以国内比赛的卡片和原来一模一样。
   const tbd = (t: TeamRef | undefined) => !t || !t.name || t.name === "TBD";
   const noPregame = !tbd(a) && !tbd(b) && match.pregame_league === null;
   const usable = !!a && !!b && (match.predictable || noPregame);
-  const noPregameText = T("赛前不预测 · 开局后有局内胜率");
+  const noPregameText = T("赛前只看跨赛区模型 · 开局后有局内胜率");
 
   return (
     <button

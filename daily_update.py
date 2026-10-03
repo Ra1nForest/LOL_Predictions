@@ -68,6 +68,22 @@ ARTIFACT_FILES = [
     "summary.json",
 ]
 
+# 训到暂存目录的两步, 顺序执行, 任何一步失败线上都不动
+TRAIN_STEPS = [
+    ("train.py", []),
+    ("ingame_train.py", []),
+]
+
+# 跨赛区模型 C 的状态 (xregion.py --build: 只读 CSV 走一遍分层 Elo, 约 15 秒; 不过健全性检查就不写文件)。
+# **旁路**, 和 _publish_web 一样: 它失败不拦上面的模型、不拦网站发布, 线上留昨天那一份 xregion.json, 结果记进
+# update_status 的 xregion (/health 看得见)。原来它是第三个训练步骤, 一失败整个日更就停: OE 收进一个没归类的
+# 新赛事代码 (2026 DCGI 进 OE 时就可能), sanity_check 拒绝导出, Stage 1/2/4 和网站从此天天不更新, 直到有人改代码。
+# 留旧的一份是安全的: 状态里 events (重放按它去重) 和评分出自同一次构建, 自洽; 只是落后 —— 正在打的赛事仍由
+# 看板从 lolesports 重放补齐, 落后多少看 /health 的 xregion.oe_asof。不能做的是新旧拼一份 (新的评分配旧的
+# events, 或者反过来): 那样同一局会被算两次或一次都不算, 不报错。所以这个文件要么整份换, 要么整份不换。
+XREGION_STEP = ("xregion.py", ["--build"])
+XREGION_FILE = "xregion.json"
+
 
 def log(msg=""):
     ts = datetime.now().strftime("%H:%M:%S")
@@ -184,6 +200,45 @@ def gate(old: dict, new: dict, games: int | None,
     if missing:
         bad.append(f"暂存目录缺文件: {', '.join(missing)}")
     return bad
+
+
+def _xregion_problems(path: Path) -> list[str]:
+    """跨赛区状态的健全性 (系数有限、队伍数够、四大都在、没有没归类的新赛事代码)。
+
+    xregion.py --build 不过检查就不写文件, 这里在换上线前再查一遍暂存里的那份 —— 文件可能是别的
+    版本的代码写的, 也可能被截断。在函数里 import: xregion 要 pandas, 日更的其余部分不需要。
+    """
+    if not path.exists():
+        return [f"{path.name} 不存在"]
+    try:
+        import xregion
+        return [f"xregion.json: {p}" for p in xregion.sanity_check(xregion.load_state(path))]
+    except Exception as e:
+        return [f"xregion.json 读不了: {type(e).__name__}: {e}"]
+
+
+def _build_xregion(env: dict) -> str | None:
+    """跑 XREGION_STEP 训到暂存目录, 再查一遍。返回 None = 暂存里那份可以换上线; 否则是不换的原因
+    (暂存里那份已删掉, 换的时候就不会碰线上的旧文件)。旁路: 不抛异常, 不影响其余步骤 (见 XREGION_STEP)。"""
+    script, args = XREGION_STEP
+    log(f"      {script} {' '.join(args)} … (旁路: 失败只是线上留旧的一份)")
+    staged = STAGING / XREGION_FILE
+    try:
+        rc, out = run([PY, script, *args], env=env, timeout=3600)
+    except Exception as e:                       # 超时之类: 同样只是不换
+        rc, out = 1, f"{type(e).__name__}: {e}"
+    if rc != 0:
+        why = f"{script} 失败 (rc={rc}): {_tail_reason(out, 3)}"
+    else:
+        bad = _xregion_problems(staged)
+        why = "; ".join(bad)[:400] if bad else None
+    if why:
+        log(f"      ⚠ 跨赛区状态不换, 线上保留旧的: {why}")
+        try:
+            staged.unlink()
+        except FileNotFoundError:
+            pass
+    return why
 
 
 def show(old: dict, new: dict):
@@ -319,9 +374,9 @@ def _pipeline(a) -> tuple[int, str | None, str | None, bool]:
     env = {"LOL_ARTIFACTS": str(STAGING)}
 
     games = snapshots = None
-    for script in ("train.py", "ingame_train.py"):
+    for script, args in TRAIN_STEPS:
         log(f"      {script} …")
-        rc, out = run([PY, script], env=env, timeout=7200)
+        rc, out = run([PY, script, *args], env=env, timeout=7200)
         if rc != 0:
             log(f"      {script} 失败 (rc={rc}), 线上保持不变:")
             for line in out.strip().splitlines()[-15:]:
@@ -336,6 +391,7 @@ def _pipeline(a) -> tuple[int, str | None, str | None, bool]:
                 try: snapshots = int(s.split("→")[1].split()[0])
                 except Exception: pass
     log(f"      训练场次 {games}   局内快照 {snapshots}")
+    xr_why = _build_xregion(env)
 
     # 3. 过闸
     log("[3/5] 指标过闸")
@@ -374,6 +430,18 @@ def _pipeline(a) -> tuple[int, str | None, str | None, bool]:
     for f in ARTIFACT_FILES:
         shutil.copy2(STAGING / f, ART / f)
     log(f"      已替换 {len(ARTIFACT_FILES)} 个文件 (旧的备份在 artifacts_prev/)")
+    swapped = list(ARTIFACT_FILES)
+    if xr_why is None:
+        shutil.copy2(STAGING / XREGION_FILE, ART / XREGION_FILE)
+        swapped.append(XREGION_FILE)
+        log(f"      跨赛区状态 {XREGION_FILE} 已替换")
+    else:
+        log(f"      跨赛区状态没换 (线上仍是上一份): {xr_why}")
+    try:
+        import update_status
+        update_status.record_xregion("ok" if xr_why is None else "failed", xr_why)
+    except Exception as e:
+        log(f"      (跨赛区状态留档失败: {type(e).__name__}: {e})")
 
     # 5. 重启 + 探活
     if a.no_restart:
@@ -407,7 +475,7 @@ def _pipeline(a) -> tuple[int, str | None, str | None, bool]:
             return 0, None, None, fetched
     # 起不来 -> 回滚
     log("      探活超时, 回滚到上一版 artifacts")
-    for f in ARTIFACT_FILES:
+    for f in swapped:
         if (backup / f).exists():
             shutil.copy2(backup / f, ART / f)
     service_restart(a.service)

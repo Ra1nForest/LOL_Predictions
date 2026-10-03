@@ -103,7 +103,9 @@ def log_prediction(*, match_id, game_id, league, blue, red, probability_blue,
                 "minute": None if minute is None else round(float(minute), 1),
                 "minute_key": mkey,
                 "probability_blue": round(float(probability_blue), 4),
-                "source": source,              # pre_draft | post_draft | ingame
+                # pre_draft | post_draft | ingame | xregion (跨赛区模型 C 的赛前数, 只在两队都在四大已知
+                # 队伍里时记 —— 回填按 OE 队名配胜负; score() 的"按来源"把它单列一组)
+                "source": source,
                 "slice_used": slice_used,
                 "golddiff": golddiff,
                 "blue_kills": blue_kills, "red_kills": red_kills,

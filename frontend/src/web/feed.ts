@@ -18,6 +18,7 @@
 import { pyRound } from "./pyfmt.ts";
 import type { TeamsFile } from "./teams.ts";
 import { mapTeam } from "./teams.ts";
+import type { FinalFrame } from "./xregion.ts";
 
 export const PERSISTED = "https://esports-api.lolesports.com/persisted/gw";
 export const FEED = "https://feed.lolesports.com/livestats/v1";
@@ -198,6 +199,18 @@ export interface TimelineRow {
   [k: string]: unknown;
 }
 
+/** esports_feed.match_detail 的形状: getEventDetails 的队伍 (id / 名字 / 简称 / 比分) 和局 (局号 / gameId / 状态) */
+export interface MatchDetail {
+  teams: { id: string | null; name: string | null; code: string | null; wins: number | null }[];
+  games: { number: number | null; id: string | null; state: string | null }[];
+}
+
+/** Feed.matchIds (= esports_feed.match_ids): 只有不会再变的 id */
+export interface MatchIds {
+  teams: { id: string | null; name: string | null; code: string | null }[];
+  games: { number: number | null; id: string | null }[];
+}
+
 type Obs = [tt: number, first: number, last: number, frozen: boolean, gold: number];
 
 export class FeedError extends Error {
@@ -298,6 +311,10 @@ export class Feed {
   private obs = new Map<string, Map<number, Obs>>();
   private meta = new Map<string, Map<number, MetaEntry>>();
   private noFrames = new Map<string, number>();
+  /** gameId → 终局帧 (finalFrame, 定型了才记) */
+  private finals = new Map<string, FinalFrame>();
+  /** matchId → 局号/队伍的 id (matchIds, 齐了才记) */
+  private ids = new Map<string, MatchIds>();
   private lag = new Map<string, number>();
   private lagProbe = new Map<string, number>();
 
@@ -432,6 +449,130 @@ export class Feed {
       if (w === null || w === undefined) continue;
       for (const key of [t.name, t.code]) if (key) out.set(norm(key), Math.trunc(w));
     }
+    return out;
+  }
+
+  // -- 跨赛区模型 C 的赛事内重放 (xregion.ts 的 boardPredict; 拼装在 board.ts 的 xregionBoard) --
+  // esports_feed.py 同名同 URL 同缓存时长。都是"取不到返回 null" (网络失败照常抛 FeedError, 由调用方兜住):
+  // 赛程 (tournament / completedEvents) 取不到 → 整场不给 C (闸门只认赛事内在线更新的版本, 少了当天的结果
+  // 就是没过闸的"隔天"版本); 某个系列赛的详情或终局帧取不到 → 那个系列赛退回交替序。
+
+  /** 一个系列赛打完后最多一分钟进重放 (上游登记比分本来就比帧晚约 6 分钟) */
+  static readonly COMPLETED_TTL = 60;
+  static readonly TOURNAMENTS_TTL = 3600;
+
+  /** esports_feed.event_tournament: 这场比赛所属的 tournament id。和 games() 同一个 URL, 不多花请求 */
+  async eventTournament(matchId: string): Promise<string | null> {
+    const tid = orObj((await this.event(matchId)).tournament).id;
+    return tid ? String(tid) : null;
+  }
+
+  /**
+   * esports_feed.league_tournament: getEventDetails 没给 tournament 时的退路 —— 这个赛区里
+   * [startDate, endDate] 含开赛日 (UTC 日期) 的那届; 没有就取 startDate 同年的第一届 (API 顺序, 新的在前)。
+   */
+  async leagueTournament(league: string, startTime: string): Promise<string | null> {
+    const lid = LEAGUE_IDS.find(([k]) => k === String(league).toUpperCase())?.[1];
+    if (!lid || !startTime) return null;
+    const p = await this.get(`${PERSISTED}/getTournamentsForLeague?hl=en-US&leagueId=${lid}`, Feed.TOURNAMENTS_TTL);
+    const ts: Json[] = [];
+    for (const lg of orArr(orObj(orObj(p).data).leagues)) {
+      for (const t of orArr(orObj(lg).tournaments)) if (t && t.id) ts.push(t);
+    }
+    const day = startTime.slice(0, 10);
+    for (const t of ts) if ((t.startDate || "") <= day && day <= (t.endDate || "")) return String(t.id);
+    for (const t of ts) if ((t.startDate || "").slice(0, 4) === day.slice(0, 4)) return String(t.id);
+    return null;
+  }
+
+  /**
+   * esports_feed.completed_events: 这一届已完赛的全部系列赛 (getCompletedEvents)。
+   * payload 缺失或形状不对返回 null (≠ 空表: 空表是"还没有打完的系列赛", 照样可以给 C)。
+   */
+  async completedEvents(tournamentId: string): Promise<Json[] | null> {
+    const p = await this.get(
+      `${PERSISTED}/getCompletedEvents?hl=en-US&tournamentId=${tournamentId}`,
+      Feed.COMPLETED_TTL,
+    );
+    const evs = orObj(orObj(orObj(p).data).schedule).events;
+    return Array.isArray(evs) ? evs : null;
+  }
+
+  /**
+   * esports_feed.match_detail: getEventDetails 的精简。ttl 默认 liveTtl (和 games() 同一个 URL、同一份缓存)。
+   * 别传更长的: 缓存认第一个写入者给的有效期, 同一场比赛的比分和局列表会跟着变旧 —— 只要 id 的话用 matchIds。
+   */
+  async matchDetail(matchId: string, ttl?: number): Promise<MatchDetail | null> {
+    const p = await this.get(this.eventUrl(matchId), ttl || this.liveTtl);
+    const m = orObj(orObj(orObj(orObj(p).data).event).match);
+    if (!Object.keys(m).length) return null;
+    return {
+      teams: orArr(m.teams).map((t: Json) => ({
+        id: t.id ? String(t.id) : null,
+        name: t.name ?? null,
+        code: t.code ?? null,
+        wins: orObj(t.result).gameWins ?? null,
+      })),
+      games: orArr(m.games).map((g: Json) => ({ number: g.number ?? null, id: g.id ?? null, state: g.state ?? null })),
+    };
+  }
+
+  /**
+   * esports_feed.match_ids: 别的系列赛的局号 → gameId 和两队的 esportsTeamId (重放要它的终局帧时用)。
+   * 照常按 liveTtl 读 (不能把共用的 getEventDetails 按一小时缓存 —— 那场比赛自己的比分会跟着停在一小时前),
+   * id 齐了 (两队都有 id、每一局都有局号和 id) 另记一份, 以后不再请求。比分和局的 state 故意不记: 它们会变。
+   */
+  async matchIds(matchId: string): Promise<MatchIds | null> {
+    const hit = this.ids.get(matchId);
+    if (hit) return hit;
+    const d = await this.matchDetail(matchId);
+    if (d === null) return null;
+    const out: MatchIds = {
+      teams: d.teams.map((t) => ({ id: t.id, name: t.name, code: t.code })),
+      games: d.games.map((g) => ({ number: g.number, id: g.id })),
+    };
+    if (
+      out.teams.length === 2 &&
+      out.teams.every((t) => t.id) &&
+      out.games.length &&
+      out.games.every((g) => g.number && g.id)
+    ) {
+      this.ids.set(matchId, out);
+    }
+    return out;
+  }
+
+  /**
+   * esports_feed.final_frame: 一局打完之后的终局帧。只对比分已经算上的局调 (= 确实打完了); 打完之后任何
+   * 更晚的 startingTime 都返回同一批冻结帧, 所以用当前的 lagged(60), 落空再试 300。蓝方是哪队取帧自己的
+   * gameMetadata (和 frameSides 同一个理由)。帧已经 finished、或最后一帧停在 10 分钟以前, 就按 gameId 记住。
+   */
+  async finalFrame(gameId: string): Promise<FinalFrame | null> {
+    const hit = this.finals.get(gameId);
+    if (hit) return hit;
+    let p: Json = null;
+    let frames: Json[] = [];
+    for (const lag of [60, 300]) {
+      p = await this.rawWindow(gameId, Feed.lagged(lag), this.windowTtl);
+      frames = orArr(orObj(p).frames);
+      if (frames.length) break;
+    }
+    if (!frames.length) return null;
+    const md = orObj(orObj(p).gameMetadata);
+    const f = frames[frames.length - 1];
+    const b = orObj(f.blueTeam);
+    const r = orObj(f.redTeam);
+    const ids = [orObj(md.blueTeamMetadata).esportsTeamId, orObj(md.redTeamMetadata).esportsTeamId];
+    const int = (x: Json) => Math.trunc(Number(x || 0));
+    const out: FinalFrame = {
+      blue_id: ids[0] ? String(ids[0]) : null,
+      red_id: ids[1] ? String(ids[1]) : null,
+      towers: [int(b.towers), int(r.towers)],
+      inhibitors: [int(b.inhibitors), int(r.inhibitors)],
+      gold: [int(b.totalGold), int(r.totalGold)],
+    };
+    const old = (Date.now() - frameTs(f)) / 1000 > 600; // 时间戳解析不了是 NaN, 比较为 false
+    if (f.gameState === "finished" || old) this.finals.set(gameId, out);
     return out;
   }
 

@@ -82,8 +82,9 @@ def record(outcome: str, *, stage: str | None = None, reason: str | None = None,
         "last_failure": ({"time": now, "stage": stage, "reason": reason}
                          if not ok else prev.get("last_failure")),
         # 网站发布那一步在整轮结束之前就记过了 (record_web), 这里原样带上 ——
-        # 不带的话每轮都会把它冲掉
+        # 不带的话每轮都会把它冲掉。跨赛区状态 (record_xregion) 同理
         "web_publish": prev.get("web_publish"),
+        "xregion": prev.get("xregion"),
     }
     _write(cur)
     return cur
@@ -106,6 +107,25 @@ def record_web(outcome: str, detail: str | None = None) -> dict:
     }
     _write(prev)
     return prev["web_publish"]
+
+
+def record_xregion(outcome: str, detail: str | None = None) -> dict:
+    """记跨赛区模型 C 的状态那一步 (daily_update._build_xregion): "ok" = 换上了新的, "failed" = 线上留旧的。
+
+    和网站发布一样是旁路: 失败不拦其他模型 (见 daily_update.XREGION_STEP), 但必须看得见 —— 否则 C 的状态
+    悄悄停在某一天, 而日更每一轮都报成功。last_success 跨失败保留: 看它就知道线上那份是哪天的。
+    """
+    prev = read()
+    now = _now()
+    old = prev.get("xregion") or {}
+    prev["xregion"] = {
+        "last_run": now,
+        "outcome": outcome,
+        "detail": detail,
+        "last_success": now if outcome == "ok" else old.get("last_success"),
+    }
+    _write(prev)
+    return prev["xregion"]
 
 
 def _write(obj: dict) -> None:
@@ -165,6 +185,13 @@ def summary() -> dict:
         msg = (f"{msg + ' ' if msg else ''}"
                f"网站模型发布失败 ({web.get('last_run')}): {web.get('detail') or '原因未记录'}")
 
+    # 跨赛区状态没换上同理: 服务照常, 但跨赛区看板用的是旧状态
+    xr = s.get("xregion") or {}
+    if xr.get("outcome") == "failed":
+        msg = (f"{msg + ' ' if msg else ''}"
+               f"跨赛区模型 C 的状态没换上 ({xr.get('last_run')}, 线上仍是 {xr.get('last_success') or '更早'} 那一份): "
+               f"{xr.get('detail') or '原因未记录'}")
+
     return {
         "level": level,
         "message": msg,
@@ -177,4 +204,5 @@ def summary() -> dict:
         # 失败详情始终带上 —— 成功之后也留着, 用来回答"上次是怎么坏的"
         "last_failure": s.get("last_failure"),
         "web_publish": s.get("web_publish"),
+        "xregion": s.get("xregion"),
     }

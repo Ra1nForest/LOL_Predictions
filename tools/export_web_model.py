@@ -28,12 +28,16 @@ explain.py 改一句话, 重新导出就跟上了。
   frontend/public/web/stage2_post.json     BP 后模型 (树) + Platt + 英雄/选手-英雄的胜场场数表
   frontend/public/web/teams.json           每队一行的滚动统计 (含母赛区) + 各赛区已知队伍及其并集 + 队名别名
   frontend/public/web/explain.json         explain.py 的文案表
+  frontend/public/web/xregion.json         跨赛区模型 C 的状态 (artifacts/xregion.json 原样, 过 sanity_check 才导出)
   frontend/scripts/golden/ingame_cases.json    黄金用例 (不发布)
   frontend/scripts/golden/stage1_cases.json
   frontend/scripts/golden/stage2_cases.json
   frontend/scripts/golden/intl_cases.json      国际赛: pregame_league / _known_for / map_team,
                                                以及看板的 _pregame_reason / _early_prediction (开局
-                                               头 3 分钟, test:diff 碰不到) / _board_warnings
+                                               头 3 分钟, test:diff 碰不到) / _board_warnings /
+                                               _xregion_note / _xregion_pregame (跨赛区模型 C 的说明)
+  frontend/scripts/golden/xregion_cases.json   跨赛区模型 C: 时间、终局帧判胜负、解码、OE 去重、引擎、
+                                               predict、看板整条重放 (xregion.py 的真函数)
 
     python tools/export_web_model.py
     npm --prefix frontend run test:golden
@@ -321,14 +325,16 @@ def _expect(ig, api, cache, inp) -> dict:
 
 def _ingame_resp(api, inp) -> dict:
     """api._ingame_core 的真实输出 —— 看板头条调它的方式 (不带 pre_ctx)。include_pregame 默认
-    True; 国际赛用例另带 include_pregame=False (不带赛前特征) 或 pre_league (赛前特征按母赛区算)。"""
+    True; 国际赛用例另带 include_pregame=False (不带赛前特征) 或 pre_league (赛前特征按母赛区算)。
+    带 blend_with 的 (跨赛区模型 C 当开局渐变的锚) 按看板的调法: blend=True, blend_with=那个数。"""
     st = api.IngameState(minute=inp["minute"], golddiff=inp["golddiff"], xpdiff=None,
                          csdiff=inp["csdiff"], blue_kills=inp["blue_kills"],
                          red_kills=inp["red_kills"], gold_total=inp["gold_total"])
+    kw = {"blend": True, "blend_with": inp["blend_with"]} if "blend_with" in inp else {}
     out, _row = api._ingame_core(inp["blue"], inp["red"], inp["league"], st,
                                  inp["blue_champs"], inp["red_champs"],
                                  inp.get("include_pregame", True),
-                                 pre_league=inp.get("pre_league"))
+                                 pre_league=inp.get("pre_league"), **kw)
     return _jsonable(out)
 
 
@@ -449,22 +455,35 @@ def intl_inputs(base: dict, store) -> list[tuple[str, dict]]:
     for lg in ("Worlds", "Esports World Cup"):
         out.append((f"syn:intl:{lg}:同母赛区按{hb}",
                     {**base, "league": lg, "pre_league": hb}))
+    # 跨赛区模型 C 出数时: 不带赛前特征, 开局 3-15 分钟以 C 的赛前数为锚渐变 (blend_with)。
+    # 15 分钟及以后权重到 1, 原样是局内模型的数; 0.5 附近和极端的锚各一个
+    for mn in (3, 5, 9.5, 14.99, 15, 22):
+        out.append((f"syn:intl:DCGI@{mn}:C锚",
+                    {**base, "league": "DCGI", "minute": mn, "include_pregame": False,
+                     "blend_with": 0.3123456789012345}))
+    for anchor in (0.5, 0.97, 0.000001):
+        out.append((f"syn:intl:Worlds@6:C锚={anchor}",
+                    {**base, "league": "Worlds", "minute": 6, "include_pregame": False, "blend_with": anchor}))
     return out
 
 
-def intl_cases(api, store) -> dict:
+def intl_cases(api, store, xstate) -> dict:
     """国际赛的几张小表 (golden/intl_cases.json), 给浏览器版逐条对账:
 
       pregame_league  api.pregame_league —— 赛前/BP 后按哪个赛区算, null = 不给
       known_for       api._known_for —— 映射队名用哪份已知队伍表 (四大按本赛区, 其余按并集)
-      map_team        esports_feed.map_team —— known 的三种形状: null (不校验)、[] (空表, 必须返回
-                      null)、"*" (并集) 或赛区名 (该赛区的表)
+      map_team        esports_feed.map_team —— known 的几种形状: null (不校验)、[] (空表, 必须返回
+                      null)、"*" (并集)、赛区名 (该赛区的表)、"xregion" (跨赛区模型 C 状态里的全部队名,
+                      = Object.keys(xregion.json 的 teams), 顺序不要重排)
       pregame_reason  api._pregame_reason —— 看板上"为什么没有赛前/BP 后"那几句 (四大、同母赛区、
                       跨赛区、一队/两队不认识)
       early           api._early_prediction —— 开局头 3 分钟的 prediction (note 结尾三选一、source
-                      可能为 null、同母赛区时的 warnings)。test:diff 只取终局帧, 碰不到这一段
+                      可能为 null 或 "xregion"、同母赛区 / C 出数时的 warnings)。test:diff 只取终局帧,
+                      碰不到这一段
       board_warnings  api._board_warnings —— 局内阶段提醒的顺序, 以及故意不带赛前特征时去掉那句
                       "没有可用的赛前队伍统计"
+      xregion_note    api._xregion_note —— C 出数时的那句说明 (+ 没有跨赛区记录的母赛区)
+      xregion_pregame api._xregion_pregame —— 还没有帧时只有 C 的那份 prediction
     """
     from esports_feed import TEAM_ALIASES, map_team
     from feature_store import LEAGUES
@@ -488,12 +507,17 @@ def intl_cases(api, store) -> dict:
     names = list(dict.fromkeys(
         sorted(TEAM_ALIASES)[:4] + ["Cloud9 Kia", "Team Liquid Alienware", k["LCK"][0],
                                     k["LCK"][0].upper(), k["LPL"][0].lower(), "GAM Esports",
-                                    "RED Kalunga", "TBD", "", None]))
-    specs = [None, [], "*", "LCK", "LPL", "LCS"]
+                                    "RED Kalunga", "TBD", "", None,
+                                    # 四大之外的别名 (只对 C 的已知表有效) 和它们的变体
+                                    "LEVIATÁN", "LOS", "MIBR.LOS", "Relove Deep Cross Gaming", "Team Secret",
+                                    "RED KALUNGA", "Team Secret Whales", "Natus Vincere", "BILIBILI GAMING"]))
+    specs = [None, [], "*", "LCK", "LPL", "LCS", "xregion"]
 
     def known_of(spec):
         if spec is None or isinstance(spec, list):
             return spec
+        if spec == "xregion":
+            return list(xstate["teams"])            # = api._load_xregion 的 xregion_known (已按名字排好)
         return store.known_teams(None if spec == "*" else spec)
 
     mt = [{"in": [n, spec], "out": map_team(n, known_of(spec))} for n in names for spec in specs]
@@ -525,6 +549,9 @@ def intl_cases(api, store) -> dict:
                         "out": list(api._pregame_reason(m))})
 
     kinds = list(dict.fromkeys((r["out"][0], r["out"][1]) for r in reasons))
+    # 跨赛区模型 C 出数时 (看板把 why_kind / why 换成这一对): 两队母赛区都有跨赛区记录 / 一个没有 / 两个都没有
+    xnotes = [[], ["NACL"], ["NACL", "LCKC"]]
+    kinds += [("xregion", api._xregion_note(nh)) for nh in xnotes]
     early = [{"in": [mn, p1, p2, wk, why], "out": api._early_prediction(mn, p1, p2, wk, why)}
              for wk, why in kinds for mn in (None, 0, 2)
              for p1, p2 in ((None, None), (0.6123456789, None), (None, 0.4321), (0.6123456789, 0.4321))]
@@ -532,8 +559,411 @@ def intl_cases(api, store) -> dict:
               [NO_PRE_STATS], [], ["别的提醒"]]
     bw = [{"in": [w, wk, why], "out": api._board_warnings(w, wk, why)}
           for wk, why in kinds for w in warns0]
+    xn = [{"in": nh, "out": api._xregion_note(nh)} for nh in xnotes]
+    xp = [{"in": [p, api._xregion_note(nh)], "out": api._xregion_pregame(p, api._xregion_note(nh))}
+          for p, nh in ((0.4320921123610977, []), (0.9, ["NACL"]))]
     return {"pregame_league": pg, "known_for": kf, "map_team": mt,
-            "pregame_reason": reasons, "early": early, "board_warnings": bw}
+            "pregame_reason": reasons, "early": early, "board_warnings": bw,
+            "xregion_note": xn, "xregion_pregame": xp}
+
+
+def export_xregion() -> dict:
+    """跨赛区模型 C 的状态: artifacts/xregion.json 原样 (日更生成的那一份, 服务读的也是它)。
+
+    过不了 xregion.sanity_check 就拒绝导出 —— 坏状态上了网站, 跨赛区看板会悄悄给出另一个数。
+    """
+    import xregion as X
+    p = ART / "xregion.json"
+    if not p.exists():
+        raise SystemExit(f"缺 {p} —— 先跑 python xregion.py --build")
+    st = X.load_state(p)
+    bad = X.sanity_check(st)
+    if bad:
+        raise SystemExit(f"{p.name} 没过健全性检查: {bad}")
+    return st
+
+
+# 2026-10-03 DCGI 瑞士轮第一天的六场 BO1 (真实赛果, lolesports getCompletedEvents) —— 黄金用例的固定输入。
+# 队名按 lolesports 原样, OE 名在导出时用 map_team(名, C 的已知表) 现映射: 哪天某队从状态里过期了, 它就是
+# null (这个系列赛算 unmapped), 用例照样成立, 不会让每天的导出失败。
+_DCGI_1003 = [
+    ("117133805552196841", "2026-10-03T08:00:00Z", "RED Kalunga", "RED", "Natus Vincere", "NAVI", 1, 0),
+    ("117133805552262379", "2026-10-03T09:00:00Z", "FlyQuest", "FLY", "LGD GAMING", "LGD", 0, 1),
+    ("117133805552262381", "2026-10-03T10:00:00Z", "kt Rolster", "KT", "Shopify Rebellion", "SR", 1, 0),
+    ("117133805552262383", "2026-10-03T11:00:00Z", "BNK FEARX", "BFX", "Team Vitality", "VIT", 1, 0),
+    ("117133805552262385", "2026-10-03T12:00:00Z", "Xi'an Team WE", "WE", "GAM Esports", "GAM", 1, 0),
+    ("117133805552262387", "2026-10-03T13:00:00Z", "Beijing JDG Esports", "JDG", "HANJIN BRION", "BRO", 0, 1),
+]
+
+
+def xregion_cases(xstate) -> dict:
+    """跨赛区模型 C 的黄金用例 (golden/xregion_cases.json), 期望值全部来自 xregion.py 的真函数, 状态就是
+    同一次导出写进 public/web/xregion.json 的那一份 (oe_asof / built_at 一并记下, 对账前先核对)。
+
+      exp              portable_exp (fdlibm 的逐行移植): 引擎里所有 exp 都走它, 浏览器版不能用 Math.exp ——
+                       边界值 (约简分支的两端、|x| < 2**-28、上下溢附近) 加三段固定种子的随机数
+      epoch / game_t   epoch_s、game_t (重放的引擎时间)
+      frame_verdict    终局帧 → [胜方下标, 蓝方下标, [|塔差|, |水晶差|, |经济差|]] 或 null
+      decode           decode_series + frames_needed (BO1、横扫、按帧解码且比分约束改判、缺帧退回交替序、
+                       id 对不上、三项全平、没分出胜负的当前系列赛、平分时的领先方; OE 已有的局 known 先扣配额,
+                       和比分对不上的记 {"error": true})
+      in_oe            OE 去重 (in_oe + oe_lookup 的胜方 / 蓝方): 输入自带一个最小状态 {"events": …} 和别名表 ——
+                       UTC 零点两侧、窗口边界正好 / 差 1 秒、蓝红对调、局号不同、旧名只认别名表指向的那一队
+      engine           Engine.from_state + play + predict: 同一时间戳的局一组更新 vs 错开 1 秒、新赛区先验
+                       (含 migr 的均值)、同母赛区 / 查不到母赛区的局不更新; 输出带走完之后的 o / oprior /
+                       olast / r (数对不上时能直接看出是哪一步)
+      predict          xregion.predict (不重放): 各赛区键、大小写、没有系数的键、同母赛区、不认识的队
+      replay           board_predict 整条 (+ replay_frames_needed): 本赛事的系列赛列表 → 重放的局 (已解码、
+                       已排序) → 蓝方胜率; 真实的 DCGI 首日、BO5 按帧改判、缺帧交替、当前系列赛打到一半、
+                       回看打完的系列赛、两个系列赛同时开打、输入乱序、整场 / 部分已在 OE、映射不出的队、
+                       没有跨赛区记录的母赛区、同母赛区、不认识的队、几百天后 (衰减)、没有系数的键、
+                       当前系列赛比分落后 (withheld)、一半在 OE 且缺帧、还没有帧 (两种选边的平均)。
+                       别名表 (= esports_feed.TEAM_ALIASES, 看板传的那一份) 放在顶层 aliases, 用例里 aliases: true 才传
+    """
+    import copy
+    import xregion as X
+    from esports_feed import TEAM_ALIASES, map_team
+
+    st = xstate
+    AL = dict(TEAM_ALIASES)
+    xknown = list(st["teams"])
+    teams = st["teams"]
+
+    def pick(league, k=0):
+        # 状态里这个池子常规局数最多的第 k 支队 —— 不写死队名: 状态每天重建, 过期的队会被剪掉
+        ts = sorted((t for t, v in teams.items() if v["pool"] == league), key=lambda t: (-teams[t]["ng"], t))
+        if len(ts) <= k:
+            raise SystemExit(f"xregion 状态里 {league} 不够 {k + 1} 支队, 造不出黄金用例")
+        return ts[k]
+
+    K0, K1, L0, L1, E0, A0 = pick("LCK"), pick("LCK", 1), pick("LPL"), pick("LPL", 1), pick("LEC"), pick("LCS")
+    P0, E1 = pick("LCP"), pick("LEC", 1)
+    pools = {v["pool"] for v in teams.values()}
+    nh_migr = next((L for L in sorted(st["migr"]) if L in pools), None)
+    nh_plain = next((L for L in sorted(st["leagues"]) if L in pools and L not in st["migr"]
+                     and not st["leagues"][L]["has_crossregion_history"]), None)
+    t_oe = st["oe_asof_t"]
+    day0 = math.floor(t_oe) + 2                         # OE 截止后第二天
+    iso = lambda days, hours=0.0: X._iso(day0 + days + hours / 24)          # noqa: E731
+
+    def team(name, wins, tid, oe="same"):
+        return {"name": name, "code": (name or "")[:3].upper(), "oe": name if oe == "same" else oe,
+                "wins": wins, "id": tid}
+
+    def series(mid, start, bo, a, b, wa, wb, frames=None, ids=("TA", "TB")):
+        s = {"match_id": mid, "start": start, "best_of": bo, "teams": [team(a, wa, ids[0]), team(b, wb, ids[1])]}
+        if frames is not None:
+            s["frames"] = frames
+        return s
+
+    def fr(blue_id, red_id, towers, inhib, gold):
+        return {"blue_id": blue_id, "red_id": red_id, "towers": list(towers), "inhibitors": list(inhib),
+                "gold": list(gold)}
+
+    # ── 可移植的 exp ──
+    import random
+    rng = random.Random(11)
+    xs = [0.0, -0.0, 1e-30, -1e-30, 1e-9, 2.0 ** -28, -(2.0 ** -28), 0.3465, 0.3466, -0.3466, 1.0397, 1.0398,
+          -1.0398, 0.5, -0.5, 20.0, -20.0, 700.0, -700.0, 709.7, 709.78, -708.5, -720.0, -745.0, -746.0,
+          -0.9582347254583471]                      # 最后一个: math.exp (MSVC) 和 fdlibm 差一位的实例
+    xs += [rng.uniform(-6, 6) for _ in range(1500)]           # 赛前胜率 (Elo 差 / S)、logistic 的 z
+    xs += [rng.uniform(-0.05, 0) for _ in range(1000)]        # 衰减 (−ln2·dt / 365)
+    xs += [rng.uniform(-40, 40) for _ in range(500)]
+    exps = [{"in": x, "out": X.portable_exp(x)} for x in xs]
+
+    # ── 时间 ──
+    isos = ["2026-10-03T08:00:00Z", "2026-10-03T08:00:00.000Z", "2026-10-03T23:59:59Z", "2026-10-04T00:00:00Z",
+            "2026-10-04T07:30:00+08:00", "1970-01-01T00:00:00Z", "2027-03-01T12:34:56Z"]
+    epoch = [{"in": s, "out": X.epoch_s(s)} for s in isos]
+    gt = [{"in": [s, n], "out": X.game_t(s, n)} for s in isos for n in (1, 2, 5)]
+
+    # ── 终局帧 ──
+    ids = ["TA", "TB"]
+    fv_in = [
+        (fr("TA", "TB", (9, 3), (2, 0), (70000, 60000)), ids),        # 蓝 = teams[0], 塔多
+        (fr("TB", "TA", (9, 3), (2, 0), (70000, 60000)), ids),        # 蓝 = teams[1]
+        (fr("TA", "TB", (5, 5), (1, 0), (60000, 61000)), ids),        # 塔平看水晶
+        (fr("TA", "TB", (5, 5), (1, 1), (60000, 61000)), ids),        # 再平看经济
+        (fr("TA", "TB", (5, 5), (1, 1), (60000, 60000)), ids),        # 全平 → null
+        (fr("TA", "TC", (9, 3), (2, 0), (70000, 60000)), ids),        # id 对不上 → null
+        (fr("TA", "TB", (9, 3), (2, 0), (70000, 60000)), ["TA", None]),
+        (fr(None, None, (9, 3), (2, 0), (70000, 60000)), ids),
+        (None, ids),
+        ({"blue_id": "TA", "red_id": "TB", "towers": [9, 3]}, ids),     # 缺列 → null
+    ]
+    fvc = [{"in": [f, i], "out": (lambda v: None if v is None else [v[0], v[1], list(v[2])])(X.frame_verdict(f, i))}
+           for f, i in fv_in]
+
+    # ── 解码 ──
+    S0 = "2026-10-05T09:00:00Z"
+    dec_in = [
+        ("BO1", series("d1", S0, 1, "A", "B", 0, 1)),
+        ("横扫 2-0", series("d2", S0, 3, "A", "B", 2, 0)),
+        ("横扫 0-3", series("d3", S0, 5, "A", "B", 0, 3)),
+        ("2-1 按帧", series("d4", S0, 3, "A", "B", 2, 1, {
+            "1": fr("TB", "TA", (2, 10), (0, 2), (50000, 70000)), "2": fr("TA", "TB", (3, 9), (0, 1), (55000, 66000))})),
+        # 3-2: 帧说 A 赢了前四局, 而 A 的非决胜局配额只有 2 —— 把握最小的两局改判给 B
+        ("3-2 比分约束改判", series("d5", S0, 5, "A", "B", 3, 2, {
+            "1": fr("TA", "TB", (9, 2), (2, 0), (70000, 52000)), "2": fr("TB", "TA", (4, 6), (0, 0), (58000, 60000)),
+            "3": fr("TA", "TB", (6, 6), (1, 0), (61000, 60000)), "4": fr("TB", "TA", (2, 11), (0, 3), (49000, 72000))})),
+        ("3-2 把握相同按局号", series("d6", S0, 5, "A", "B", 3, 2, {
+            "1": fr("TA", "TB", (8, 3), (1, 0), (65000, 60000)), "2": fr("TA", "TB", (8, 3), (1, 0), (65000, 60000)),
+            "3": fr("TA", "TB", (8, 3), (1, 0), (65000, 60000)), "4": fr("TA", "TB", (8, 3), (1, 0), (65000, 60000))})),
+        ("缺一局帧 → 交替", series("d7", S0, 5, "A", "B", 2, 3, {
+            "1": fr("TA", "TB", (9, 2), (2, 0), (70000, 52000)), "2": None,
+            "3": fr("TB", "TA", (2, 9), (0, 2), (52000, 70000)), "4": fr("TA", "TB", (9, 2), (2, 0), (70000, 52000))})),
+        ("没给帧 → 交替", series("d8", S0, 5, "A", "B", 3, 1)),
+        ("id 对不上 → 交替", series("d9", S0, 3, "A", "B", 1, 2, {
+            "1": fr("TX", "TB", (9, 2), (2, 0), (70000, 52000)), "2": fr("TA", "TB", (2, 9), (0, 2), (52000, 70000))})),
+        ("三项全平 → 交替", series("d10", S0, 3, "A", "B", 2, 1, {
+            "1": fr("TA", "TB", (5, 5), (0, 0), (60000, 60000)), "2": fr("TA", "TB", (2, 9), (0, 2), (52000, 70000))})),
+        ("没分出胜负 1-1 按帧", series("d11", S0, 5, "A", "B", 1, 1, {
+            "1": fr("TA", "TB", (2, 9), (0, 2), (52000, 70000)), "2": fr("TB", "TA", (2, 9), (0, 2), (52000, 70000))})),
+        ("没分出胜负 1-1 交替 (平分时 teams[0] 先)", series("d12", S0, 5, "A", "B", 1, 1)),
+        ("没分出胜负 1-2 交替 (领先方先)", series("d13", S0, 5, "A", "B", 1, 2)),
+        ("best_of 不知道 = 没分出胜负", series("d14", S0, None, "A", "B", 2, 1)),
+        ("0-0", series("d15", S0, 3, "A", "B", 0, 0)),
+    ]
+    dec_in = [(n, s, None) for n, s in dec_in]
+    # OE 里已有的局 (known = {局号: (胜方, 蓝方)}): 先从比分里扣掉, 剩下的局只在剩下的配额里解码
+    dec_in += [
+        ("一半在 OE (前两局 A 赢) + 缺帧: 剩下三局全归 B", series("k1", S0, 5, "A", "B", 2, 3), {1: (0, 0), 2: (0, 1)}),
+        ("一半在 OE + 有帧: 帧说 A 赢的局改判", series("k2", S0, 5, "A", "B", 2, 3, {
+            "3": fr("TA", "TB", (9, 2), (2, 0), (70000, 52000)), "4": fr("TB", "TA", (4, 6), (0, 0), (58000, 60000))}),
+         {1: (0, 0), 2: (0, 1)}),
+        ("OE 有决胜局", series("k3", S0, 3, "A", "B", 2, 1), {3: (0, 1)}),
+        ("横扫, OE 有一局", series("k4", S0, 3, "A", "B", 0, 2), {1: (1, 0)}),
+        ("OE 的局号超出比分 (忽略)", series("k5", S0, 5, "A", "B", 1, 1), {4: (0, 0)}),
+        ("OE 里 A 赢的比比分多: 报错", series("k6", S0, 5, "A", "B", 1, 3), {1: (0, 0), 2: (0, 1)}),
+        ("OE 里胜者在决胜局前就赢满: 报错", series("k7", S0, 5, "A", "B", 3, 1), {1: (0, 0), 2: (0, 0), 3: (0, 1)}),
+        ("横扫但 OE 说落后方赢过: 报错", series("k8", S0, 3, "A", "B", 2, 0), {1: (1, 1)}),
+    ]
+
+    def dec_out(s, known):
+        try:
+            return {"needed": X.frames_needed(s, known), "games": X.decode_series(s, known)}
+        except ValueError:
+            return {"error": True}
+
+    dec = [{"src": n, "in": s, "known": None if kn is None else {str(i): list(v) for i, v in kn.items()},
+            "out": dec_out(s, kn)} for n, s, kn in dec_in]
+
+    # ── 去重 (自带一个最小状态) ──
+    # teams = 状态里的现役队名: OE 那边的队名不在里面 (过期的旧名) 时只要另一方对得上就算同一局
+    mini = {"teams": {"P": {}, "Q": {}, "R": {}, "S": {}, "W": {}, "K": {}},
+            "events": {"2026 X": {"games": [
+                ["P", "Q", 1, "2026-10-04T00:20:00Z", 1, "cross"],      # 跨 UTC 零点
+                ["Q", "P", 2, "2026-10-04T01:10:00Z", 0, "cross"],
+                ["P", "R", 1, "2026-10-03T23:50:00Z", 1, "cross"],
+                ["P", "S", None, "2026-10-03T12:00:00Z", 1, "cross"],    # 没有局号的 OE 局: 永远配不上
+                ["Old Name", "K", 1, "2026-07-15T14:50:00Z", 1, "cross"],     # OE 记的是过期的旧名
+                ["Old Name", "Gone Too", 1, "2026-07-16T09:20:00Z", 1, "cross"],
+                ["S", "Other Old", 1, "2026-07-17T09:20:00Z", 0, "cross"],    # 旧名, 但别名指向别的队
+                ["P", "Q", 3, "2026-10-04T02:00:00Z", 0, "cross"],              # 同一局号窗口里两条: 取近的
+                ["Q", "P", 3, "2026-10-04T12:00:00Z", 0, "cross"],
+            ]}}}
+    mini_al = {"Old Name": "W", "Other Old": "R", "Q": "Z"}            # "Q" 是现役队: 别名不让它通配
+    q = [
+        ("前一天 23:00 开赛, OE 第 1 局在零点后", ["P", "Q", 1, "2026-10-03T23:00:00Z"]),
+        ("蓝红对调", ["Q", "P", 1, "2026-10-03T23:00:00Z"]),
+        ("第 2 局", ["P", "Q", 2, "2026-10-03T23:00:00Z"]),
+        ("局号不同", ["P", "Q", 3, "2026-10-03T23:00:00Z"]),
+        ("赛程写零点后开赛, OE 那局在前一天 23:50", ["R", "P", 1, "2026-10-04T00:30:00Z"]),
+        ("窗口下界正好 (OE 早 6 小时)", ["P", "Q", 1, "2026-10-04T06:20:00Z"]),
+        ("窗口下界外 1 秒", ["P", "Q", 1, "2026-10-04T06:20:01Z"]),
+        ("窗口上界正好 (OE 晚 18 小时)", ["P", "Q", 1, "2026-10-03T06:20:00Z"]),
+        ("窗口上界外 1 秒", ["P", "Q", 1, "2026-10-03T06:19:59Z"]),
+        ("别的对手", ["P", "Z", 1, "2026-10-03T23:00:00Z"]),
+        ("OE 没局号", ["P", "S", 1, "2026-10-03T12:00:00Z"]),
+        ("OE 用过期旧名, 另一方对得上 (2026 EWC 的 Team Secret)", ["W", "K", 1, "2026-07-15T14:25:00Z"]),
+        ("同上, 蓝红对调", ["K", "W", 1, "2026-07-15T14:25:00Z"]),
+        ("OE 那边是另一支现役队: 不算", ["Q", "R", 1, "2026-10-03T23:00:00Z"]),
+        ("两边都是过期旧名: 不算", ["W", "Q", 1, "2026-07-16T09:00:00Z"]),
+        ("旧名的别名指向别的队 (R), 不是 W: 不算", ["S", "W", 1, "2026-07-17T09:00:00Z"]),
+        ("同上, 指向的那队: 算", ["S", "R", 1, "2026-07-17T09:00:00Z"]),
+        ("别名表写了现役队 Q → Z: 不通配", ["P", "Z", 1, "2026-10-03T23:00:00Z"]),
+        ("窗口里两条同局号: 取离 startTime 近的那条的胜负", ["P", "Q", 3, "2026-10-04T01:00:00Z"]),
+        ("同上, 另一边近", ["Q", "P", 3, "2026-10-04T11:00:00Z"]),
+    ]
+    ioe = []
+    for n, a in q:
+        for al in (mini_al, None):
+            idx = X.oe_index(mini, al)
+            hit = X.oe_lookup(idx, *a)
+            ioe.append({"src": n + ("" if al else " (没有别名表)"), "in": {"state": mini, "aliases": al, "q": a},
+                        "out": {"hit": X.in_oe(idx, *a), "lookup": None if hit is None else list(hit)}})
+
+    # ── 引擎 ──
+    t1 = float(day0)
+    coef = st["coefficients"]["WORLDS"]
+
+    def run_engine(games, blue, red, tp):
+        e = X.Engine.from_state(st)
+        n = e.play(games)
+        p = e.predict(coef, blue, red, tp)
+        Ls = sorted({x for g in games for x in (e.pool.get(g["blue"]), e.pool.get(g["red"])) if x}
+                    | {x for x in (e.pool.get(blue), e.pool.get(red)) if x})
+        Ts = sorted({g["blue"] for g in games} | {g["red"] for g in games} | {blue, red})
+        return {"n_upd": n, "p": p,
+                "o": {L: e.o[L] for L in Ls if L in e.o}, "oprior": {L: e.oprior[L] for L in Ls if L in e.o},
+                "olast": {L: e.olast[L] for L in Ls if L in e.o},
+                "r": {T: e.r[T] for T in Ts if T in e.r}}
+
+    g = lambda t, b, r, w: {"t": t, "blue": b, "red": r, "blue_win": w}          # noqa: E731
+    eng_in = [
+        ("一局跨赛区", [g(t1, K0, L0, 1)], K0, L0, t1 + 1),
+        ("同一时间戳两局共用 LCK: 一组更新", [g(t1, K0, L0, 1), g(t1, K1, E0, 0)], K0, E0, t1 + 1),
+        ("错开 1 秒: 第二局看得到第一局", [g(t1, K0, L0, 1), g(t1 + 1 / 86400, K1, E0, 0)], K0, E0, t1 + 1),
+        ("同母赛区的局不更新", [g(t1, K0, K1, 1)], K0, L0, t1 + 1),
+        ("不认识的队不更新", [g(t1, "Definitely Not A Team", L0, 1)], K0, L0, t1 + 1),
+        ("几百天后 (衰减)", [g(t1, K0, L0, 0)], K0, L0, t1 + 300),
+        ("没有比赛, 只衰减", [], A0, P0, t1 + 30),
+    ]
+    if nh_plain:
+        T = pick(nh_plain)
+        eng_in.append((f"第一次出现的赛区 {nh_plain} 取先验 −600", [g(t1, T, K0, 1)], T, L0, t1 + 1))
+    if nh_migr:
+        T = pick(nh_migr)
+        eng_in.append((f"第一次出现的赛区 {nh_migr} 取迁入队原赛区偏移的均值", [g(t1, L0, T, 0)], T, E0, t1 + 1))
+    eng = [{"src": n, "in": {"games": gs, "blue": b, "red": r, "t": tp, "league_key": "WORLDS"},
+            "out": run_engine(gs, b, r, tp)} for n, gs, b, r, tp in eng_in]
+
+    # ── predict (不重放) ──
+    pr_in = []
+    for key in ("WORLDS", "MSI", "FIRST STAND", "ESPORTS WORLD CUP", "DCGI", "worlds", "Esports World Cup", "LCK", ""):
+        pr_in.append([key, K0, L0, t1])
+    pr_in += [["WORLDS", L0, K0, t1], ["WORLDS", E0, A0, t1 + 10], ["WORLDS", P0, K0, t1 + 0.5],
+              ["WORLDS", K0, K1, t1], ["WORLDS", "Definitely Not A Team", K0, t1], ["WORLDS", K0, L0, t1 + 2000]]
+    prd = [{"in": a, "out": X.predict(st, *a)} for a in pr_in]
+
+    # ── 看板整条 ──
+    def dcgi(upto_idx, current_wins=None):
+        out = []
+        for mid, start, a, ca, b, cb, wa, wb in _DCGI_1003[:upto_idx + 1]:
+            out.append({"match_id": mid, "start": start, "best_of": 1,
+                        "teams": [{"name": a, "code": ca, "oe": map_team(a, xknown), "wins": wa, "id": None},
+                                  {"name": b, "code": cb, "oe": map_team(b, xknown), "wins": wb, "id": None}]})
+        if current_wins is not None:
+            out[-1]["teams"][0]["wins"], out[-1]["teams"][1]["wins"] = current_wins
+        return out
+
+    def last_oe_series(min_games):
+        """状态里最近的一个跨赛区 OE 系列赛 (同一对、局号 1..n 连续、相邻两局 ≤ 12 小时), 至少 min_games 局。"""
+        allg = [(ev, x) for ev, v in st["events"].items() for x in v["games"] if x[5] == "cross" and x[2]]
+        allg.sort(key=lambda z: z[1][3], reverse=True)
+        for _ev, x in allg:
+            if x[2] != min_games:
+                continue
+            pair = {x[0], x[1]}
+            run = [y for _e, y in allg if {y[0], y[1]} == pair and abs(X.epoch_s(y[3]) - X.epoch_s(x[3])) < 12 * 3600]
+            run.sort(key=lambda y: y[2])
+            if [y[2] for y in run] == list(range(1, min_games + 1)):
+                return run
+        raise SystemExit(f"状态里找不到 {min_games} 局的跨赛区系列赛")
+
+    def oe_as_series(run, mid, extra=0, bo=None):
+        a, b = run[0][0], run[0][1]
+        wins = [sum(1 for y in run if (y[0] == a) == bool(y[4])), 0]
+        wins[1] = len(run) - wins[0]
+        start = X._iso(X.epoch_s(run[0][3]) / 86400 - 0.5 / 24)       # 第一局前半小时开赛
+        s = series(mid, start, bo or 5, a, b, wins[0], wins[1])
+        if extra:
+            s["teams"][0]["wins"] += extra
+        # 按 OE 的真实结果给每一局造一份"终局帧" (蓝方按 OE 的蓝方): 解码要用
+        frames = {}
+        for y in run:
+            blue_is_a = y[0] == a
+            win_blue = bool(y[4])
+            hi, lo = (9, 3) if win_blue else (3, 9)
+            frames[str(y[2])] = fr("TA" if blue_is_a else "TB", "TB" if blue_is_a else "TA", (hi, lo), (1, 0) if win_blue else (0, 1),
+                                   (65000, 60000) if win_blue else (60000, 65000))
+        for k in range(len(run) + 1, len(run) + extra + 1):
+            frames[str(k)] = fr("TA", "TB", (8, 4), (1, 0), (64000, 60000))
+        s["frames"] = frames
+        return s
+
+    cur_late = lambda mid, a, b, days=1.0: series(mid, iso(days), 3, a, b, 0, 0)       # noqa: E731
+    rp_in = []
+    rp_in.append(("DCGI 首日真实赛果: 第 6 场开打前重放前 5 场", "DCGI", dcgi(5, (0, 0)), _DCGI_1003[5][0], 1))
+    rp_in.append(("DCGI 首日真实赛果: 回看打完的第 6 场", "DCGI", dcgi(5), _DCGI_1003[5][0], 1))
+    rp_in.append(("DCGI 首日真实赛果: 第 1 场 (没有可重放的)", "DCGI", dcgi(0), _DCGI_1003[0][0], 1))
+    bo5 = copy.deepcopy(dec_in[4][1])
+    bo5.update(match_id="x5", start=iso(0, 8))
+    bo5["teams"][0].update(name=K0, oe=K0)
+    bo5["teams"][1].update(name=L0, oe=L0)
+    rp_in.append(("BO5 按帧解码且比分约束改判", "WORLDS", [bo5, cur_late("c1", E0, A0)], "c1", 1))
+    alt = copy.deepcopy(bo5)
+    alt["frames"]["2"] = None
+    rp_in.append(("缺一局终局帧: 整个系列赛交替", "WORLDS", [alt, cur_late("c1", E0, A0)], "c1", 1))
+    cur = series("c2", iso(1, 9), 5, K0, E0, 1, 1, {
+        "1": fr("TB", "TA", (2, 9), (0, 1), (55000, 64000)), "2": fr("TA", "TB", (3, 10), (0, 2), (51000, 66000))})
+    rp_in.append(("当前系列赛 1-1 打第 3 局 (前两局按帧)", "MSI", [cur], "c2", 3))
+    done = series("c3", iso(1, 9), 3, K0, E0, 2, 1, {
+        "1": fr("TA", "TB", (2, 9), (0, 1), (55000, 64000)), "2": fr("TB", "TA", (3, 10), (0, 2), (51000, 66000))})
+    rp_in.append(("回看打完的 2-1 系列赛的第 2 局", "MSI", [done], "c3", 2))
+    rp_in.append(("回看打完的 2-1 系列赛的第 3 局", "MSI", [done], "c3", 3))
+    same_a = series("s1", iso(0, 8), 1, K0, L0, 1, 0)
+    same_b = series("s2", iso(0, 8), 1, K1, E0, 0, 1)
+    # 当前对阵 LPL 对 LEC: s2 (LCK 对 LEC) 和 s1 (LCK 对 LPL) 共用 LCK —— 一组更新时 s2 看不到 s1 对 LCK 偏移的
+    # 更新, 错开 1 秒就看得到, LEC 的偏移因此不同, 当前这局的数也不同
+    rp_in.append(("两个系列赛同一时刻开打: 同一时间戳一组", "WORLDS", [same_a, same_b, cur_late("c4", L1, E1)], "c4", 1))
+    next_b = copy.deepcopy(same_b)
+    next_b["start"] = X._iso(X.epoch_s(same_b["start"]) / 86400 + 1 / 86400)
+    rp_in.append(("晚 1 秒开打: 按先后", "WORLDS", [same_a, next_b, cur_late("c4", L1, E1)], "c4", 1))
+    rp_in.append(("输入乱序 (结果按开赛时间)", "WORLDS",
+                  [cur_late("c4", L1, E1), series("s3", iso(0, 12), 1, K1, A0, 1, 0), same_a,
+                   series("s4", iso(0, 10), 3, E0, L1, 2, 0)], "c4", 1))
+    rp_in.append(("开赛晚于当前系列赛的不算", "WORLDS",
+                  [series("s5", iso(2), 1, K1, A0, 1, 0), cur_late("c4", L1, E1)], "c4", 1))
+    run3 = last_oe_series(3)
+    rp_in.append(("整个系列赛已在 OE: 全部去重, 一个终局帧都不取", "WORLDS",
+                  [oe_as_series(run3, "o1"), cur_late("c5", K1, A0)], "c5", 1))
+    rp_in.append(("OE 只有前 3 局, lolesports 打了第 4 局", "WORLDS",
+                  [oe_as_series(run3, "o2", extra=1, bo=7), cur_late("c5", K1, A0)], "c5", 1))
+    unm = series("u1", iso(0, 8), 3, K0, "Some Academy", 2, 1)
+    unm["teams"][1]["oe"] = None
+    rp_in.append(("有一队映射不出 OE 名: 整个系列赛跳过", "WORLDS", [unm, cur_late("c6", L0, E0)], "c6", 1))
+    if nh_plain:
+        rp_in.append((f"母赛区 {nh_plain} 没有跨赛区记录", "WORLDS",
+                      [same_a, cur_late("c7", pick(nh_plain), K0)], "c7", 1))
+    if nh_migr and nh_plain:
+        rp_in.append(("两队母赛区都没有跨赛区记录", "WORLDS",
+                      [cur_late("c8", pick(nh_migr), pick(nh_plain))], "c8", 1))
+    rp_in.append(("同母赛区: 不给", "WORLDS", [same_a, cur_late("c9", K0, K1)], "c9", 1))
+    rp_in.append(("不认识的队: 不给", "WORLDS", [same_a, cur_late("c10", "Definitely Not A Team", K1)], "c10", 1))
+    rp_in.append(("三百天后: 衰减", "WORLDS", [same_a, cur_late("c11", L0, A0, 300)], "c11", 1))
+    rp_in.append(("没有系数的键", "LCK", [same_a, cur_late("c12", L0, A0)], "c12", 1))
+    # 当前系列赛比分落后于局号 (第 3 局开打, 比分还是 1-0): 不给, 也不取终局帧
+    lag = series("c13", iso(1, 9), 5, K0, E0, 1, 0, {"1": fr("TA", "TB", (9, 2), (1, 0), (64000, 58000))})
+    rp_in.append(("当前系列赛比分落后于局号: 不给", "MSI", [lag], "c13", 3))
+    rp_in.append(("当前系列赛比分正好跟上", "MSI", [lag], "c13", 2))
+    # 一半在 OE: OE 的 3 局按 OE, lolesports 又打了 2 局 (没有终局帧) —— 只在剩下的配额里交替
+    split = oe_as_series(run3, "o3", extra=2, bo=7)
+    for k in range(len(run3) + 1, len(run3) + 3):
+        split["frames"][str(k)] = None
+    rp_in.append(("一半在 OE + 后两局缺帧", "WORLDS", [split, cur_late("c14", K1, A0)], "c14", 1))
+    rows = [(n, key, ser, cid, num, True, True) for n, key, ser, cid, num in rp_in]
+    rows.append(("DCGI 首日: 第 6 场还没开打, 不知道谁蓝方 (两种选边的平均)", "DCGI", dcgi(5, (0, 0)),
+                 _DCGI_1003[5][0], 1, True, False))
+    rows.append(("同母赛区的局没有帧: 照样不给", "WORLDS", [same_a, cur_late("c9", K0, K1)], "c9", 1, True, False))
+    rows.append(("不传别名表", "WORLDS", [oe_as_series(run3, "o1"), cur_late("c5", K1, A0)], "c5", 1, False, True))
+    rp = []
+    for n, key, ser, cid, num, use_al, sk in rows:
+        al = AL if use_al else None
+        need = X.replay_frames_needed(st, ser, cid, num, al)
+        res = X.board_predict(st, key, _cur_oe(ser, cid, 0), _cur_oe(ser, cid, 1), ser, cid, num, al, sk)
+        rp.append({"src": n, "in": {"league_key": key, "blue": _cur_oe(ser, cid, 0), "red": _cur_oe(ser, cid, 1),
+                                    "series": ser, "current": cid, "number": num, "aliases": use_al,
+                                    "sides_known": sk},
+                   "out": {"needed": [list(x) for x in need], **res}})
+    return {"oe_asof": st["oe_asof"], "built_at": st["built_at"], "aliases": AL, "exp": exps, "epoch": epoch,
+            "game_t": gt, "frame_verdict": fvc, "decode": dec, "in_oe": ioe, "engine": eng, "predict": prd,
+            "replay": rp}
+
+
+def _cur_oe(series, cid, k):
+    """当前系列赛 teams[k] 的 OE 名 —— 看板上蓝 / 红就是它 (这里没有帧的选边, 按 teams 顺序)。"""
+    return next(s for s in series if s["match_id"] == cid)["teams"][k]["oe"]
 
 
 def stage1_cases(api, store) -> list[dict]:
@@ -720,12 +1150,14 @@ def main():
     api.STATE["stages"] = {"pre_draft": s1, "post_draft": s2}
     api.STATE["ingame_live"] = ig
     today = str(pd.Timestamp.now().normalize().date())
+    xstate = export_xregion()
 
     for name, obj in (("ingame_live.json", export_ingame(ig)),
                       ("stage1_pre.json", export_stage1(s1, api.MODEL_KEYS)),
                       ("stage2_post.json", export_stage2(s2, store, api.MODEL_KEYS)),
                       ("teams.json", export_teams(store)),
-                      ("explain.json", export_explain())):
+                      ("explain.json", export_explain()),
+                      ("xregion.json", xstate)):
         n = _write(OUT_WEB / name, obj)
         print(f"  {name:18s} {n / 1024:>6,.0f} KB")
     stale = OUT_WEB / "teams_pre.json"          # 旧格式, 已并进 teams.json
@@ -771,13 +1203,20 @@ def main():
           f"{sum('p2' in c for c in c2)} 局算出 BP 后概率、{sum(not c['draft'] for c in c2)} 局凑不齐十人、"
           f"{sum('error' in c for c in c2)} 局预期报错")
 
-    gi = intl_cases(api, store)
+    gi = intl_cases(api, store, xstate)
     n = _write(OUT_GOLD / "intl_cases.json", {"generated_at": _now(), "today": today, **gi})
     print(f"  intl_cases.json    {n / 1024:>6,.0f} KB   pregame_league {len(gi['pregame_league'])} 条 "
           f"(其中给赛前 {sum(c['out'] is not None for c in gi['pregame_league'])})  "
           f"known_for {len(gi['known_for'])} 条  map_team {len(gi['map_team'])} 条  "
           f"pregame_reason {len(gi['pregame_reason'])} 条  开局 {len(gi['early'])} 条  "
           f"看板提醒 {len(gi['board_warnings'])} 条")
+
+    gx = xregion_cases(xstate)
+    n = _write(OUT_GOLD / "xregion_cases.json", {"generated_at": _now(), "today": today, **gx})
+    print(f"  xregion_cases.json {n / 1024:>6,.0f} KB   exp {len(gx['exp'])} 条  解码 {len(gx['decode'])} 条  "
+          f"去重 {len(gx['in_oe'])} 条  "
+          f"引擎 {len(gx['engine'])} 条  predict {len(gx['predict'])} 条  看板重放 {len(gx['replay'])} 条 "
+          f"(其中给数 {sum(c['out']['probability_blue'] is not None for c in gx['replay'])})")
     print(f"完成, {time.time() - t0:.0f} 秒。下一步: npm --prefix frontend run test:golden")
 
 

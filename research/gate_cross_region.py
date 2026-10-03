@@ -118,6 +118,29 @@ LCP/CBLOL), 且跨年漂移很大。LFL 排在 LPL 前面是迁入先验造成�
 · 迁入先验和"过期 365 天按阵容认队"两条规则在 DEV 上一局都没用到, 是看了 HOLDOUT 期的参赛身份 (不是
   胜负) 后加的; 去掉阵容规则 t 从 +2.87 变 +2.80。按协议字面的母赛区重跑: 458 局, t +2.68, 仍通过。
 
+上线 (2026-10-04, 用户批准) —— 只上赛前 C, 而且只上赛事内在线更新的形态
+-----------------------------------------------------------------------
+运行时的唯一定义是根目录的 xregion.py: 局级表、引擎、系数、衰减、导出状态和看板重放都在那里, 本脚本和
+xregion_data.py 从它 import (重构前后逐局 max|Δp| = 0、判决行一字不差)。日更生成 artifacts/xregion.json,
+看板 (api._xregion_board, 浏览器版 web/) 从它出发, 再把本赛事 OE 还没收录、lolesports 上已打完的局按 C 的
+更新公式重放进去 —— 闸门只认这个形态。上线前的可行性 (scratchpad, 没进仓库):
+  · 不重放 (结果隔天才生效, 冻结参数): 系列赛 t +2.02, 没过 —— 所以取不到赛程时看板不给 C, 不退回这个形态。
+  · lolesports 没有逐局胜者字段: 横扫 / BO1 / 决胜局由比分定, 其余看终局帧 (塔 → 水晶 → 经济) 再按比分约束
+    解码, 真实终局帧 47/47 判对; 缺帧时整场退回交替序 (只用交替序是 31/47)。
+  · 系列赛内局序只能近似 (按开赛时间和局号): 各种近似方案对 Brier 的影响都 ≤ 0.0005。
+  · 去重: 2025-2026 四个国际赛 356 局能映射的已完成局, 在导出状态里全部认得出来 (另 10 局的队已经过期)。
+开局 3-15 分钟以 C 为锚渐变 (和国内看板以 BP 后为锚是同一个 _blend_prior): 跨赛区历史局 196 局 / 75 系列赛上,
+渐变对硬切 Brier 0.1966 对 0.2052, 系列赛 t +2.27 (48/75 更好) —— 方向是变好但没过 2.5, 按国内那次的口径
+"不显著变差 + 连续"采纳; 第 3 分钟的跳变平均 18.6 → 0.11 个百分点 (超过 15 点的局 52% → 0%)。
+BP 后不另给数 (D 没过), 看板在 BP 后那一段继续显示 C 的赛前数。
+上线复核 (2026-10-04, 三路核查之后的修正; 都不改模型和闸门的任何一个数, 本脚本的判决行不变):
+  · 日更: xregion.py --build 原来是第三个训练步骤, OE 一收进没归类的新代码 (DCGI) 整个日更就停。现在是旁路
+    (坏了线上留整份旧状态, 记进 update_status); "DCGI" 先登记成国际赛, 已在杯赛表里的代码 (DCup) 只提醒。
+  · 去重认 OE 旧名只认别名表写明的那一队; 一半在 OE 的系列赛先按 OE 的胜负扣比分再解码; 当前系列赛比分
+    落后于局号时不给 C; 还没有帧时给两种选边的平均 (截距 a 约 +0.14 是蓝方优势, 赛程队序不是选边)。
+  · 和当前系列赛同时 / 更晚开赛、或开打时还没打完的系列赛不重放 —— 实测 (HOLDOUT 450 局, scratchpad 的
+    g_parallel.py): 受影响 17 局, mean|Δp| 0.0008, Brier Δ −0.00012 (系列赛 t +0.86), 当成近似留着。
+
     python research/gate_cross_region.py [--cache-dir D] [--refresh] [--dev-preds-dir D] [--dev-only]
                                          [--skip-production] [--out D]
     从项目根目录跑。约 40 秒 (重建局级表另加约 20 秒); 不联网, 不碰线上服务和 predictions/log.jsonl。
@@ -149,19 +172,16 @@ from xregion_data import (target, walk_forward_events, group_t, brier,       # n
                           logloss, LEAGUES, ROLES)
 from harness import paired_t, T_ACCEPT                                      # noqa: E402  配对 t 全项目一份
 from feature_store import champion_key                                      # noqa: E402  英雄名归一
-
-S = 400 / math.log(10)            # Elo 刻度: 差 S 分 = logit 差 1
-EPOCH = pd.Timestamp("1970-01-01")
-LN2 = math.log(2)
+# 候选 C 的引擎、参数、系数拟合 —— 2026-10-04 上线后只在根目录 xregion.py 写一份, 看板导出状态和重放用的是
+# 同一段代码。下面这些名字原样留在本模块里 (研究脚本按 G.run_elo / G.P_C 用它们)。
+import xregion                                                              # noqa: E402
+from xregion import (S, EPOCH, LN2, P_C, LAM_C, prepare, run_elo,            # noqa: E402,F401
+                     fit_ridge, sigmoid, logit, const_rate)
 
 # ══════════════════════════════════════════════════════════
 #  冻结的候选 (DEV 上选定; 这里一个数都不许改)
 # ══════════════════════════════════════════════════════════
-# 赛前 = 候选 C 分层 Elo。DEV 上还调到了 reg=0 (不跨年回归)、rebrand=否 (不按阵容继承改名队的评分)
-# —— 这两项在这个取值下什么都不做, 所以下面的实现里没有它们。
-P_C = dict(K=2.0, knew=1.0, nnew=10, h=0.0, init=0.0, cup=True, intl_same=False,
-           eta=24.0, kint=24.0, hl=365.0, dnm=600.0, lag="none")
-LAM_C = 30.0                      # walk-forward logistic: Δo、Δr 分开, 岭先验朝 (logit c, 1, 1), λ = 30
+# 赛前 = 候选 C 分层 Elo: P_C / LAM_C 在 xregion.py (运行时也用); 下面的 DEV 复现会拿它们对账。
 # BP 后 = 候选 D: C + 英雄胜率 cw (四大常规联赛 + 国际赛合池, 半衰期 365 天, 向 0.5 收缩 100 局), β 的岭 λ_d = 3
 D_CFG = dict(hl_c=365.0, scope="major", k_c=100.0, lam_d=3.0)
 # 基线 (c) 赛区 BT 的岭强度, 也是 DEV 上挑的 (给基线它最好的一枪)
@@ -237,188 +257,7 @@ def metrics(p, y) -> dict:
             "ece": float(ece(p, y)) if len(y) >= 20 else np.nan, "slope": b, "slope_se": se}
 
 
-def sigmoid(z):
-    return 1 / (1 + np.exp(-z))
-
-
-def logit(p):
-    p = min(max(p, 1e-6), 1 - 1e-6)
-    return math.log(p / (1 - p))
-
-
-# ══════════════════════════════════════════════════════════
-#  局级表 → 扁平数组 (Elo 主循环吃 Python 列表, 比逐行 pandas 快两个数量级)
-# ══════════════════════════════════════════════════════════
-
-def prepare(df: pd.DataFrame) -> dict:
-    if not df["date"].is_monotonic_increasing:
-        raise RuntimeError("局级表没按时间排序 —— Elo 和英雄表都假定按时间走")
-    A = {"n": len(df)}
-    # 天 (浮点)。不能用 astype("int64") / 86400e9: 缓存里的 date 是 datetime64[us] —— 候选 C 的第一版就这样
-    # 差了 1000 倍, 半衰期整个失效, 没有任何报错
-    A["t"] = ((df["date"] - EPOCH).dt.total_seconds() / 86400).tolist()
-    ns = df["date"].astype("int64").tolist()                  # 只用来判断"同一时间戳", 单位无所谓
-    A["year"] = df["year"].astype(int).tolist()
-    A["ec"] = df["event_class"].map({"league": 0, "non_home": 1, "intl": 2}).astype(int).tolist()
-    A["league"] = df["league"].astype(str).tolist()
-    A["blue"] = df["blue"].astype(str).tolist()
-    A["red"] = df["red"].astype(str).tolist()
-    A["y"] = df["blue_win"].astype(float).tolist()
-    A["ok"] = df["result_ok"].astype(bool).tolist()
-    A["hb"] = [x if isinstance(x, str) else None for x in df["home_blue"].tolist()]
-    A["hr"] = [x if isinstance(x, str) else None for x in df["home_red"].tolist()]
-    A["status"] = df["region_status"].astype(str).tolist()
-    # 同一时间戳的几局一组: 组内先全部取赛前值, 再统一更新 —— 同时开打的两局互相看不到
-    starts = [0] + [i for i in range(1, len(ns)) if ns[i] != ns[i - 1]]
-    A["groups"] = list(zip(starts, starts[1:] + [len(ns)]))
-    day = [math.floor(x) for x in A["t"]]
-    dstarts = [0] + [i for i in range(1, len(day)) if day[i] != day[i - 1]]
-    A["day_groups"] = list(zip(dstarts, dstarts[1:] + [len(day)]))
-    return A
-
-
-# ══════════════════════════════════════════════════════════
-#  候选 C: 分层 Elo
-# ══════════════════════════════════════════════════════════
-
-def run_elo(P: dict, A: dict) -> dict:
-    """按时间走一遍全部 OE 比赛, 给每局记下赛前的 o_蓝 / o_红 (只有跨赛区国际赛才有) 和 r_蓝 / r_红。
-
-    全球实力 S = o[母赛区] + r[队]:
-      · r 每个 OE 赛区一个 Elo 池, 由常规联赛和同池杯赛更新 (K, 前 nnew 局 ×knew); 跨赛区国际赛另以 kint
-        更新两队的 r。换赛区时: 新旧赛区都有偏移 → 保持全球实力不变; 迁入还没有偏移的新赛区 (LCP) → r 原样
-        带过去, 并登记"迁入来源"; 原赛区没有偏移 (次级联赛升上来) → 重置为 init。
-      · o 只由跨赛区国际赛更新 (学习率 eta, 零和), 第一次出现时取先验 (四大 0, 其余 −dnm; 新赛区取迁入
-        队伍原赛区偏移的均值), 并以半衰期 hl 向先验指数衰减 (懒计算: 用到时才衰减)。
-    时间纪律: 预测只用时间戳严格更早的结果 (lag="none", 协议允许评分这样用, 赛事内的更早局也算);
-    lag="nextday" 是服务现实 —— 结果从下一个 UTC 日起才生效 (OE 隔天才有数据)。
-    这是候选 C 脚本 run_elo 的逐行移植; main() 先在 DEV 上逐局对账, 对不上就停。
-    """
-    K, knew, nnew, h, init = P["K"], P["knew"], int(P["nnew"]), P["h"], P["init"]
-    eta, kint, hl, dnm = P["eta"], P["kint"], P["hl"], P["dnm"]
-    cup, intl_same = P["cup"], P["intl_same"]
-    nextday = P["lag"] == "nextday"
-    majors = set(LEAGUES)
-
-    r: dict[str, float] = {}
-    pool: dict[str, str] = {}
-    ng: dict[str, int] = {}
-    o: dict[str, float] = {}
-    oprior: dict[str, float] = {}
-    olast: dict[str, float] = {}
-    migr: dict[str, list] = defaultdict(list)       # 还没有偏移的赛区 → 迁入队伍的原赛区
-    pending: list = []                              # nextday: (生效时刻, 更新), 按时间排队
-    stats = {"intl_pool_mismatch": 0}
-
-    n = A["n"]
-    ob, orr = np.full(n, np.nan), np.full(n, np.nan)
-    rb, rr = np.full(n, np.nan), np.full(n, np.nan)
-    tl, yl, ecl, lgl = A["t"], A["y"], A["ec"], A["league"]
-    bl, rl, okl, hbl, hrl, stl = A["blue"], A["red"], A["ok"], A["hb"], A["hr"], A["status"]
-
-    def enter(team, league):
-        """常规联赛比赛: 确保队伍在这个池子里有 r (新队 / 换赛区)。"""
-        old = pool.get(team)
-        if old == league:
-            return
-        if old is None:
-            r[team], ng[team], pool[team] = init, 0, league
-            return
-        if old in o and league in o:                    # 两个赛区都有偏移: 保持全球实力不变
-            r[team] = o[old] + r[team] - o[league]
-        elif old in o:                                  # 迁入还没有偏移的新赛区: r 带过去
-            migr[league].append(old)
-        else:                                           # 原赛区没有可比的零点: 当新队
-            r[team] = init
-            ng[team] = 0
-        pool[team] = league
-        ng.setdefault(team, 0)
-
-    def off(L, t):
-        """赛区偏移: 懒初始化 + 向先验的指数衰减。"""
-        if L not in o:
-            src = [o[x] for x in migr.get(L, []) if x in o]
-            pri = float(np.mean(src)) if src else (0.0 if L in majors else -dnm)
-            o[L] = oprior[L] = pri
-            olast[L] = t
-        elif hl != math.inf:
-            dt = t - olast[L]
-            if dt > 0:
-                o[L] = oprior[L] + (o[L] - oprior[L]) * math.exp(-LN2 * dt / hl)
-                olast[L] = t
-        return o[L]
-
-    def apply(u):
-        if u[0] == "dom":
-            _, i, b, rd, pe = u
-            d = yl[i] - pe
-            kb = K * (knew if ng.get(b, 0) < nnew else 1.0)
-            kr = K * (knew if ng.get(rd, 0) < nnew else 1.0)
-            r[b] += kb * d
-            r[rd] -= kr * d
-            ng[b] = ng.get(b, 0) + 1
-            ng[rd] = ng.get(rd, 0) + 1
-        else:
-            _, i, b, rd, pe, hb, hr, okb, okr = u
-            d = yl[i] - pe
-            o[hb] += eta * d
-            o[hr] -= eta * d
-            if kint:
-                if okb:
-                    r[b] += kint * d
-                if okr:
-                    r[rd] -= kint * d
-
-    pi = 0
-    for g0, g1 in A["groups"]:
-        if nextday:                                     # 到期的结果先生效 (按原来的时间顺序)
-            while pi < len(pending) and pending[pi][0] <= tl[g0]:
-                apply(pending[pi][1])
-                pi += 1
-        upd = []
-        for i in range(g0, g1):
-            ec, b, rd, t = ecl[i], bl[i], rl[i], tl[i]
-            if ec == 0:                                 # 常规联赛
-                L = lgl[i]
-                enter(b, L)
-                enter(rd, L)
-                rb[i], rr[i] = r[b], r[rd]
-                if okl[i]:
-                    upd.append(("dom", i, b, rd, 1 / (1 + math.exp(-(r[b] + h - r[rd]) / S))))
-            elif ec == 2:                               # 国际赛
-                st = stl[i]
-                if st == "unknown":
-                    continue
-                hb, hr = hbl[i], hrl[i]
-                # 母赛区 (xregion_data 的口径, 可能按阵容认队) 和 Elo 池不一致的队, r 取 init 且不更新
-                okb, okr = pool.get(b) == hb, pool.get(rd) == hr
-                stats["intl_pool_mismatch"] += (not okb) + (not okr)
-                vb = r[b] if okb else init
-                vr = r[rd] if okr else init
-                rb[i], rr[i] = vb, vr
-                if st == "cross":
-                    ob[i], orr[i] = off(hb, t), off(hr, t)
-                    pe = 1 / (1 + math.exp(-(ob[i] + vb + h - orr[i] - vr) / S))
-                    if okl[i]:
-                        upd.append(("x", i, b, rd, pe, hb, hr, okb, okr))
-                else:                                   # 同赛区: 偏移相同, 只看 r
-                    ob[i] = orr[i] = o.get(hb, np.nan)
-                    pe = 1 / (1 + math.exp(-(vb + h - vr) / S))
-                    if intl_same and okb and okr and okl[i]:
-                        upd.append(("dom", i, b, rd, pe))
-            else:                                       # 杯赛 / 次级跨区赛: 同池两队才更新
-                if cup and pool.get(b) is not None and pool.get(b) == pool.get(rd):
-                    pe = 1 / (1 + math.exp(-(r[b] + h - r[rd]) / S))
-                    if okl[i]:
-                        upd.append(("dom", i, b, rd, pe))
-        for u in upd:
-            if nextday:
-                pending.append((math.floor(tl[u[1]]) + 1.0, u))
-            else:
-                apply(u)
-    return {"ob": ob, "or": orr, "rb": rb, "rr": rr, "o": dict(o), "oprior": dict(oprior),
-            "olast": dict(olast), "migr": {k: list(v) for k, v in migr.items()}, "stats": stats,
-            "r": dict(r), "pool": dict(pool)}
+# sigmoid / logit / prepare / run_elo (候选 C 的引擎) 在 xregion.py, 本模块开头已 import。
 
 
 # ══════════════════════════════════════════════════════════
@@ -486,29 +325,7 @@ def cw_feature(T: dict, k_c: float) -> np.ndarray:
 #  walk-forward 的 logistic (岭先验) 和基线
 # ══════════════════════════════════════════════════════════
 
-def fit_ridge(X, y, prior, lam, pen=None, iters=60):
-    """最小化 NLL + λ/2·Σ pen·(β − prior)²。没有训练行 (2022 MSI 之前) 就返回先验。"""
-    prior = np.asarray(prior, float)
-    if lam == math.inf or len(y) == 0:
-        return prior.copy()
-    pen = np.ones_like(prior) if pen is None else np.asarray(pen, float)
-    beta = prior.copy()
-    for _ in range(iters):
-        p = sigmoid(X @ beta)
-        g = X.T @ (y - p) - lam * pen * (beta - prior)
-        H = X.T @ (X * (p * (1 - p))[:, None]) + lam * np.diag(pen) + 1e-9 * np.eye(len(beta))
-        step = np.linalg.solve(H, g)
-        beta = beta + step
-        if np.abs(step).max() < 1e-10:
-            break
-    return beta
-
-
-def const_rate(df, cut) -> float:
-    """基线 (a): 切点之前全部 OE 比赛的蓝方胜率。"""
-    m = (df["date"] < cut) & df["result_ok"]
-    return float(df.loc[m, "blue_win"].mean())
-
+# fit_ridge / const_rate 在 xregion.py (看板的系数用同一个拟合)。
 
 def predict_wf(df, R, E, F=None, lam_d=None):
     """p = σ(a + b_o·Δo/S + b_r·Δr/S [+ β·F/sd])。系数按赛事 walk-forward, 只在切点之前的全部
@@ -525,16 +342,13 @@ def predict_wf(df, R, E, F=None, lam_d=None):
     for name, cut, idx in E["ev_list"]:
         c = E["cut_consts"][name]
         tr = xmask & (dates < np.datetime64(cut))
-        cols = [np.ones(tr.sum()), x_o[tr], x_r[tr]]
-        prior, pen, sd = [logit(c), 1.0, 1.0], [1.0, 1.0, 1.0], 1.0
+        sd, extra = 1.0, ()
         if F is not None:
             have = tr & ~np.isnan(F)
             s_ = float(np.std(F[have])) if have.sum() >= 2 else 0.0
             sd = s_ if s_ > 1e-9 else 1.0
-            cols.append(Fz[tr] / sd)
-            prior.append(0.0)
-            pen.append(lam_d / LAM_C)
-        beta = fit_ridge(np.column_stack(cols), y[tr], prior, LAM_C, pen)
+            extra = ((Fz / sd, 0.0, lam_d / LAM_C),)
+        beta = xregion.fit_coef(x_o, x_r, y, tr, c, extra)    # 看板的系数也是这一个函数拟合的
         ii = np.asarray(idx)
         xo = np.where(np.isnan(x_o[ii]), 0.0, x_o[ii])     # 同赛区局的偏移可能没初始化, 差为 0
         z = beta[0] + beta[1] * xo + beta[2] * x_r[ii]

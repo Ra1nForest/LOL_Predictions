@@ -115,6 +115,17 @@ TEAM_ALIASES = {
     # LCS
     "Cloud9 Kia": "Cloud9",
     "Team Liquid Alienware": "Team Liquid",
+    # ── 四大之外: 只给跨赛区模型 C 用 (api._xregion_board 拿 xregion 状态里的队名当 known) ──
+    # 目标不在四大的已知队伍表里, 所以 Stage 1/2 那边照旧返回 None (见 map_team), 不会造出"可预测"的假象。
+    # 每一条都按阵容核对过: lolesports 那一局的五个首发 vs OE 该队最近常规联赛的五个人 (2026-10-03)。
+    "LEVIATÁN": "Leviatan",                        # CBLOL; 5/5 人对上 (OE 2026-08-08 ~ 08-30)
+    "LOS": "LØS",                                  # CBLOL; 5/5 (OE 2026-09-27 ~ 10-01)
+    "MIBR.LOS": "LØS",                             # 同一队在 2026 EWC 的赞助名; 5/5
+    "RED Kalunga": "RED Canids",                   # CBLOL, 2026 DCGI 参赛; 4/4 (OE 2026-09-19 ~ 09-26)
+    "Relove Deep Cross Gaming": "Deep Cross Gaming",   # LCP, 2026 MSI 参赛; 5/5 (OE 2026-08-01 ~ 08-13)
+    # 2026 EWC 上叫 "Team Secret", OE 里同名的那支是过期的旧队 (最后一场常规联赛早于 365 天, 状态里没有它);
+    # 阵容 5/5 是 LCP 的 Team Secret Whales
+    "Team Secret": "Team Secret Whales",
 }
 
 _norm = lambda s: re.sub(r"[^a-z0-9]", "", (s or "").lower())
@@ -335,6 +346,8 @@ class EsportsFeed:
         # 于是整局从头重扫 —— 直播中每次轮询都要付一遍。
         self._obs: dict[str, dict[int, tuple]] = {}
         self._meta: dict[str, dict] = {}            # gameId -> 十个人的名字/英雄
+        self._final: dict[str, dict] = {}           # gameId -> 终局帧 (final_frame, 定型了才记)
+        self._ids: dict[str, dict] = {}             # matchId -> 局号/队伍的 id (match_ids, 齐了才记)
         self._no_frames: dict[str, float] = {}      # gameId -> 这之前别再探了
         self._lock = threading.Lock()
         self._sess = requests.Session()
@@ -480,6 +493,122 @@ class EsportsFeed:
             for key in (t.get("name"), t.get("code")):
                 if key:
                     out[_norm(key)] = int(w)
+        return out
+
+    # -- 跨赛区模型 C 的赛事内重放 (xregion.board_predict; 拼装在 api._xregion_board) --
+    # 浏览器版 frontend/src/web/feed.ts 同名同 URL 同缓存时长。四个都是"取不到返回 None", 调用方据此决定:
+    # 赛程 (tournament / completedEvents) 取不到 → 整场不给 C (闸门只认赛事内在线更新的版本, 少了当天的
+    # 结果就是没过闸的那个"隔天"版本); 某个系列赛的详情或终局帧取不到 → 那个系列赛退回交替序。
+    COMPLETED_TTL = 60          # 一个系列赛打完后最多一分钟进重放 (上游登记比分本来就比帧晚约 6 分钟)
+    TOURNAMENTS_TTL = 3600
+
+    def event_tournament(self, match_id: str) -> Optional[str]:
+        """这场比赛所属的 tournament id (getEventDetails 的 event.tournament.id)。和 games() 同一个 URL, 不多花请求。"""
+        p = self._get(f"{PERSISTED}/getEventDetails?hl=en-US&id={match_id}", self.live_ttl)
+        ev = ((p or {}).get("data") or {}).get("event") or {}
+        tid = (ev.get("tournament") or {}).get("id")
+        return str(tid) if tid else None
+
+    def league_tournament(self, league: str, start_time: str) -> Optional[str]:
+        """getEventDetails 没给 tournament 时的退路: 这个赛区里 [startDate, endDate] 含开赛日 (UTC 日期) 的那届,
+        没有就取 startDate 同年的第一届 (API 顺序, 新的在前)。"""
+        lid = LEAGUE_IDS.get(str(league).upper())
+        if not lid or not start_time:
+            return None
+        p = self._get(f"{PERSISTED}/getTournamentsForLeague?hl=en-US&leagueId={lid}", self.TOURNAMENTS_TTL)
+        ts = [t for lg in (((p or {}).get("data") or {}).get("leagues") or [])
+              for t in (lg.get("tournaments") or []) if t.get("id")]
+        day = start_time[:10]
+        for t in ts:
+            if (t.get("startDate") or "") <= day <= (t.get("endDate") or ""):
+                return str(t["id"])
+        for t in ts:
+            if (t.get("startDate") or "")[:4] == day[:4]:
+                return str(t["id"])
+        return None
+
+    def completed_events(self, tournament_id: str) -> Optional[list[dict]]:
+        """这一届已完赛的全部系列赛 (getCompletedEvents, 按开赛时间升序, 每场带 games[].id)。
+
+        payload 缺失或形状不对返回 None (≠ 空表: 空表是"还没有打完的系列赛", 照样可以给 C)。
+        """
+        p = self._get(f"{PERSISTED}/getCompletedEvents?hl=en-US&tournamentId={tournament_id}",
+                      self.COMPLETED_TTL)
+        evs = (((p or {}).get("data") or {}).get("schedule") or {}).get("events")
+        return evs if isinstance(evs, list) else None
+
+    def match_detail(self, match_id: str, ttl: Optional[float] = None) -> Optional[dict]:
+        """getEventDetails 的精简: {"teams": [{id, name, code, wins}], "games": [{number, id, state}]}。
+
+        ttl 默认 live_ttl (和 games() 同一个 URL、同一份缓存)。别传更长的: 缓存认第一个写入者给的有效期, 同一场
+        比赛的比分和局列表会跟着变旧 —— 只要 id 的话用 match_ids。
+        """
+        p = self._get(f"{PERSISTED}/getEventDetails?hl=en-US&id={match_id}", ttl or self.live_ttl)
+        m = ((((p or {}).get("data") or {}).get("event") or {}).get("match")) or {}
+        if not m:
+            return None
+        return {"teams": [{"id": str(t["id"]) if t.get("id") else None, "name": t.get("name"),
+                           "code": t.get("code"), "wins": (t.get("result") or {}).get("gameWins")}
+                          for t in (m.get("teams") or [])],
+                "games": [{"number": g.get("number"), "id": g.get("id"), "state": g.get("state")}
+                          for g in (m.get("games") or [])]}
+
+    def match_ids(self, match_id: str) -> Optional[dict]:
+        """别的系列赛的局号 → gameId 和两队的 esportsTeamId: {"teams": [{id, name, code}], "games": [{number, id}]}。
+
+        跨赛区模型重放别的系列赛、要它的终局帧时用 (api._xregion_frames)。这些 id 一旦有了就不会再变, 所以齐了
+        (两队都有 id、每一局都有局号和 id) 就按 match_id 记在 self._ids 里, 以后不再请求。
+        不能为了"不再请求"把 getEventDetails 按一小时缓存: 那个 URL 和 games() / match_wins() / 页面顶上的比分
+        共用一份缓存 (_get 认的是第一个写入者给的有效期), 这里写一小时, 那场比赛自己的看板和直播列表的比分就会
+        停在一小时前 —— 而"已完赛"是 getCompletedEvents 说的, 它背后的 state 两个方向都会错。所以照常按 live_ttl
+        读, 另记一份只含 id 的。比分 (wins) 和局的 state 故意不记: 它们会变。
+        """
+        hit = self._ids.get(match_id)
+        if hit is not None:
+            return hit
+        d = self.match_detail(match_id)
+        if d is None:
+            return None
+        out = {"teams": [{"id": t["id"], "name": t["name"], "code": t["code"]} for t in d["teams"]],
+               "games": [{"number": g["number"], "id": g["id"]} for g in d["games"]]}
+        if (len(out["teams"]) == 2 and all(t["id"] for t in out["teams"]) and out["games"]
+                and all(g["number"] and g["id"] for g in out["games"])):
+            self._ids[match_id] = out
+        return out
+
+    def final_frame(self, game_id: str) -> Optional[dict]:
+        """一局打完之后的终局帧: {"blue_id", "red_id", "towers": [蓝, 红], "inhibitors": [蓝, 红], "gold": [蓝, 红]}。
+
+        只对比分已经算上的局调 (= 确实打完了)。打完之后任何更晚的 startingTime 都返回同一批冻结帧 (模块顶部
+        第 6 条; 实测三个月前的局用"现在 − 60 秒"照样拿得到), 所以就用当前的 lagged(60), 落空再试 300。
+        蓝方是哪队取帧自己的 gameMetadata (和 frame_sides 同一个理由, 不用 persisted 的 side)。
+        帧已经是 finished、或者最后一帧停在 10 分钟以前 (帧流断了, 不会再变), 就按 gameId 记住, 以后不再取。
+        """
+        hit = self._final.get(game_id)
+        if hit is not None:
+            return hit
+        p, frames = None, []
+        for lag in (60, 300):
+            p = self._window(game_id, self._lagged(lag), self.window_ttl)
+            frames = (p or {}).get("frames") or []
+            if frames:
+                break
+        if not frames:
+            return None
+        md = (p or {}).get("gameMetadata") or {}
+        f = frames[-1]
+        b, r = f.get("blueTeam") or {}, f.get("redTeam") or {}
+        ids = [(md.get(k) or {}).get("esportsTeamId") for k in ("blueTeamMetadata", "redTeamMetadata")]
+        out = {"blue_id": str(ids[0]) if ids[0] else None, "red_id": str(ids[1]) if ids[1] else None,
+               "towers": [int(b.get("towers") or 0), int(r.get("towers") or 0)],
+               "inhibitors": [int(b.get("inhibitors") or 0), int(r.get("inhibitors") or 0)],
+               "gold": [int(b.get("totalGold") or 0), int(r.get("totalGold") or 0)]}
+        try:
+            old = (datetime.now(timezone.utc) - self._ts(f)).total_seconds() > 600
+        except Exception:
+            old = False
+        if f.get("gameState") == "finished" or old:
+            self._final[game_id] = out
         return out
 
     # -- 实时帧 --

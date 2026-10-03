@@ -24,6 +24,8 @@ python fetch_data.py --auth --force        # re-auth; the token dies every 7 day
 
 python train.py                            # Stage 1 + 2  -> artifacts/model_{pre,post}_draft.json
 python ingame_train.py                     # Stage 4      -> artifacts/model_ingame{,_live}.json
+python xregion.py --build                  # cross-region model C -> artifacts/xregion.json (sanity-checked)
+python xregion.py --check artifacts/xregion.json
 
 uvicorn api:app --reload --port 8000       # UI at /, OpenAPI at /docs
 ```
@@ -127,6 +129,18 @@ also what gets deployed — `research/`, `tools/`, `attic/` are not needed at ru
   while `Match.league` keeps the upstream casing (`"Worlds"`). `is_major()` is the single
   major/non-major test; `research/backfill_late.oe_league()` the single lolesports→OE league lookup
   (both case-insensitive).
+- **`xregion.py`** is the cross-region pre-game model C ("分层 Elo"), the board's number for
+  international matchups that Stage 1/2 cannot serve. It is the **single definition** of the
+  all-league game table, the engine (`Engine`: sequential updates, same-timestamp batching), the
+  walk-forward coefficients, decay, `predict()`, the exported state (`build_state()` →
+  `artifacts/xregion.json`, written by `python xregion.py --build` and by the daily update) and the
+  board's in-event replay (`board_predict()` and the pure helpers around it). `research/xregion_data.py`
+  and `research/gate_cross_region.py` import it; it must not import `research/`. `api._xregion_board`
+  only fetches (event schedule, final frames — `esports_feed`'s `event_tournament` /
+  `completed_events` / `match_detail` / `match_ids` / `final_frame`) and hands the data to the pure
+  functions. Other series' ids come from `match_ids` (read at `live_ttl`, memoised once complete):
+  never re-read the shared `getEventDetails` URL with a long TTL — `_get` keeps whatever TTL the first
+  writer chose, so that match's own board and its live-list score would go up to an hour stale.
 - **`explain.py`** turns field names into sentences. Raw field names must never reach a response
   unless `raw_features: true`; a field with no template is dropped, not shown raw.
 - **`debate.py`** (Stage 3) runs the 4-round protocol against NVIDIA NIM. `agents.py` is the older
@@ -155,7 +169,11 @@ also what gets deployed — `research/`, `tools/`, `attic/` are not needed at ru
   tables are *exported*, not copied). The browser calls lolesports directly — both hosts send
   `Access-Control-Allow-Origin: *` — so traffic is spread over visitors' own IPs. `stage2.ts`
   computes the board's post-draft line from two exported win/game tallies (champion×league,
-  player×champion); Stage 3 is not in the static build.
+  player×champion); Stage 3 is not in the static build. `xregion.ts` ports the board half of
+  `xregion.py` (the engine's replay / decay / predict, final-frame verdicts, score-constrained
+  decoding, OE de-dup, `boardPredict`) over `public/web/xregion.json` (a sanity-checked copy of
+  `artifacts/xregion.json`); `board.ts`'s `xregionBoard` mirrors `api._xregion_board`, and
+  `feed.ts` carries the same five schedule / final-frame helpers as `esports_feed.py`.
   Being a second implementation, **it is only trustworthy while two checks pass**: `test:golden`
   (features, probabilities, whole `api._ingame_core` and `/predict` responses, bit-for-bit) and
   `test:diff` (the whole board, against `tools/board_oracle.py`). The oracle is a **fresh**
@@ -221,8 +239,10 @@ guards. If one goes red, work out whether that trap is back before changing the 
   home league, and every Stage 1/2 number on the board (too_early, post-draft line, blend anchor,
   curve) is computed **with the home league**; anything else (cross-region, or a team with no
   major-league history) returns `None` → no Stage 1/2 anywhere on the board, and Stage 4 runs with
-  `include_pre=False` (no `diff_pre_*`, no silent fallback to `_pre_context`) and without the
-  3–15 minute blend. Stage 4 always gets the **event** league, so `is_*` stay all-zero exactly as
+  `include_pre=False` (no `diff_pre_*`, no silent fallback to `_pre_context`). On those boards the
+  pre-game number comes from the cross-region model C instead (next bullet) when it can be computed;
+  when it cannot, the board is exactly what it was before C existed (no number before minute 3, no
+  blend, the "不显示" sentence). Stage 4 always gets the **event** league, so `is_*` stay all-zero exactly as
   international rows were encoded in training — passing the home league there would not error.
   Measured in `research/gate_international.py` with the live artifacts: on 523 historical
   cross-region games Stage 1/2 have no predictive value (accuracy ~50%, calibration slope ~0, yet
@@ -237,6 +257,55 @@ guards. If one goes red, work out whether that trap is back before changing the 
   `test:diff` only replays final frames, so the first three minutes never reach it: the too_early
   payload and the reason sentences are pure functions (`_early_prediction`, `_pregame_reason`,
   `_board_warnings` and their `web/board.ts` twins) pinned by `golden/intl_cases.json` instead.
+- **Cross-region boards use model C, and only in its in-event online form.** Shipped 2026-10-04
+  (user approved) after a frozen DEV/HOLDOUT gate (`research/gate_cross_region.py`): HOLDOUT
+  450 games, Brier 0.2231 vs constant 0.2478, series `t = +2.87` (a thin pass; it ties the
+  "home-league identity only" baseline, `t = +0.40`), accuracy ~65%, over-confident (says ~85%,
+  wins ~76%). The post-draft variant D **failed** (`t = +2.47`, BP term `t = −1.64`), so C boards
+  have no post-draft line. **Only the version that updates after every finished game passed** —
+  the OE-only "results count from the next day" version fails (`t = +2.02` to `+2.48`), and OE lags
+  about a day. So `api._xregion_board` (twin: `web/` board) must replay the running event's finished
+  games from lolesports on top of `artifacts/xregion.json` (`xregion.board_predict`); if the event
+  schedule (`getEventDetails` tournament → `getCompletedEvents`) cannot be fetched, C is **not
+  shown** — never fall back to the state alone. Replay rules (all in `xregion.py`, pinned by
+  `golden/xregion_cases.json` and `XregionReplay`): series of the same tournament that started
+  before the current one, plus the current series' games numbered below the current game; finished
+  count = sum of the series score (not `games[].state`), and **if the current game's number − 1
+  exceeds the current series' score (upstream registers the score ~6 min after the frames) C is
+  withheld** (`withheld: "score_lag"`) rather than silently replaying one game short; games already
+  in OE are skipped by `oe_lookup` (same game number, OE start within [startTime − 6 h, startTime
+  + 18 h], one team name equal and the other equal **or a stale OE name that `TEAM_ALIASES` maps to
+  that team** — OE logged 2026 EWC's Team Secret Whales as "Team Secret"; accepting *any* non-current
+  name falsely de-duplicated a same-day game against a different opponent); OE's results for those
+  games are taken out of the score before decoding the rest (a series split across the OE cutoff
+  otherwise decoded to the opposite series result; OE results contradicting the score raise → no C);
+  winners from the score for BO1/sweeps/deciding games, otherwise from final frames (towers →
+  inhibitors → gold, blue side from the frame's `esportsTeamId`) decoded under the score constraint
+  (47/47 on real final frames), and alternating order (leader first) for a series with any frame
+  missing; engine time `t = startTime + (number − 1) s`, ordered by `(t, startTime, match_id,
+  number)` — never by input position. Series that started at/after the current one or were still
+  running are not replayed (measured on HOLDOUT: 17/450 games touched, mean |Δp| 0.0008, Brier Δ
+  −0.00012, `t = +0.86`). Before the game has frames nobody knows which side is blue, and C's
+  intercept (a ≈ +0.14) is the blue-side edge, so the no-frames number is the **side-neutral mean**
+  `(p(A blue) + 1 − p(B blue)) / 2` (`side_neutral: true`; the player never uses it as an anchor).
+  The board's C number feeds the too_early headline and the
+  no-frames pre-game view (`source: "xregion"`, `_xregion_pregame`; Board.tsx must not call
+  Stage 1 for these matches), and is the **blend anchor** for minutes 3–15 on the headline, curve,
+  per-second timeline and live playback (adopted by "not significantly worse": series `t = +2.27`
+  in the better direction, minute-3 jump 18.6 → 0.11 points). Stage 4 still gets no pre-game
+  features. Logging follows the same rule as everywhere: only `match.predictable` boards, source
+  `"xregion"` for the pre-game row. Domestic and same-home-league boards are byte-identical with
+  and without C (verified against HEAD's oracle on 36 boards; `XregionBoard` pins it), and do not
+  send any of C's upstream requests.
+  **Every `exp` computed from the exported state uses the fdlibm port** (`xregion.portable_exp` /
+  `web/xregion.ts` `exp`, set by `Engine.from_state`; `logistic` defaults to it), never
+  `math.exp` / `Math.exp`: no two platforms' `exp` agree to the last bit (this machine's
+  `math.exp` is MSVC's — 1147 of 200k inputs not correctly rounded, and 7% differ from V8; Safari
+  uses the system libm), so with the platform `exp` the two implementations disagreed by an ulp on
+  a sizeable share of boards and `test:diff` could not tell that from a porting bug. The gate and
+  `build_state` (`Engine(P)` / `run_elo`, default `exp=math.exp`) are deliberately left on
+  `math.exp`, so the gate reproduction stays bit-for-bit (re-verified: max|Δp| = 0, DEV and
+  HOLDOUT, all seven models); the state is data both sides read from the same JSON.
 - **Isotonic calibration is Stage 4 only. Do not generalise it to Stage 1/2.** Same change, opposite
   verdicts, because the calibration sets differ by 20×: Stage 4 has ~35k snapshots (Brier
   `t = +6.91`, ECE `t = +7.12`, 8/8 folds), Stage 1/2 have 1716 games (Brier `t = -4.74`, 6/6 folds
@@ -331,8 +400,15 @@ What actually runs:
   shipping a front-end change is just pushing it.
 - **This Windows machine** — four scheduled tasks installed by `deploy/windows_install.ps1`:
   `LoL-Predict` (`run_api.py`, the API on 127.0.0.1:8000), `LoL-Collect`, `LoL-Update`
-  (`daily_update.py --publish-web`: retrain, gate, swap, restart `LoL-Predict` via `schtasks /end`
-  + `/run`, then push the refreshed model files to the site) and `LoL-Backfill`. The batch jobs
+  (`daily_update.py --publish-web`: retrain — `train.py`, `ingame_train.py` into
+  `artifacts_staging/`, plus `xregion.py --build` as a **side path** —, gate, swap, restart
+  `LoL-Predict` via `schtasks /end` + `/run`, then push the refreshed model files to the site —
+  `export_web_model.py` copies `artifacts/xregion.json` to `frontend/public/web/`) and
+  `LoL-Backfill`. A failed xregion build or `sanity_check` (e.g. OE adds an unclassified event code)
+  keeps yesterday's `xregion.json` **whole** — self-consistent, since its `events` de-dup list and its
+  ratings come from one build; never mix files — and is recorded in `update_status.json` → `xregion`
+  and `/health`; it no longer blocks Stage 1/2/4 or the site (it used to stop the whole update every
+  day until someone edited the code). The batch jobs
   start through `run_task.py` (windowless `pythonw` with stdout redirected into `logs/`). Tasks run
   as the logged-in user with no stored credentials, so they need a session (a locked screen is
   fine). All four have `-StartWhenAvailable`, so a run missed while the machine was off happens as soon

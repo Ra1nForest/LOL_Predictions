@@ -201,6 +201,15 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
   const hasEarly = !hasLive && earlyP != null;
   // 用的到底是哪一档 —— 后端的 source 字段说了算, 不自己按有没有值去猜
   const earlyIsDraft = pr?.source === "post_draft" || postP != null;
+  // 跨赛区模型 C 出数 (跨赛区对阵, 或有队不在四大赛区): 赛前数**不是** Stage 1 算的 —— 只看两队和所在赛区的
+  // 历史战绩, 准确率和偏自信程度另有一句说明 (在 warnings 里, 下面原样显示)。标签必须说清是哪个模型, 否则一个
+  // 跨赛区模型的数就冒充了平常那个赛前概率。字段同样以后端为准: too_early / 没开打时看 source, 局内看
+  // pregame_source。
+  const isXr = pr?.source === "xregion" || pr?.pregame_source === "xregion";
+  const pregameLabel = isXr ? T("跨赛区赛前") : undefined;
+  // C 的数在还没开打 (这一局没有帧) 时就有, 看板把它放在 prediction 里 (too_early 为 false) —— 那一屏走下面的
+  // hasEarly 视图, 但它是真正的"赛前", 不是开局头 3 分钟: 状态行照常说"局间休息 / 已结束"
+  const xrPre = hasEarly && pr?.source === "xregion" && !pr.too_early;
 
   // 没有局内读数 = 比赛还没开打, 回退到赛前预测 (Stage 1/2)。
   // 队名映射不出来就不发 —— 后端只认模型认识的队名, 拿 API 原名去问必错。
@@ -296,7 +305,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
   // too_early 但没有概率 (跨赛区 / 队名不认识的国际赛开局头 3 分钟) 同理: 已经开打了,
   // 那时 played 不为空, 不拦的话这里会写成"局间休息"。
   const tooEarly = !!pr?.too_early;
-  if (!hasLive && !hasEarly && !tooEarly) {
+  if (!hasLive && (!hasEarly || xrPre) && !tooEarly) {
     // 同样**不看 match.state**: 实测 2026-09-04 LPL LGD vs AL 打到第 3 局
     // (1-1 的 BO5) 而 state 已是 completed —— 局间休息时这里就会报"已结束",
     // 而系列赛根本没打完。按比分对 BO 算, 和后端 _clinched 同一套。
@@ -306,9 +315,9 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
     const seriesOver = nd != null && w.some((x) => x >= nd);
     // 三种情况要分开: 打完了 / 打了一半正在换局 / 真的还没开始。
     // 中间那种以前也会被写成"尚未开始", 而那时系列赛已经打了两局。
-    meta.push(
-      T(seriesOver ? "已结束" : played.length > 0 ? "局间休息" : "尚未开始"),
-    );
+    const status = seriesOver ? "已结束" : played.length > 0 ? "局间休息" : "尚未开始";
+    // C 的赛前那一屏下面已经写着"尚未开打", 状态行不再重复"尚未开始"
+    if (!(xrPre && status === "尚未开始")) meta.push(T(status));
   }
   // 已经开打但局内模型还没启用: 报第几分钟, 让人知道"在等什么"
   if ((hasEarly || tooEarly) && pr?.minute != null) {
@@ -434,16 +443,23 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
               pMin={null}
               pMax={null}
               pregame={pr!.pregame_probability_blue}
+              pregameLabel={pregameLabel}
               postdraft={postP}
               reasons={pr!.reasons}
             />
             <div className="summary-row">
               <p className="summary">
-                {T(earlyIsDraft ? "BP 后" : "赛前")} ·{" "}
+                {T(earlyIsDraft ? "BP 后" : isXr ? "跨赛区模型" : "赛前")} ·{" "}
                 {T("{team} 占优", { team: earlyP! >= 0.5 ? blueName : redName })}
               </p>
               <p className="shift">
-                {T(earlyIsDraft ? "已计入双方阵容, 局内模型尚未启用" : "尚未开打")}
+                {T(
+                  earlyIsDraft
+                    ? "已计入双方阵容, 局内模型尚未启用"
+                    : isXr && tooEarly
+                      ? "不看英雄, 局内模型尚未启用"
+                      : "尚未开打",
+                )}
               </p>
             </div>
           </>
@@ -458,6 +474,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
               pMin={card!.p_min}
               pMax={card!.p_max}
               pregame={pr!.pregame_probability_blue}
+              pregameLabel={pregameLabel}
               postdraft={pr!.postdraft_probability_blue}
               reasons={pr!.reasons}
             />
@@ -495,8 +512,8 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
         {lv?.note && <div className="warn">{lv.note}</div>}
 
         {/* 开局头 3 分钟 (hasEarly) 的提醒。too_early 平时不带 warnings; 国际赛同母赛区时带一句口径
-            说明 ("按 LCK 内战口径计算") —— 上面那一屏显示的正是按这个口径算的数, 不能只在局内阶段
-            的折叠说明里才看得到。 */}
+            说明 ("按 LCK 内战口径计算"), 跨赛区模型 C 出数时 (含还没开打的那一屏) 带它的准确率和偏自信
+            说明 —— 上面那一屏显示的正是这个数, 不能只在局内阶段的折叠说明里才看得到。 */}
         {hasEarly &&
           warns.map((w, i) => (
             <div className="warn" key={i}>
@@ -545,6 +562,7 @@ export function Board({ matchId, initial, onBack }: BoardProps) {
                 blueName={blueName}
                 redName={redName}
                 pregame={pr!.pregame_probability_blue}
+                pregameLabel={pregameLabel}
                 postdraft={pr!.postdraft_probability_blue}
                 endState={endState}
               />

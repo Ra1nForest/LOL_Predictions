@@ -13,7 +13,9 @@
  *   live.stale_seconds                     "此刻减帧时刻", 两边取数的时刻不同
  *
  * 赛区按 LEAGUE_IDS 走, 国际赛也在内 —— 跨赛区 / 队名不认识的看板 (只有局内模型、不带赛前特征、
- * 不渐变) 和同母赛区的看板 (赛前按母赛区算) 都由这里和 Python 逐字段对上。
+ * 不渐变) 和同母赛区的看板 (赛前按母赛区算) 都由这里和 Python 逐字段对上。跨赛区模型 C 出数的看板
+ * (多一个 xregion 键: 本赛事重放、C 的赛前数、开局以 C 为锚渐变) 同样逐字段比, 末尾单独报几块、其中几块重放过。
+ * 两边读同一份状态 (Python: artifacts/xregion.json, 浏览器: public/web/xregion.json —— 导出时原样复制)。
  *
  *   node scripts/diff-board.mjs                 最近 4 天, 每赛区最多 3 场
  *   node scripts/diff-board.mjs --days 7 --per 4
@@ -52,6 +54,7 @@ const models = {
   s1: loadStage1(read("../public/web/stage1_pre.json")),
   s2: loadStage2(read("../public/web/stage2_post.json")),
   ex: read("../public/web/explain.json"),
+  xr: read("../public/web/xregion.json"),
 };
 const feed = new Feed({ teams });
 const today = localToday();
@@ -138,6 +141,8 @@ try {
 console.log();
 
 let bad = 0;
+let xrBoards = 0;
+let xrReplayed = 0;
 targets.forEach((x, i) => {
   const js = jsBoards[i];
   const ref = py[`${x.m.match_id}:${x.g.id}`];
@@ -149,9 +154,18 @@ targets.forEach((x, i) => {
   }
   const b = js.ok;
   const d = diffs(normalize(b), normalize(ref));
-  const brief = b.live
-    ? `第${b.live.minute}分钟 暂停${b.live.paused_seconds}s 曲线${b.timeline.length}点 P(蓝)=${b.prediction?.probability_blue}`
-    : "(无帧)";
+  const brief =
+    (b.live
+      ? `第${b.live.minute}分钟 暂停${b.live.paused_seconds}s 曲线${b.timeline.length}点 P(蓝)=${b.prediction?.probability_blue}`
+      : "(无帧)") +
+    (b.xregion
+      ? `  C=${b.xregion.probability_blue.toFixed(4)} 重放${b.xregion.replayed}局 去重${b.xregion.deduped}局`
+      : "");
+  // 跨赛区模型 C: 两边有没有给 C 本身也是比对内容 (diffs 里会报 xregion 键的有无); 这里只计数
+  if (b.xregion || ref.xregion) {
+    xrBoards++;
+    if ((b.xregion?.replayed ?? 0) > 0 || (ref.xregion?.replayed ?? 0) > 0) xrReplayed++;
+  }
   if (d.length) {
     bad++;
     console.log(`✗ ${x.label}  ${brief}  (${js.ms}ms)`);
@@ -172,5 +186,7 @@ for (const [name, js, ref] of [
   for (const e of d) console.log(`    ${e.path}  浏览器 ${JSON.stringify(e.js)}  Python ${JSON.stringify(e.py)}`);
 }
 
-console.log(`\n${targets.length} 局里 ${bad} 局不一致`);
+console.log(
+  `\n${targets.length} 局里 ${bad} 局不一致; 其中跨赛区模型 C 出数的 ${xrBoards} 局 (有赛事内重放的 ${xrReplayed} 局)`,
+);
 process.exit(bad ? 1 : 0);

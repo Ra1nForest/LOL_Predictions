@@ -71,6 +71,7 @@ const UI: Record<string, string> = {
   "缺少历史数据, 无法预测": "Not enough history to predict",
   无历史数据: "No history",
   "赛前不预测 · 开局后有局内胜率": "No pre-match odds · in-game odds once the game starts",
+  "赛前只看跨赛区模型 · 开局后有局内胜率": "Pre-match: cross-region model only · in-game odds once the game starts",
   // 国际赛的显示名 (leagueName): match.league 本身保持上游原样, 只在显示时换
   全球总决赛: "Worlds",
   季中冠军赛: "MSI",
@@ -98,6 +99,10 @@ const UI: Record<string, string> = {
   "训练数据截至 {date}": "Trained on data through {date}",
   "{team} 占优": "{team} favored",
   "已计入双方阵容, 局内模型尚未启用": "Both drafts counted · in-game model not active yet",
+  // 跨赛区模型 C 出数时 (Board.tsx 的 isXr): 赛前那一项的标签和开局头 3 分钟那一行
+  跨赛区模型: "Cross-region model",
+  跨赛区赛前: "Cross-region pre-match",
+  "不看英雄, 局内模型尚未启用": "Champions not counted · in-game model not active yet",
   尚未开打: "Not started yet",
   暂无预测数据: "No prediction yet",
   胜率走势: "Win probability",
@@ -423,6 +428,11 @@ const RULES: [string, string][] = [
   ["{a} 和 {b} 不在四大赛区的数据里, 没有赛前和 BP 后预测; 开局 3 分钟起直接用局内模型", "{a} and {b} aren't in the data for the four major leagues, so there's no pre-match or after-draft prediction; the in-game model takes over from minute 3"],
   ["{name} 不在四大赛区的数据里, 没有赛前和 BP 后预测; 开局 3 分钟起直接用局内模型", "{name} isn't in the data for the four major leagues, so there's no pre-match or after-draft prediction; the in-game model takes over from minute 3"],
   ["跨赛区对阵: 赛前和 BP 后模型只在赛区内战上验证过, 在历史跨赛区国际赛上没有预测力, 这里不显示; 开局 3 分钟起直接用局内模型", "Cross-region matchup: the pre-match and after-draft models were only validated on games within one league and had no predictive power on past cross-region international games, so they aren't shown; the in-game model takes over from minute 3"],
+  // 跨赛区模型 C 出数时换上的那句 (board.ts xregionNote / api._xregion_note), 没有跨赛区记录的母赛区点名补一句。
+  // 两个赛区的排在一个的前面 ({lg} 会把 "A 和 B" 整个吞下); 三条都要排在 "{what}: {err}" 前面
+  ["跨赛区对阵: 赛前数字来自跨赛区模型 (只看两队和所在赛区的历史战绩, 不看英雄), 历史上准确率约 65%, 而且偏自信 —— 它说 85% 的局实际约赢 76%; {a} 和 {b} 此前没有跨赛区国际赛记录, 这个数主要靠先验", "Cross-region matchup: the pre-match number comes from the cross-region model (it only looks at the two teams' and their leagues' past results, not champions); historically about 65% accurate, and overconfident — games it rates at 85% are actually won about 76% of the time; {a} and {b} have no earlier cross-region international record, so this number rests mostly on the prior"],
+  ["跨赛区对阵: 赛前数字来自跨赛区模型 (只看两队和所在赛区的历史战绩, 不看英雄), 历史上准确率约 65%, 而且偏自信 —— 它说 85% 的局实际约赢 76%; {lg} 此前没有跨赛区国际赛记录, 这个数主要靠先验", "Cross-region matchup: the pre-match number comes from the cross-region model (it only looks at the two teams' and their leagues' past results, not champions); historically about 65% accurate, and overconfident — games it rates at 85% are actually won about 76% of the time; {lg} has no earlier cross-region international record, so this number rests mostly on the prior"],
+  ["跨赛区对阵: 赛前数字来自跨赛区模型 (只看两队和所在赛区的历史战绩, 不看英雄), 历史上准确率约 65%, 而且偏自信 —— 它说 85% 的局实际约赢 76%", "Cross-region matchup: the pre-match number comes from the cross-region model (it only looks at the two teams' and their leagues' past results, not champions); historically about 65% accurate, and overconfident — games it rates at 85% are actually won about 76% of the time"],
   ["国际赛: 赛前和 BP 后按两队所在的 {lg} 内战口径计算, 国际赛的场次不计入近况", "International event: pre-match and after-draft odds treat this as an {lg} game, since both teams play in {lg}; international games don't count toward recent form"],
   // 选边说明: 界面上目前不显示 (见 Board.tsx 的 side_warning 注释), 但响应里有, 一并翻
   ["以帧里的 gameState 为准, persisted_state 会滞后", "Frame gameState is authoritative; persisted_state lags behind"],

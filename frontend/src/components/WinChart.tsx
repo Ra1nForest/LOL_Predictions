@@ -12,6 +12,8 @@ interface Props {
   redName: string;
   /** 赛前概率 —— 画成参考线, 让"局势移动了多少"看得见 */
   pregame: number | null;
+  /** 赛前那条线的标签, 默认"赛前"。跨赛区模型 C 出数时看板传"跨赛区赛前" —— 那个数不是 Stage 1 算的 */
+  pregameLabel?: string;
   /** BP 后概率, 有就用它当曲线起点 */
   postdraft: number | null;
   /** 末端标记画成什么。三态而不是布尔 ——
@@ -47,6 +49,7 @@ export function WinChart({
   blueName,
   redName,
   pregame,
+  pregameLabel,
   postdraft,
   endState,
 }: Props) {
@@ -126,7 +129,7 @@ export function WinChart({
   const LABEL_GAP = 13;
   const refLines = (() => {
     const rows = [
-      pregame != null ? { p: pregame, label: tr("赛前"), dash: "2 4" } : null,
+      pregame != null ? { p: pregame, label: pregameLabel ?? tr("赛前"), dash: "2 4" } : null,
       postdraft != null ? { p: postdraft, label: tr("BP 后"), dash: "6 3" } : null,
     ].filter((r): r is { p: number; label: string; dash: string } => r != null);
     if (rows.length < 2 || Math.abs(y(rows[0]!.p) - y(rows[1]!.p)) >= LABEL_GAP) {

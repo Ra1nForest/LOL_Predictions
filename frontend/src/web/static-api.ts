@@ -19,7 +19,7 @@ import type {
   TimelinePoint,
 } from "../api/types.ts";
 import type { Models } from "./board.ts";
-import { boardPlan, buildBoard, fineTimeline, liveList, upcomingList } from "./board.ts";
+import { boardPlan, buildBoard, fineTimeline, liveList, planXrOf, upcomingList } from "./board.ts";
 import type { ExplainFile } from "./explain.ts";
 import { Feed } from "./feed.ts";
 import type { IngameModelFile } from "./ingame.ts";
@@ -33,6 +33,7 @@ import { localToday } from "./teams.ts";
 import { EN } from "../i18n.ts";
 import type { ViewCtx } from "./player.ts";
 import { LivePlayer, liveView } from "./player.ts";
+import type { XregionState } from "./xregion.ts";
 
 async function getJSON<T>(name: string): Promise<T> {
   const r = await fetch(`${import.meta.env.BASE_URL}web/${name}`);
@@ -64,8 +65,14 @@ function models(): Promise<Models> {
     getJSON<Stage1File>("stage1_pre.json"),
     getJSON<ExplainFile>("explain.json"),
     getJSON<Stage2File>("stage2_post.json"),
+    // 跨赛区模型 C 的状态: 下载失败只让跨赛区看板退回原来的行为 (不给赛前数), 不拖垮其余模型 ——
+    // 和服务器读不到 artifacts/xregion.json 时一样
+    getJSON<XregionState>("xregion.json").catch((e) => {
+      console.warn(`xregion.json 没加载, 跨赛区看板不给赛前数: ${e}`);
+      return null;
+    }),
   ])
-    .then(([ig, s1, ex, s2]) => ({ ingame: loadIngame(ig), s1: loadStage1(s1), s2: loadStage2(s2), ex }))
+    .then(([ig, s1, ex, s2, xr]) => ({ ingame: loadIngame(ig), s1: loadStage1(s1), s2: loadStage2(s2), ex, xr }))
     .catch((e) => {
       modelsP = null;
       throw e;
@@ -136,8 +143,16 @@ export const staticApi = {
   async fine(board: BoardResponse, onPts: (pts: TimelinePoint[]) => void): Promise<void> {
     const lv = board.live;
     const m = board.match;
-    // 队名、赛区、赛前口径和看板曲线同一个取法 (boardPlan): 队名映射不出来也画局内模型的线
-    const plan = m ? boardPlan(m.teams.map((t) => ({ api: t.name, model: t.model_name })), m.league, m.pregame_league) : null;
+    // 队名、赛区、赛前口径和看板曲线同一个取法 (boardPlan): 队名映射不出来也画局内模型的线;
+    // 看板带着跨赛区模型 C 的数时开局那段从它渐变, 同看板曲线
+    const plan = m
+      ? boardPlan(
+          m.teams.map((t) => ({ api: t.name, model: t.model_name })),
+          m.league,
+          m.pregame_league,
+          planXrOf(board),
+        )
+      : null;
     if (!lv || !m || !plan || !lv.frame_time) return;
     const gid = lv.game_id;
     const upto = Date.parse(lv.frame_time);
@@ -158,7 +173,8 @@ export const staticApi = {
         t,
         mo,
         localToday(),
-        // prior: 看板的 BP 后概率 —— 逐秒走势开局那段和头条同一个渐变 (没有赛前口径时不渐变)
+        // prior: 看板的 BP 后概率 —— 逐秒走势开局那段和头条同一个渐变 (没有赛前口径时不渐变);
+        // xr: 跨赛区模型 C 的数 (没有赛前口径但有 C 时以它为锚)
         {
           gameId: gid,
           blue: plan.blue,
@@ -167,6 +183,7 @@ export const staticApi = {
           preLeague: plan.preLeague,
           upto,
           prior: board.prediction?.postdraft_probability_blue ?? null,
+          xr: plan.xr,
         },
         (pts) => {
           all = pts as unknown as TimelinePoint[];

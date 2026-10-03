@@ -2167,3 +2167,1215 @@ class InternationalBoard(unittest.TestCase):
         out = self.api.esports_board("M1", curves=False)
         self.assertIsNotNone(out["match"], "WORLDS 取不到不该让 DCGI 的比赛找不到")
         self.assertEqual(out["match"]["league"], "DCGI")
+
+
+# ══════════════════════════════════════════════════════════
+#  跨赛区模型 C (xregion.py) —— 引擎、导出状态、表的规则
+# ══════════════════════════════════════════════════════════
+
+def _oe_raw(games):
+    """合成的 OE 原始行 (= xregion._read_raw 的输出: 赛区已改名、日期已解析)。
+
+    games: [(gameid, 时间, 赛区代码, 蓝队, 红队, 蓝方胜, 局序, 蓝方五人 id 或 None, 红方五人 id 或 None)]。
+    每局两行 team + 十行选手; 不给选手 id 就用 "队名:位置"。
+    """
+    import pandas as pd
+    from feature_store import ROLES
+    rows = []
+    for gid, when, lg, blue, red, bw, gno, bp, rp in games:
+        ts = pd.Timestamp(when)
+        for side, team, pid0, res, ids in (("Blue", blue, 100, int(bw), bp), ("Red", red, 200, 1 - int(bw), rp)):
+            base = dict(gameid=gid, datacompleteness="complete", league=lg, playoffs=0, date=ts, game=gno,
+                        patch="25.01", side=side, teamname=team, teamid=f"id:{team}", result=res)
+            rows.append(dict(base, participantid=pid0, position="team", playername=None, playerid=None,
+                             champion=None))
+            for k, role in enumerate(ROLES):
+                pid = ids[k] if ids else f"{team}:{role}"
+                rows.append(dict(base, participantid=(1 if side == "Blue" else 6) + k, position=role,
+                                 playername=pid, playerid=pid, champion="Ahri"))
+    return pd.DataFrame(rows)
+
+
+def _xregion_world():
+    """一个小世界: 2023 一支日本队 (到 2025 已过期); 2024、2025 两季 LCK / LPL / PCS / VCS 内战和 MSI;
+    2025 年中 P1 (PCS)、V1 (VCS) 迁入新赛区 LCP, 另有新队 C3; 2025 WLDs 的第一局是同赛区局, 之后有
+    同一时间戳且共用一个赛区的两局、跨 UTC 零点的 BO3、LCP 第一次打跨赛区。WLDs 期间没有国内比赛 ——
+    这样"状态 + 重放"必须和整表在线走一遍逐位相同。"""
+    import random
+    import pandas as pd
+    rng = random.Random(7)
+    games, n = [], [0]
+
+    def add(when, lg, b, r, gno=1):
+        n[0] += 1
+        games.append((f"G{n[0]:04d}", when, lg, b, r, rng.random() < 0.55, gno, None, None))
+
+    def season(start, pools):
+        h = 0
+        for lg, ts in pools.items():
+            for a in ts:
+                for b in ts:
+                    if a < b:
+                        for blue, red in ((a, b), (b, a)):
+                            h += 1
+                            add(pd.Timestamp(start) + pd.Timedelta(hours=7 * h), lg, blue, red)
+
+    for k in range(4):
+        add(f"2023-03-0{k + 1} 08:00", "LJL", "J1", "J2")
+    big = {"LCK": ["K1", "K2", "K3"], "LPL": ["L1", "L2", "L3"]}
+    season("2024-01-01", {**big, "PCS": ["P1", "P2"], "VCS": ["V1", "V2"]})
+    for w, b, r in (("2024-05-02 08:00", "K1", "L1"), ("2024-05-02 08:00", "P1", "V1"),
+                    ("2024-05-03 08:00", "K1", "P1"), ("2024-05-03 09:00", "L1", "V1"),
+                    ("2024-05-04 08:00", "K2", "L2")):
+        add(w, "MSI", b, r)
+    season("2025-01-01", {**big, "PCS": ["P1", "P2"], "VCS": ["V1", "V2"]})
+    add("2025-03-20 06:00", "KeSPA", "K1", "K2")          # 杯赛, 同池: 更新 r; 不是母赛区
+    add("2025-03-21 06:00", "KeSPA", "K1", "L1")          # 杯赛, 不同池: 不更新
+    for w, b, r in (("2025-05-02 08:00", "K1", "L1"), ("2025-05-02 08:00", "K2", "P1"),
+                    ("2025-05-03 08:00", "L2", "V1"), ("2025-05-04 08:00", "K1", "V2")):
+        add(w, "MSI", b, r)
+    season("2025-06-01", {"LCP": ["P1", "V1", "C3"]})
+    season("2025-08-01", big)
+    add("2025-10-01 06:00", "WLDs", "K1", "K2")           # 赛事第一局: 同赛区 (切点要算上它)
+    add("2025-10-02 08:00", "WLDs", "P1", "K3")           # LCP 第一次跨赛区: 先验 = PCS / VCS 偏移的均值
+    add("2025-10-02 08:00", "WLDs", "K2", "L1")           # 同一时间戳、同样有 LCK: 互相看不到
+    add("2025-10-02 23:30", "WLDs", "K1", "L2", 1)        # BO3 跨 UTC 零点
+    add("2025-10-03 00:20", "WLDs", "L2", "K1", 2)
+    add("2025-10-03 01:10", "WLDs", "K1", "L2", 3)
+    add("2025-10-04 08:00", "WLDs", "C3", "L3")
+    add("2025-10-04 09:00", "WLDs", "V1", "K2")
+    return games
+
+
+class XregionEngine(unittest.TestCase):
+    """坑: 看板用"导出的状态 + 赛事内重放"出数, 闸门用"整表按时间走一遍"出数, 两条路只要有一处不同
+    (同一时间戳的局先后更新了、衰减多乘了一次、JSON 丢了精度、系数切点放错赛事) 就是一个看着合理的错数字。
+    闸门只证明了在线版本能过 —— 看板必须和它逐位相同, 不是"差不多"。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import pandas as pd
+        import xregion as X
+        cls.X = X
+        cls.table, cls.diag = X.build_table(_oe_raw(_xregion_world()))
+        cls.A = X.prepare(cls.table)
+        cls.R = X.run_elo(X.P_C, cls.A)
+        w = cls.table[cls.table["event"] == "2025 WLDs"]
+        cls.wlds = w
+        cls.first = pd.Timestamp(w["date"].min())
+
+    def _state(self, **kw):
+        import json
+        return json.loads(json.dumps(self.X.build_state(self.table, **kw), allow_nan=False))
+
+    def test_状态加重放和整表在线逐位相同(self):
+        import json
+        import numpy as np
+        X, t = self.X, self.table
+        # 看板 (from_state 之后) 的 exp 是 portable_exp (浏览器版要逐位复现, 见 xregion.portable_exp); 整表和
+        # 导出也拿它走, 两条路才是同一段算术 —— 比的是重放的机制 (分组、衰减的时刻、JSON 精度、系数切点)
+        R = X.run_elo(X.P_C, self.A, exp=X.portable_exp)
+        st = json.loads(json.dumps(X.build_state(t, asof=self.first, exp=X.portable_exp), allow_nan=False))
+        # 期望的系数 = 闸门的 walk-forward: 只用切点前的跨赛区国际赛, c = 切点前的蓝方胜率
+        x_o, x_r = (R["ob"] - R["or"]) / X.S, (R["rb"] - R["rr"]) / X.S
+        tr = X.target(t).values & (t["date"].values < np.datetime64(self.first))
+        beta = X.fit_coef(x_o, x_r, t["blue_win"].values.astype(float), tr, X.const_rate(t, self.first))
+        coef = st["coefficients"]["WORLDS"]
+        self.assertEqual([coef["a"], coef["b_o"], coef["b_r"]], [float(b) for b in beta],
+                         "赛事还没进 OE 时, '全部数据之后'的切点必须等于闸门的'赛事第一局'")
+        hist, checked = [], 0
+        for i, r in self.wlds.iterrows():
+            ti = self.A["t"][i]
+            if r["cross_region"]:
+                eng = X.Engine.from_state(st)
+                eng.play([g for g in hist if g["t"] < ti])
+                f = eng.features(r["blue"], r["red"], ti)
+                self.assertEqual(f, (R["ob"][i], R["or"][i], R["rb"][i], R["rr"][i]), f"第 {i} 局的 o / r")
+                p = X.predict(st, "WORLDS", r["blue"], r["red"], ti, [g for g in hist if g["t"] < ti])
+                self.assertEqual(p, X.logistic(coef, R["ob"][i], R["or"][i], R["rb"][i], R["rr"][i]))
+                checked += 1
+            hist.append({"t": ti, "blue": r["blue"], "red": r["red"], "blue_win": int(r["blue_win"])})
+        self.assertEqual(checked, 7, "世界里 7 局跨赛区 WLDs 都要对上")
+        self.assertIn("LCP", st["migr"], "LCP 在导出时还没有偏移, 先验靠 migr")
+        self.assertFalse(st["leagues"]["LCP"]["has_crossregion_history"])
+
+    def test_同一时间戳的局先全部取赛前值再统一更新(self):
+        import math
+        X = self.X
+        st = self._state(asof=self.first)
+        t0 = X.to_t("2025-10-02 08:00")
+        a = {"t": t0, "blue": "P1", "red": "K3", "blue_win": 1}
+        b = {"t": t0, "blue": "K2", "red": "L1", "blue_win": 0}
+        e_batch = X.Engine.from_state(st)
+        e_batch.play([a, b])
+        # 期望: 两局的赛前值都在任何更新之前取 —— 手算
+        e = X.Engine.from_state(st)
+        fa, fb = e.features("P1", "K3", t0), e.features("K2", "L1", t0)
+        pa = 1 / (1 + X.portable_exp(-(fa[0] + fa[2] - fa[1] - fa[3]) / X.S))     # 看板的引擎用 portable_exp
+        pb = 1 / (1 + X.portable_exp(-(fb[0] + fb[2] - fb[1] - fb[3]) / X.S))
+        lck = e.o["LCK"] - X.P_C["eta"] * (1 - pa) + X.P_C["eta"] * (0 - pb)
+        self.assertEqual(e_batch.o["LCK"], lck)
+        e_seq = X.Engine.from_state(st)
+        e_seq.play([a, dict(b, t=t0 + 1e-6)])
+        self.assertNotEqual(e_seq.o["LCK"], e_batch.o["LCK"], "错开一点时间, 第二局就看得到第一局 —— 结果必须不同")
+
+    def test_重放的局不能乱序(self):
+        X = self.X
+        e = X.Engine.from_state(self._state(asof=self.first))
+        with self.assertRaises(ValueError, msg="递减的 t 直接报错, 不悄悄重排"):
+            e.play([{"t": 20000.5, "blue": "K1", "red": "L1", "blue_win": 1},
+                    {"t": 20000.4, "blue": "K2", "red": "L2", "blue_win": 1}])
+
+    def test_衰减按半衰期且不往回衰减(self):
+        X = self.X
+        e = X.Engine()
+        e.o["LCS"], e.oprior["LCS"], e.olast["LCS"] = 100.0, 0.0, 1000.0
+        self.assertAlmostEqual(e.off("LCS", 1000.0 + 365.0), 50.0, places=10)
+        self.assertEqual(e.olast["LCS"], 1365.0)
+        v = e.o["LCS"]
+        self.assertEqual(e.off("LCS", 1200.0), v, "早于上次衰减的时刻: 不动")
+        e.o["LPL"], e.oprior["LPL"], e.olast["LPL"] = -100.0, -600.0, 0.0
+        self.assertAlmostEqual(e.off("LPL", 730.0), -600.0 + 500.0 * 0.25, places=9, msg="向先验衰减, 不是向 0")
+
+    def test_第一次出现的赛区取先验(self):
+        X = self.X
+        e = X.Engine()
+        e.o.update({"PCS": -500.0, "VCS": -560.0})
+        e.migr["LCP"] += ["PCS", "VCS", "PCS"]
+        self.assertEqual(e.off("LCP", 10.0), X.pairwise_mean([-500.0, -560.0, -500.0]),
+                         "新赛区 = 迁入队伍原赛区偏移的均值 (按队计)")
+        self.assertEqual(e.off("LEC", 10.0), 0.0, "四大的先验是 0")
+        self.assertEqual(e.off("TCL", 10.0), -X.P_C["dnm"], "其余赛区的先验是 −600")
+
+    def test_pairwise_mean和np_mean逐位相同(self):
+        # 浏览器版照 pairwise_mean 的顺序加; 顺序累加在 8 个以上时会差最后一位
+        import random
+        import numpy as np
+        rng = random.Random(3)
+        for n in list(range(1, 140)) + [255, 256, 257, 600]:
+            xs = [rng.uniform(-700, 100) for _ in range(n)]
+            self.assertEqual(self.X.pairwise_mean(xs), float(np.mean(xs)), n)
+
+    def test_系数切点按赛事(self):
+        import numpy as np
+        X, t = self.X, self.table
+        st = self._state()                            # 全部数据: OE 最后一局在 2025-10, "当年" = 2025
+        tg = X.target(t).values
+        dates = t["date"].values
+        c = st["coefficients"]
+        self.assertEqual(c["WORLDS"]["event"], "2025 WLDs")
+        self.assertEqual(c["WORLDS"]["cutoff"], X._iso(self.first), "切点是赛事在 OE 的第一局, 同赛区局也算")
+        self.assertEqual(c["WORLDS"]["n_train"], int((tg & (dates < np.datetime64(self.first))).sum()))
+        msi = t.loc[t["event"] == "2025 MSI", "date"].min()
+        self.assertEqual((c["MSI"]["event"], c["MSI"]["cutoff"]), ("2025 MSI", X._iso(msi)))
+        for k in ("FIRST STAND", "ESPORTS WORLD CUP", "DCGI"):
+            self.assertIsNone(c[k]["cutoff"], f"{k}: 当年的赛事不在 OE → 全部数据之后")
+            self.assertEqual(c[k]["n_train"], int(tg.sum()))
+        st24 = self._state(asof="2025-01-01")
+        self.assertEqual(st24["coefficients"]["MSI"]["event"], "2024 MSI", "'当年'跟着 OE 最后一局走")
+        self.assertIsNone(st24["coefficients"]["WORLDS"]["cutoff"])
+
+    def test_母赛区过期或同赛区不给数(self):
+        X = self.X
+        st = self._state()
+        self.assertNotIn("J1", st["teams"], "最后一场常规联赛早于 365 天的队不导出")
+        e = X.Engine.from_state(st)
+        tw = X.to_t("2025-10-10")
+        self.assertIsNone(e.home("J1", tw))
+        self.assertIsNone(X.predict(st, "WORLDS", "J1", "K1", tw))
+        self.assertIsNone(X.predict(st, "WORLDS", "K1", "K2", tw), "同母赛区: C 不给 (闸门没评过)")
+        self.assertIsNone(X.predict(st, "LCK", "K1", "L1", tw), "没有系数的赛区键")
+        self.assertIsNotNone(X.predict(st, "worlds", "K1", "L1", tw), "赛区键大小写无关")
+        e.last["K1"] = tw - X.STALE_HOME_DAYS - 1
+        self.assertIsNone(e.home("K1", tw))
+
+    def test_状态列出OE里已有的国际赛局(self):
+        # 重放靠它去重: OE 已经算进状态的局再重放一遍, 评分就被算了两次
+        st = self._state()
+        ev = st["events"]["2025 WLDs"]
+        self.assertEqual(st["game_fields"], ["blue", "red", "game", "date", "blue_win", "status"])
+        self.assertEqual(len(ev["games"]), len(self.wlds))
+        self.assertEqual(ev["league_key"], "WORLDS")
+        self.assertIn(["L2", "K1", 2, "2025-10-03T00:20:00Z", int(self.wlds.iloc[4]["blue_win"]), "cross"], ev["games"])
+        self.assertEqual(ev["games"][0][-1], "same")
+        self.assertEqual(sum(len(v["games"]) for v in st["events"].values()),
+                         int(self.table["is_international"].sum()))
+
+    def test_导出再读回不丢精度(self):
+        X = self.X
+        st = self._state()
+        e1 = self.R["engine"]
+        e2 = X.Engine.from_state(st)
+        for team in st["teams"]:
+            self.assertEqual(e2.r[team], e1.r[team])
+        for L in e1.o:
+            self.assertEqual((e2.o[L], e2.oprior[L], e2.olast[L]), (e1.o[L], e1.oprior[L], e1.olast[L]))
+
+    def test_to_t和整列算法逐位相同(self):
+        import pandas as pd
+        X = self.X
+        s = pd.Series(pd.to_datetime(["2026-10-02 18:20:44", "2025-01-01 00:00:00", "2023-03-05 23:59:59"])
+                      .astype("datetime64[us]"))
+        col = ((s - X.EPOCH).dt.total_seconds() / 86400).tolist()
+        self.assertEqual([X.to_t(x) for x in s], col)
+        self.assertEqual(X.to_t("2026-10-02T18:20:44Z"), col[0])
+        self.assertEqual(X.to_t("2026-10-03T02:20:44+08:00"), col[0], "带时区的按 UTC 换算")
+
+
+class XregionPortableExp(unittest.TestCase):
+    """坑: 看板的 C 由 Python 和浏览器两份实现算, 而各平台的 exp 末位互不相同 (本机 math.exp 是 MSVC 运行库的,
+    20 万个输入里 1147 个不是正确舍入, 和浏览器 V8 有 7% 的输入差一位)。用平台的 exp, 两边就在约一成的看板上差
+    最后一位 —— "两份实现本来就对不上"成了常态, 真正的移植错误就藏在里面。所以从导出状态出发的计算 (重放、衰减、
+    logistic) 两边都用同一段只含 IEEE 四则运算的 fdlibm exp; 闸门和每天导出状态 (整表走一遍) 仍用 math.exp,
+    闸门的复现一个比特不动。"""
+
+    def test_fdlibm的值(self):
+        import math
+        import xregion as X
+        # 这个输入上 MSVC 的 math.exp 给 0.38356939397440054; fdlibm (也是 V8 的 Math.exp) 给 ...06
+        self.assertEqual(X.portable_exp(-0.9582347254583471), 0.3835693939744006)
+        self.assertEqual(X.portable_exp(0.0), 1.0)
+        self.assertEqual(X.portable_exp(-0.0), 1.0)
+        # 纯 fdlibm 的 exp(1) 比 math.e 大一位 (V8 对 x = 1 特判成 Math.E, 这里不跟 —— 两份移植一致就够)
+        self.assertEqual(X.portable_exp(1.0), 2.7182818284590455)
+        self.assertEqual(X.portable_exp(-746.0), 0.0)
+        self.assertEqual(X.portable_exp(710.0), math.inf)
+        self.assertTrue(math.isfinite(X.portable_exp(709.7)), "k = 1024 那一档不能溢出 (2.0 ** 1024 要拆两步)")
+        self.assertEqual(X.portable_exp(-math.inf), 0.0)
+        self.assertTrue(math.isnan(X.portable_exp(math.nan)))
+
+    def test_和math_exp至多差一位(self):
+        import math
+        import random
+        import xregion as X
+        rng = random.Random(5)
+        for _ in range(20000):
+            x = rng.uniform(-40, 40)
+            a, b = X.portable_exp(x), math.exp(x)
+            self.assertLessEqual(abs(a - b), math.ulp(b), x)
+
+    def test_看板的引擎用它_闸门的引擎不用(self):
+        import math
+        import xregion as X
+        self.assertIs(X.Engine().exp, math.exp, "闸门 / 导出状态: math.exp, 闸门复现不动")
+        st = {"params": {**X.P_C, "majors": ["LCK", "LPL", "LEC", "LCS"]}, "teams": {}, "leagues": {}, "migr": {}}
+        self.assertIs(X.Engine.from_state(st).exp, X.portable_exp, "从导出状态出发 = 看板, 浏览器版要逐位复现")
+        coef = {"a": 0.1, "b_o": 0.7, "b_r": 0.95}
+        z = 0.1 + 0.7 * ((15.094420463862296 - -138.9824578406959) / X.S) + 0.95 * ((54.288647534997935 - 20.318060134603556) / X.S)
+        self.assertEqual(X.logistic(coef, 15.094420463862296, -138.9824578406959, 54.288647534997935, 20.318060134603556),
+                         1 / (1 + X.portable_exp(-z)))
+
+
+class XregionTableRules(unittest.TestCase):
+    """坑: 母赛区 / 系列赛 / 赛区改名错了不报错 —— 一支 LCK 队的母赛区被记成 "KeSPA", 赛区强度就多出一个
+    假赛区; 跨 UTC 零点的 BO5 被拆成两个系列赛; 少了 LTA 改名, 2025 一整年北美 / 巴西的比赛消失。"""
+
+    def _table(self, games):
+        import xregion as X
+        return X.build_table(_oe_raw(games))
+
+    def test_母赛区跳过杯赛(self):
+        g, _ = self._table([
+            ("A", "2025-09-01 08:00", "LCK", "K1", "K2", 1, 1, None, None),
+            ("B", "2025-09-02 08:00", "LPL", "L1", "L2", 1, 1, None, None),
+            ("C", "2025-09-20 08:00", "KeSPA", "K1", "K2", 1, 1, None, None),
+            ("D", "2025-10-05 08:00", "WLDs", "K1", "L1", 1, 1, None, None)])
+        r = g[g["gameid"] == "D"].iloc[0]
+        self.assertEqual((r["home_blue"], r["home_red"], r["region_status"]), ("LCK", "LPL", "cross"))
+
+    def test_队名过期365天按阵容认队(self):
+        s = [f"s{k}" for k in range(5)]
+        g, _ = self._table([
+            ("A", "2023-06-01 08:00", "VCS", "Old Secret", "V2", 1, 1, s, None),
+            ("B", "2025-08-01 08:00", "LCP", "Whales", "C3", 1, 1, s, None),
+            ("C", "2025-08-02 08:00", "LPL", "L1", "L2", 1, 1, None, None),
+            ("D", "2025-10-05 08:00", "WLDs", "Old Secret", "L1", 1, 1, s, None),
+            ("E", "2025-10-06 08:00", "WLDs", "National", "L1", 1, 1, None, None)])
+        d = g[g["gameid"] == "D"].iloc[0]
+        self.assertEqual((d["home_name_blue"], d["home_blue"], d["home_source_blue"]), ("VCS", "LCP", "roster"))
+        e = g[g["gameid"] == "E"].iloc[0]
+        self.assertEqual(e["region_status"], "unknown", "没有任何历史的 (国家队) 不走阵容规则")
+
+    def test_系列赛跨零点不拆开_同日再打另算(self):
+        g, _ = self._table([
+            ("A", "2025-10-05 23:30", "WLDs", "K1", "L1", 1, 1, None, None),
+            ("B", "2025-10-06 00:20", "WLDs", "L1", "K1", 1, 2, None, None),
+            ("C", "2025-10-06 08:00", "WLDs", "K1", "L1", 1, 1, None, None)])
+        s = g.set_index("gameid")["series"]
+        self.assertEqual(s["A"], s["B"])
+        self.assertNotEqual(s["B"], s["C"], "局序不增 = 新系列赛")
+
+    def test_读CSV时LTA改名(self):
+        import tempfile
+        import xregion as X
+        raw = _oe_raw([("A", "2025-02-01 08:00", "LTA N", "FlyQuest", "Cloud9", 1, 1, None, None),
+                       ("B", "2025-02-01 09:00", "LTA S", "LOUD", "paiN Gaming", 1, 1, None, None)])
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "oe.csv"
+            raw.to_csv(p, index=False)
+            got = X._read_raw([p], verbose=False)
+        self.assertEqual(sorted(set(got["league"])), ["CBLOL", "LCS"])
+
+    def _dcgi_like(self, code):
+        games = [("A", "2025-05-01 08:00", "LCK", "K1", "K2", 1, 1, None, None),
+                 ("B", "2025-05-01 09:00", "LPL", "L1", "L2", 1, 1, None, None),
+                 ("C", "2025-05-02 08:00", "LCK", "K3", "K4", 1, 1, None, None),
+                 ("D", "2025-05-02 09:00", "LPL", "L3", "L4", 1, 1, None, None),
+                 ("E", "2025-05-10 08:00", "MSI", "K1", "L1", 1, 1, None, None)]
+        pairs = [("K1", "L1"), ("K2", "L2"), ("K3", "L3"), ("K4", "L4"), ("K1", "L2"), ("K2", "L1")]
+        games += [(f"X{k}", "2025-12-01 08:00", code, b, r, 1, 1, None, None) for k, (b, r) in enumerate(pairs)]
+        return self._table(games)
+
+    def test_没归类的新赛事代码会被报出来且拒绝导出(self):
+        # 全球邀请赛若以一个没登记的新代码进了 OE, 会被当成常规联赛: 参赛队的母赛区和 Elo 池整个挪过去, 不报错
+        import xregion as X
+        g, diag = self._dcgi_like("DCG")
+        self.assertEqual([x["event"] for x in diag["unlisted_lookalikes"]], ["2025 DCG"])
+        st = X.build_state(_with_diag(g, diag))
+        self.assertEqual(st["teams"]["K1"]["pool"], "DCG", "错就错在这里: K1 的 Elo 池被挪进了一个假赛区")
+        self.assertTrue(any("没列入国际赛" in p for p in X.sanity_check(st)))
+
+    def test_已在杯赛表里的代码有跨赛区对打_只提醒不拦(self):
+        # 2026-10-04 复核: OE 若把 DCGI 记成 DCup (已在 NON_HOME, 协议排除), 原来的检查照样拒绝导出, 而按提示
+        # "加进 NON_HOME" 也清不掉 —— 日更从此每天停在这一步 (Stage 1/2/4 和网站一起)。杯赛不挪池子、不当母赛区,
+        # 状态没有错, 只是这些局不计入: 只提醒
+        import xregion as X
+        g, diag = self._dcgi_like("DCup")
+        self.assertEqual(diag["unlisted_lookalikes"], [])
+        self.assertEqual([x["event"] for x in diag["nonhome_crossregion"]], ["2025 DCup"])
+        self.assertFalse(g.loc[g["league"] == "DCup", "is_international"].any(), "DCup 仍是协议排除的国内杯赛")
+        st = X.build_state(_with_diag(g, diag))
+        self.assertEqual(st["teams"]["K1"]["pool"], "LCK", "杯赛不挪池子")
+        self.assertFalse([p for p in X.sanity_check(st) if "没列入国际赛" in p or "DCup" in p],
+                         "(这个小世界的队数不够, 别的检查本来就不过; 只看它不因杯赛被拦)")
+        self.assertTrue(any("杯赛 2025 DCup" in x for x in X._summary(st)), "构建时要打出来")
+        self.assertNotIn("2025 DCup", st["events"], "不计入 = 也不进去重表, 看板会整个重放它 (不会算两遍)")
+
+    def test_DCGI以登记的代码进OE_算国际赛(self):
+        import xregion as X
+        g, diag = self._dcgi_like("DCGI")
+        self.assertEqual(diag["unlisted_lookalikes"] + diag["nonhome_crossregion"], [])
+        self.assertTrue(g.loc[g["league"] == "DCGI", "is_international"].all())
+        st = X.build_state(_with_diag(g, diag))
+        self.assertEqual(st["teams"]["K1"]["pool"], "LCK")
+        self.assertEqual(st["events"]["2025 DCGI"]["n"], 6)
+        self.assertEqual(st["coefficients"]["DCGI"]["event"], "2025 DCGI", "切点按闸门: 这个赛事在 OE 里的第一局")
+        self.assertEqual(st["coefficients"]["DCGI"]["cutoff"], "2025-12-01T08:00:00Z")
+
+
+def _with_diag(df, diag):
+    df.attrs["diag"] = diag
+    return df
+
+
+def _valid_xregion_state():
+    """一份能过 sanity_check 的最小状态 (四大各 8 队, 外加凑够 MIN_TEAMS 的次级联赛队)。"""
+    import xregion as X
+    teams = {}
+    for L in ("LPL", "LCK", "LEC", "LCS"):
+        for k in range(8):
+            teams[f"{L}-{k}"] = {"pool": L, "home": L, "r": 1.5, "ng": 30, "last_regular": "2026-09-01T00:00:00Z",
+                                 "last_regular_t": 20697.0}
+    for k in range(X.MIN_TEAMS):
+        teams[f"LDL-{k}"] = {"pool": "LDL", "home": "LDL", "r": 0.0, "ng": 3, "last_regular": "2026-09-01T00:00:00Z",
+                             "last_regular_t": 20697.0}
+    leagues = {L: {"o": -50.0, "prior": 0.0, "last_t": 20650.0, "last": "2026-07-16T00:00:00Z",
+                   "has_crossregion_history": True, "crossregion_games": 100, "major": True}
+               for L in ("LPL", "LCK", "LEC", "LCS")}
+    leagues["LDL"] = {"o": None, "prior": None, "last_t": None, "last": None, "has_crossregion_history": False,
+                      "crossregion_games": 0, "major": False}
+    coefs = {k: {"a": 0.14, "b_o": 0.7, "b_r": 0.95, "c": 0.53, "event": None, "cutoff": None, "n_train": 979}
+             for k in X.LE_EVENT_CODES}
+    return {"oe_asof": "2026-10-02T18:20:44Z", "teams": teams, "leagues": leagues, "coefficients": coefs,
+            "diag": {"unlisted_lookalikes": []}}
+
+
+class XregionSanityAndWiring(unittest.TestCase):
+    """坑: 状态文件坏了 (系数 NaN、少一年数据、四大缺一个、有个新杯赛代码没归类) 不会让看板报错 ——
+    只会让跨赛区的数悄悄变成另一个数。日更必须在换上线前拦住, 而且和其他模型一起换。"""
+
+    def test_好状态通过_坏状态各自被拦(self):
+        import copy
+        import xregion as X
+        good = _valid_xregion_state()
+        self.assertEqual(X.sanity_check(good), [])
+        cases = []
+        s = copy.deepcopy(good); s["coefficients"]["WORLDS"]["b_o"] = float("nan"); cases.append(("NaN 系数", s))
+        s = copy.deepcopy(good); del s["coefficients"]["DCGI"]; cases.append(("缺 DCGI 系数", s))
+        s = copy.deepcopy(good); s["teams"] = {k: v for k, v in s["teams"].items() if not k.startswith("LEC")}
+        cases.append(("LEC 没有队", s))
+        s = copy.deepcopy(good); s["teams"] = dict(list(s["teams"].items())[:100]); cases.append(("队太少", s))
+        s = copy.deepcopy(good); s["leagues"]["LCS"]["has_crossregion_history"] = False; cases.append(("LCS 没偏移", s))
+        s = copy.deepcopy(good); s["diag"]["unlisted_lookalikes"] = [{"event": "2026 DCG"}]; cases.append(("新代码", s))
+        s = copy.deepcopy(good)
+        s["events"] = {"2026 XYZ": {"code": "XYZ", "year": 2026, "games": []}}
+        cases.append(("国际赛代码既没有 lolesports 键也没写明没有", s))
+        for name, s in cases:
+            self.assertTrue(X.sanity_check(s), name)
+        ok = copy.deepcopy(good)
+        ok["diag"]["nonhome_crossregion"] = [{"event": "2026 DCup", "n": 6, "cross_first_division": 6}]
+        ok["events"] = {"2026 DCGI": {"code": "DCGI", "year": 2026, "games": []},
+                        "2026 AC": {"code": "AC", "year": 2026, "games": []},
+                        "2025 XYZ": {"code": "XYZ", "year": 2025, "games": []}}      # 往年的不影响切点
+        self.assertEqual(X.sanity_check(ok), [], "杯赛里的跨赛区对打只提醒; 有归属的国际赛代码不拦")
+
+    def test_日更里C是旁路_坏状态整份不换_不拦其他模型(self):
+        # 2026-10-04 复核: 原来 xregion.py --build 是第三个训练步骤, 它一失败 (比如 OE 收进一个没归类的新代码)
+        # 整个日更就停, Stage 1/2/4 和网站天天不更新。现在它是旁路: 坏了只是线上留旧的一份 (整份, 自洽)
+        import json
+        import tempfile
+        enc = getattr(sys.stdout, "encoding", None)
+        import daily_update                         # 导入时会把本进程 stdout 改成 UTF-8
+        if enc and hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding=enc)
+        DU = daily_update
+        self.assertNotIn("xregion.json", DU.ARTIFACT_FILES, "它不能卡住其他模型的'缺文件'检查")
+        self.assertNotIn("xregion.py", [s for s, _a in DU.TRAIN_STEPS])
+        self.assertEqual(DU.XREGION_STEP, ("xregion.py", ["--build"]))
+        old = (DU.STAGING, DU.run, DU.log)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                DU.STAGING = Path(d)
+                DU.log = lambda *a, **k: None
+                p = Path(d) / "xregion.json"
+                p.write_text(json.dumps(_valid_xregion_state()), encoding="utf-8")
+                self.assertEqual(DU._xregion_problems(p), [])
+                DU.run = lambda cmd, env=None, timeout=0: (0, "ok")
+                self.assertIsNone(DU._build_xregion({}), "好的: 可以换")
+                self.assertTrue(p.exists())
+                bad = _valid_xregion_state()
+                bad["coefficients"]["MSI"]["a"] = float("inf")
+                p.write_text(json.dumps(bad), encoding="utf-8")
+                self.assertIn("MSI", DU._build_xregion({}))
+                self.assertFalse(p.exists(), "不过检查的那份删掉, 换的时候不会碰线上的旧文件")
+                p.write_text('{"teams": {', encoding="utf-8")
+                self.assertTrue(DU._xregion_problems(p), "截断的文件")
+                DU.run = lambda cmd, env=None, timeout=0: (1, "有没列入国际赛、却有跨赛区一级联赛对打的赛事")
+                self.assertIn("rc=1", DU._build_xregion({}))
+                self.assertFalse(p.exists())
+                self.assertFalse(any("xregion" in b for b in DU.gate({}, {}, None, None)), "缺了它也不拦其他模型")
+        finally:
+            DU.STAGING, DU.run, DU.log = old
+
+    def test_C的状态没换上_health看得见(self):
+        import tempfile
+        import update_status as U
+        old = U.STATUS_FILE
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                U.STATUS_FILE = Path(d) / "s.json"
+                U.record_xregion("ok")
+                U.record("ok", fetch_ok=True, exit_code=0)
+                first = U.read()["xregion"]["last_success"]
+                self.assertIsNotNone(first, "整轮的留档不能把它冲掉")
+                U.record_xregion("failed", "xregion.json: 有没列入国际赛的赛事")
+                U.record("ok", fetch_ok=True, exit_code=0)
+                s = U.summary()
+                self.assertEqual(s["xregion"]["outcome"], "failed")
+                self.assertEqual(s["xregion"]["last_success"], first, "线上那份是哪天的")
+                self.assertIn("跨赛区模型 C 的状态没换上", s["message"])
+        finally:
+            U.STATUS_FILE = old
+
+    def test_参数是闸门冻结的那一组(self):
+        # 改任何一个数都等于换了一个没过闸的模型 (闸门的 DEV 复现也会对不上)
+        import math
+        import xregion as X
+        self.assertEqual(X.P_C, dict(K=2.0, knew=1.0, nnew=10, h=0.0, init=0.0, cup=True, intl_same=False,
+                                     eta=24.0, kint=24.0, hl=365.0, dnm=600.0, lag="none"))
+        self.assertEqual(X.LAM_C, 30.0)
+        self.assertEqual(X.S, 400 / math.log(10))
+        self.assertEqual(X.STALE_HOME_DAYS, 365)
+
+    def test_每个非四大的lolesports键都有系数映射(self):
+        # LEAGUE_IDS 加了新的国际赛键而这里没加, 看板对它就没有系数 (或者按错的赛事切点)
+        import xregion as X
+        from esports_feed import LEAGUE_IDS, is_major
+        self.assertEqual({k for k in LEAGUE_IDS if not is_major(k)}, set(X.LE_EVENT_CODES))
+        self.assertEqual(X.oe_event("Worlds", 2026), "2026 WLDs")
+        self.assertEqual(X.oe_event("ESPORTS WORLD CUP", 2026), "2026 EWC")
+        self.assertEqual(X.oe_event("DCGI", 2026), "2026 DCGI")
+        self.assertNotIn("DCup", X.LE_EVENT_CODES.values(), "DCGI 不能猜成 OE 的国内杯赛 DCup")
+        self.assertFalse(X.is_international("DCup", 2026))
+
+    def test_每个国际赛代码要么有lolesports键要么写明没有(self):
+        # 加了国际赛代码却忘了 LE_EVENT_CODES: 那个赛区键的切点落到全部数据之后, 把赛事自己的局也拟合进系数
+        import xregion as X
+        codes = {c for c in X.LE_EVENT_CODES.values() if c}
+        self.assertEqual(set(X.INTL_EVENTS), codes | X.NO_LE_KEY)
+        self.assertFalse(codes & X.NO_LE_KEY)
+
+    def test_运行时模块不依赖research(self):
+        import ast
+        src = (_ROOT / "xregion.py").read_text(encoding="utf-8")
+        mods = set()
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Import):
+                mods |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                mods.add(node.module.split(".")[0])
+        research = {p.stem for p in (_ROOT / "research").glob("*.py")} | {"research"}
+        self.assertFalse(mods & research, f"xregion.py import 了研究代码: {mods & research}")
+
+
+# ══════════════════════════════════════════════════════════
+#  跨赛区模型 C 上看板: 赛事内重放、去重、解码、看板接线、留档
+# ══════════════════════════════════════════════════════════
+
+_XSTATE_CACHE: dict = {}
+
+
+def _x_state(asof):
+    """合成小世界 (_xregion_world) 在 asof 之前导出的状态, 走一遍 JSON (和看板读到的一样)。"""
+    import json
+    import xregion as X
+    if asof not in _XSTATE_CACHE:
+        table, diag = X.build_table(_oe_raw(_xregion_world()))
+        st = X.build_state(_with_diag(table, diag), asof=asof)
+        _XSTATE_CACHE[asof] = (json.loads(json.dumps(st, allow_nan=False)), table)
+    return _XSTATE_CACHE[asof]
+
+
+def _xs(mid, start, a, b, wa, wb, bo=3, frames=None, ids=("TA", "TB"), oe=True):
+    """看板重放的一个系列赛 (xregion.py 看板那一段开头写的形状)。"""
+    s = {"match_id": mid, "start": start, "best_of": bo,
+         "teams": [{"name": a, "code": a, "oe": a if oe else None, "wins": wa, "id": ids[0]},
+                   {"name": b, "code": b, "oe": b, "wins": wb, "id": ids[1]}]}
+    if frames is not None:
+        s["frames"] = frames
+    return s
+
+
+def _xf(blue_id, red_id, towers, inhib=(0, 0), gold=(60000, 60000)):
+    return {"blue_id": blue_id, "red_id": red_id, "towers": list(towers), "inhibitors": list(inhib),
+            "gold": list(gold)}
+
+
+class XregionReplay(unittest.TestCase):
+    """坑: 看板把 OE 已经算进状态的局再重放一遍 (同一局算两次)、重放顺序随输入顺序变、解码出来的胜局数和
+    比分对不上、缺一局帧就猜一个胜负 —— 全都只会给出另一个看着合理的数。"""
+
+    def test_OE里已有的局不重放_UTC零点两侧都认得(self):
+        import xregion as X
+        st, table = _x_state(None)                   # 状态里已经有 2025 WLDs 的全部局
+        bo3 = table[(table["event"] == "2025 WLDs") & table["blue"].isin(["K1", "L2"])
+                    & table["red"].isin(["K1", "L2"])].sort_values("game")
+        self.assertEqual(list(bo3["game"]), [1, 2, 3])
+        self.assertEqual(sorted({str(d.date()) for d in bo3["date"]}), ["2025-10-02", "2025-10-03"],
+                         "这个 BO3 跨 UTC 零点")
+        k1 = int(sum((b == "K1") == bool(y) for b, y in zip(bo3["blue"], bo3["blue_win"])))
+        frames = {str(g): _xf("TA" if b == "K1" else "TB", "TB" if b == "K1" else "TA",
+                              (9, 3) if (b == "K1") == bool(y) else (3, 9))
+                  for g, b, y in zip(bo3["game"], bo3["blue"], bo3["blue_win"])}
+        cur = _xs("cur", "2025-10-06T08:00:00Z", "K2", "L3", 0, 0)
+        ser = [_xs("bo3", "2025-10-02T23:00:00Z", "K1", "L2", k1, 3 - k1, frames=frames), cur]
+        res = X.board_predict(st, "WORLDS", "K2", "L3", ser, "cur", 1)
+        self.assertEqual((res["deduped"], res["replayed"]), (3, 0))
+        self.assertEqual(X.replay_frames_needed(st, ser, "cur", 1), [], "整场都在 OE 里: 一个终局帧都不取")
+        t = X.game_t("2025-10-06T08:00:00Z", 1)
+        self.assertEqual(res["probability_blue"], X.predict(st, "WORLDS", "K2", "L3", t))
+        # 反证: 赛程时间挪出去重窗口, 同样三局就会被再算一次 —— 数变了, 不报错
+        ser2 = [dict(ser[0], start="2025-10-04T23:00:00Z"), cur]
+        res2 = X.board_predict(st, "WORLDS", "K2", "L3", ser2, "cur", 1)
+        self.assertEqual(res2["replayed"], 3)
+        self.assertNotEqual(res2["probability_blue"], res["probability_blue"])
+
+    def test_去重窗口的边界(self):
+        import xregion as X
+        mini = {"teams": {"P": {}, "Q": {}, "R": {}},
+                "events": {"e": {"games": [["P", "Q", 1, "2026-10-04T00:20:00Z", 1, "cross"]]}}}
+        idx = X.oe_index(mini)
+        self.assertTrue(X.in_oe(idx, "Q", "P", 1, "2026-10-03T23:00:00Z"), "蓝红对调也算同一局")
+        self.assertTrue(X.in_oe(idx, "P", "Q", 1, "2026-10-04T06:20:00Z"))
+        self.assertFalse(X.in_oe(idx, "P", "Q", 1, "2026-10-04T06:20:01Z"))
+        self.assertTrue(X.in_oe(idx, "P", "Q", 1, "2026-10-03T06:20:00Z"))
+        self.assertFalse(X.in_oe(idx, "P", "Q", 1, "2026-10-03T06:19:59Z"))
+        self.assertFalse(X.in_oe(idx, "P", "Q", 2, "2026-10-03T23:00:00Z"), "局号不同")
+        self.assertFalse(X.in_oe(idx, "R", "Q", 1, "2026-10-03T23:00:00Z"), "OE 那边是另一支现役队 (P): 另一场比赛")
+
+    def test_OE用过期旧名记的局也认得(self):
+        # 2026 EWC: OE 把 Team Secret Whales 记成过期的旧名 "Team Secret" (状态里早被剪掉), lolesports 的
+        # "Team Secret" 按别名映射成 "Team Secret Whales"。只认完全相同的队名, 这 4 局就被重放第二遍
+        import xregion as X
+        mini = {"teams": {"Team Secret Whales": {}, "Karmine Corp": {}, "Sentinels": {}},
+                "events": {"2026 EWC": {"games": [
+                    ["Karmine Corp", "Team Secret", 1, "2026-07-15T14:52:10Z", 1, "cross"],
+                    ["Team Secret", "Karmine Corp", 2, "2026-07-15T15:48:30Z", 0, "cross"]]}}}
+        from esports_feed import TEAM_ALIASES
+        idx = X.oe_index(mini, TEAM_ALIASES)
+        for n in (1, 2):
+            self.assertTrue(X.in_oe(idx, "Karmine Corp", "Team Secret Whales", n, "2026-07-15T14:25:00Z"), n)
+        self.assertEqual(X.oe_lookup(idx, "Team Secret Whales", "Karmine Corp", 1, "2026-07-15T14:25:00Z"), (1, 1),
+                         "OE 的胜负和蓝红跟着换到看板的队序 (KC 蓝方赢)")
+        self.assertFalse(X.in_oe(idx, "Sentinels", "Team Secret Whales", 1, "2026-07-15T14:25:00Z"),
+                         "两边都对不上 (只有一边是旧名的通配) 不算")
+        self.assertFalse(X.in_oe(X.oe_index(mini), "Karmine Corp", "Team Secret Whales", 1, "2026-07-15T14:25:00Z"),
+                         "没有别名表就不认旧名")
+
+    def test_旧名只认别名表指向的那一队(self):
+        # 2026-10-04 复核: 原来"OE 那边不是现役队"就放行。OE 已收 Sentinels 对旧名 "Team Secret" (09:20 第 1 局),
+        # 同一天 13:00 Sentinels 对 FlyQuest 的第 1 局被当成"已在 OE", 再也不重放 —— 少算一局, 不报错
+        import xregion as X
+        from esports_feed import TEAM_ALIASES
+        mini = {"teams": {"Sentinels": {}, "FlyQuest": {}, "Team Secret Whales": {}},
+                "events": {"2026 EWC": {"games": [["Sentinels", "Team Secret", 1, "2026-07-15T09:20:00Z", 1, "cross"]]}}}
+        idx = X.oe_index(mini, TEAM_ALIASES)
+        self.assertFalse(X.in_oe(idx, "Sentinels", "FlyQuest", 1, "2026-07-15T13:00:00Z"))
+        self.assertTrue(X.in_oe(idx, "Sentinels", "Team Secret Whales", 1, "2026-07-15T09:00:00Z"))
+
+    def test_重放顺序只看开赛时间和局号_不看输入顺序(self):
+        import random
+        import xregion as X
+        st, _ = _x_state("2025-10-01")
+        ser = [_xs("a", "2025-10-02T08:00:00Z", "K1", "L1", 2, 1, frames={
+                   "1": _xf("TA", "TB", (9, 2)), "2": _xf("TB", "TA", (8, 3))}),
+               _xs("b", "2025-10-02T08:00:00Z", "K2", "P1", 1, 0, bo=1),        # 和 a 同一时刻开打
+               _xs("c", "2025-10-02T12:00:00Z", "L2", "V1", 0, 2),
+               _xs("cur", "2025-10-03T08:00:00Z", "K3", "L3", 0, 0)]
+        base = X.board_predict(st, "WORLDS", "K3", "L3", ser, "cur", 1)
+        ts = [g["t"] for g in base["games"]]
+        self.assertEqual(ts, sorted(ts))
+        self.assertEqual([(g["match_id"], g["number"]) for g in base["games"]],
+                         [("a", 1), ("b", 1), ("a", 2), ("a", 3), ("c", 1), ("c", 2)],
+                         "同一时刻开打的两个系列赛按局号交错; t 相同的两局一组更新")
+        self.assertEqual(base["games"][0]["t"], base["games"][1]["t"])
+        rng = random.Random(5)
+        for _ in range(5):
+            sh = ser[:]
+            rng.shuffle(sh)
+            self.assertEqual(X.board_predict(st, "WORLDS", "K3", "L3", sh, "cur", 1), base)
+
+    def test_只重放当前局之前的局(self):
+        import xregion as X
+        st, _ = _x_state("2025-10-01")
+        cur = _xs("cur", "2025-10-03T08:00:00Z", "K1", "L1", 2, 1, frames={
+            "1": _xf("TA", "TB", (2, 9)), "2": _xf("TB", "TA", (3, 10))})
+        later = _xs("later", "2025-10-03T20:00:00Z", "K2", "L2", 1, 0, bo=1)
+        ser = [cur, later]
+        for k, n in ((1, 0), (2, 1), (3, 2)):
+            res = X.board_predict(st, "WORLDS", "K1", "L1", ser, "cur", k)
+            self.assertEqual(res["replayed"], n, f"第 {k} 局只能看到前 {n} 局, 看不到之后开赛的系列赛")
+        self.assertEqual(X.board_predict(st, "WORLDS", "K1", "L1", ser, "cur", 2)["games"][0]["blue_win"], 0,
+                         "2-1 打完、第 3 局归胜者, 第 1 局帧说 B 赢 (约束解码用了整场的比分)")
+
+    def test_解码出的胜局数等于比分_决胜局归胜者(self):
+        import random
+        import xregion as X
+        rng = random.Random(11)
+        for _ in range(400):
+            bo = rng.choice([3, 5])
+            need = bo // 2 + 1
+            clinched = rng.random() < 0.6
+            if clinched:
+                lose = rng.randrange(1, need)
+                wa, wb = (need, lose) if rng.random() < 0.5 else (lose, need)
+            else:
+                wa, wb = rng.randrange(1, need), rng.randrange(1, need)
+            frames = {}
+            for i in range(1, wa + wb + 1):
+                if rng.random() < 0.9:
+                    blue_a = rng.random() < 0.5
+                    frames[str(i)] = _xf("TA" if blue_a else "TB", "TB" if blue_a else "TA",
+                                         (rng.randrange(12), rng.randrange(12)), (rng.randrange(3), rng.randrange(3)),
+                                         (rng.randrange(50000, 80000), rng.randrange(50000, 80000)))
+            s = _xs("s", "2025-10-02T08:00:00Z", "A", "B", wa, wb, bo=bo, frames=frames)
+            dec = X.decode_series(s)
+            self.assertEqual([d["number"] for d in dec], list(range(1, wa + wb + 1)))
+            self.assertEqual(sum(d["winner"] == 0 for d in dec), wa)
+            self.assertEqual(sum(d["winner"] == 1 for d in dec), wb)
+            if clinched:
+                self.assertEqual(dec[-1]["winner"], 0 if wa > wb else 1, "决胜局归系列赛胜者")
+            if any(X.frame_verdict(frames.get(str(i)), ["TA", "TB"]) is None for i in X.frames_needed(s)):
+                self.assertTrue(all(d["how"] in ("alternate", "score") for d in dec), "缺一局帧: 整场交替")
+
+    def test_按帧判对的不改_判多了的改把握最小的(self):
+        import xregion as X
+        s = _xs("s", "2025-10-02T08:00:00Z", "A", "B", 3, 2, bo=5, frames={
+            "1": _xf("TA", "TB", (9, 2), (2, 0)), "2": _xf("TB", "TA", (4, 6)),
+            "3": _xf("TA", "TB", (6, 6), (1, 0)), "4": _xf("TB", "TA", (2, 11), (0, 3))})
+        # 帧说 A 赢了前四局; A 除决胜局外只能再赢 2 局 —— 把握最小的第 3、2 局改判给 B
+        self.assertEqual([d["winner"] for d in X.decode_series(s)], [0, 1, 1, 0, 0])
+
+    def test_缺帧退回交替序_领先方先(self):
+        import xregion as X
+        s = _xs("s", "2025-10-02T08:00:00Z", "A", "B", 2, 3, bo=5, frames={"1": _xf("TA", "TB", (9, 2))})
+        dec = X.decode_series(s)
+        self.assertEqual([d["winner"] for d in dec], [1, 0, 1, 0, 1])
+        self.assertEqual([d["how"] for d in dec], ["alternate"] * 4 + ["score"])
+        s = _xs("s", "2025-10-02T08:00:00Z", "A", "B", 1, 1, bo=5)
+        self.assertEqual([d["winner"] for d in X.decode_series(s)], [0, 1], "平分时 teams[0] 先")
+        self.assertIsNone(X.frame_verdict(_xf("TA", "TX", (9, 2)), ["TA", "TB"]), "帧里的队伍 id 对不上就不猜")
+
+    def test_系数按看板的赛区键取(self):
+        import xregion as X
+        st, _ = _x_state("2025-10-01")
+        ser = [_xs("a", "2025-10-02T08:00:00Z", "K1", "L1", 1, 0, bo=1),
+               _xs("cur", "2025-10-03T08:00:00Z", "K2", "L2", 0, 0)]
+        t = X.game_t("2025-10-03T08:00:00Z", 1)
+        for key in ("WORLDS", "MSI", "DCGI"):
+            e = X.Engine.from_state(st)
+            e.play(X.board_replay(st, ser, "cur", 1)["games"])
+            want = X.logistic(st["coefficients"][key], *e.features("K2", "L2", t))
+            self.assertEqual(X.board_predict(st, key.lower(), "K2", "L2", ser, "cur", 1)["probability_blue"], want)
+        self.assertIsNone(X.board_predict(st, "LCK", "K2", "L2", ser, "cur", 1)["probability_blue"])
+
+    def test_时间必须带时区_第一局和to_t逐位相同(self):
+        import xregion as X
+        with self.assertRaises(ValueError):
+            X.epoch_s("2026-10-03T08:00:00")         # JS 会按本地时间解析, 两边差几个小时
+        self.assertEqual(X.game_t("2026-10-03T08:00:00Z", 1), X.to_t("2026-10-03T08:00:00Z"))
+        self.assertEqual(X.game_t("2026-10-03T08:00:00.000Z", 3), (X.epoch_s("2026-10-03T08:00:00Z") + 2) / 86400)
+
+    def test_母赛区没有跨赛区记录要点名(self):
+        import xregion as X
+        st, _ = _x_state("2025-10-01")              # 此时 LCP 还没打过跨赛区
+        self.assertFalse(st["leagues"]["LCP"]["has_crossregion_history"])
+        res = X.board_predict(st, "WORLDS", "K1", "C3", [_xs("cur", "2025-10-03T08:00:00Z", "K1", "C3", 0, 0)],
+                              "cur", 1)
+        self.assertEqual((res["home_red"], res["no_history"]), ("LCP", ["LCP"]))
+        self.assertIsNotNone(res["probability_blue"])
+
+    def test_当前系列赛比分没跟上局号就不给(self):
+        # 2026-10-04 复核: 第 3 局开打了, 上游的比分 (约晚 6 分钟) 还停在 1-0, 原来悄悄只放第 1 局 —— 数差 7 个
+        # 百分点, 不报错, 而开局头 3 分钟那一行赛前数每局只留档一次
+        import xregion as X
+        st, _ = _x_state("2025-10-01")
+        fr = {"1": _xf("TA", "TB", (9, 2)), "2": _xf("TB", "TA", (9, 2))}
+        ok = X.board_predict(st, "WORLDS", "K1", "L1", [_xs("cur", "2025-10-03T08:00:00Z", "K1", "L1", 1, 1, bo=5,
+                                                             frames=fr)], "cur", 3)
+        self.assertEqual((ok["withheld"], ok["replayed"]), (None, 2))
+        self.assertIsNotNone(ok["probability_blue"])
+        ser = [_xs("cur", "2025-10-03T08:00:00Z", "K1", "L1", 1, 0, bo=5, frames={"1": fr["1"]})]
+        lag = X.board_predict(st, "WORLDS", "K1", "L1", ser, "cur", 3)
+        self.assertEqual((lag["withheld"], lag["probability_blue"]), ("score_lag", None))
+        self.assertEqual(X.replay_frames_needed(st, ser, "cur", 3), [], "反正不给, 一个终局帧都不取")
+        self.assertIsNone(X.board_predict(st, "WORLDS", "K1", "L1", ser, "cur", 2)["withheld"],
+                          "第 2 局: 比分 1-0 正好跟得上")
+
+    def test_一半在OE的系列赛_剩下的局只在剩下的配额里解码(self):
+        # 2026-10-04 复核: OE 收了一个 BO5 的前两局 (K2 两连胜), 比分 K2 2 : 3 L2, 后三局没有终局帧。原来整个
+        # 系列赛按交替序解码 (不看 OE), 重放的三局里 K2 又赢一局 —— 状态 + 重放 = K2 3 胜, 系列赛胜负都反了
+        import copy
+        import xregion as X
+        st, _ = _x_state("2025-10-01")
+        st = copy.deepcopy(st)
+        st["events"]["2025 WLDs"] = {"code": "WLDs", "year": 2025, "games": [
+            ["K2", "L2", 1, "2025-10-02T08:10:00Z", 1, "cross"], ["L2", "K2", 2, "2025-10-02T09:00:00Z", 0, "cross"]]}
+        other = _xs("s1", "2025-10-02T08:00:00Z", "K2", "L2", 2, 3, bo=5)
+        cur = _xs("cur", "2025-10-03T08:00:00Z", "K1", "L1", 0, 0)
+        rep_ = X.board_replay(st, [other, cur], "cur", 1)
+        self.assertEqual(rep_["deduped"], 2)
+        self.assertEqual([(g["number"], g["blue_win"], g["blue"]) for g in rep_["games"]],
+                         [(3, 0, "K2"), (4, 0, "K2"), (5, 0, "K2")], "L2 要赢满剩下的三局")
+        dec = X.decode_series(other, {1: (0, 0), 2: (0, 1)})
+        self.assertEqual([(d["winner"], d["how"]) for d in dec], [(0, "oe"), (0, "oe"), (1, "alternate"),
+                                                                   (1, "alternate"), (1, "score")])
+        self.assertEqual(X.frames_needed(other, {1: (0, 0), 2: (0, 1)}), [3, 4], "OE 已有的局不取终局帧")
+        self.assertEqual(X.replay_frames_needed(st, [other, cur], "cur", 1), [("s1", 3), ("s1", 4)])
+        with self.assertRaises(ValueError, msg="OE 说 K2 赢了三局, 比分只有两局: 不是认错了局就是比分错了"):
+            X.decode_series(other, {1: (0, 0), 2: (0, 1), 3: (0, 0)})
+        with self.assertRaises(ValueError, msg="决胜局之前胜者就赢满了"):
+            X.decode_series(_xs("s", "2025-10-02T08:00:00Z", "A", "B", 3, 1, bo=5),
+                            {1: (0, 0), 2: (0, 0), 3: (0, 0)})
+
+    def test_还没有帧时给两种选边的平均(self):
+        # 2026-10-04 复核: 没开打的局按赛程队序当蓝方, 截距 a 约 +0.14 让数随一个任意的顺序挪 5-7 个百分点,
+        # 热门都会换边 (JDG 对 BRO: JDG 蓝 0.557, JDG 红 0.484)
+        import xregion as X
+        st, _ = _x_state("2025-10-01")
+        ser = [_xs("cur", "2025-10-03T08:00:00Z", "K1", "L1", 0, 0)]
+        ser_r = [_xs("cur", "2025-10-03T08:00:00Z", "L1", "K1", 0, 0)]
+        p_ab = X.board_predict(st, "WORLDS", "K1", "L1", ser, "cur", 1)["probability_blue"]
+        p_ba = X.board_predict(st, "WORLDS", "L1", "K1", ser_r, "cur", 1)["probability_blue"]
+        self.assertGreater(abs(p_ab - (1 - p_ba)), 0.01, "有选边时两种摆法确实不同 (截距)")
+        n_ab = X.board_predict(st, "WORLDS", "K1", "L1", ser, "cur", 1, sides_known=False)
+        n_ba = X.board_predict(st, "WORLDS", "L1", "K1", ser_r, "cur", 1, sides_known=False)
+        self.assertEqual(n_ab["probability_blue"], (p_ab + (1 - p_ba)) / 2)
+        self.assertTrue(n_ab["side_neutral"])
+        self.assertAlmostEqual(n_ab["probability_blue"] + n_ba["probability_blue"], 1.0, places=12,
+                               msg="不随赛程里的队序变")
+
+
+class XregionAliases(unittest.TestCase):
+    """坑: 给四大之外的队加别名, 重新造出 Stage 1/2 "可预测"的假象; 或者 C 的已知表认不出 lolesports 的赞助名
+    (RED Kalunga / MIBR.LOS / Team Secret), 整场跨赛区不给数。"""
+
+    def test_别名只对C的已知表生效(self):
+        from esports_feed import map_team
+        xknown = ["Deep Cross Gaming", "LØS", "Leviatan", "RED Canids", "T1", "Team Secret Whales"]
+        major = ["T1", "Gen.G"]
+        for api_name, oe in (("LEVIATÁN", "Leviatan"), ("LOS", "LØS"), ("MIBR.LOS", "LØS"),
+                             ("RED Kalunga", "RED Canids"), ("Relove Deep Cross Gaming", "Deep Cross Gaming"),
+                             ("Team Secret", "Team Secret Whales")):
+            self.assertEqual(map_team(api_name, xknown), oe, api_name)
+            self.assertIsNone(map_team(api_name, major), f"{api_name}: 目标不在四大里, Stage 1/2 仍不可预测")
+        self.assertIsNone(map_team("Team Secret", ["Team Secret"]),
+                          "OE 里同名的旧 Team Secret 已过期; 别名指向现在的 Team Secret Whales")
+
+
+class _XStore(_StubStore):
+    """K1 / L1 在四大的已知队伍里 (predictable), 母赛区不同 —— 国际赛上是跨赛区; C3 不在四大里。
+
+    make_row 给一行固定的赛前特征: 国内看板 (use_pre) 的头条和曲线要走正常带赛前特征的那条路 —— 没有它时
+    _pre_context 抛错被吞掉, "国内看板一字不差"比的是两条一样退化了的曲线, 什么都证明不了。
+    """
+    HOME = {**_StubStore.HOME, "K1": "LCK", "L1": "LPL"}
+    PRE = {"diff_avg_kills": 1.5, "diff_avg_deaths": -1.0, "diff_avg_totalgold": 800.0, "diff_avg_towers": 0.5,
+           "diff_avg_dragons": 0.3, "diff_avg_golddiffat15": 400.0, "diff_avg_cspm": 2.0, "diff_avg_ckpm": 0.05,
+           "diff_rolling_wr": 0.08}
+
+    def make_row(self, blue, red, league, draft=None, playoffs=0):
+        return dict(self.PRE), []
+
+
+class XregionBoard(unittest.TestCase):
+    """坑: 跨赛区看板接上 C 之后, 国内 / 同母赛区的看板跟着变了一个字; 赛程取不到时退回"只用 OE"的版本
+    (没过闸); 开局渐变的锚、赛前那条线和留档的 source 各说各的。"""
+
+    START = "2025-10-05T08:00:00Z"
+
+    def setUp(self):
+        import api
+        from esports_feed import EsportsFeed, LiveState, Match, TeamRef
+        from ingame_service import IngameModel
+        try:
+            self.ig = IngameModel("_live")
+        except Exception as e:
+            self.skipTest(f"局内模型文件不在: {e}")
+        self.api = api
+        self.st, _ = _x_state("2025-10-01")
+        self.logged, self.xcalls, self.stage_calls = [], [], []
+        self._old = (dict(api.STATE), api.log_prediction)
+
+        def _log(**k):
+            if k.get("probability_blue") is not None:
+                self.logged.append(k)
+        api.log_prediction = _log
+        test0 = self
+
+        class Stage:
+            metrics = {}
+
+            def __init__(s, k):
+                s.k = k
+
+            def predict(s, row):
+                test0.stage_calls.append(s.k)
+                return 0.0, 0.57
+
+        class Stages:
+            # 国内看板 (use_pre) 要真算出赛前数; C 的看板一次都不该算 (_board 里查)
+            def __getitem__(s, k):
+                return Stage(k)
+
+        api.STATE.clear()
+        api.STATE.update(store=_XStore(), stages=Stages(), ingame=None, ingame_live=self.ig)
+        test = self
+
+        def make_feed(league, names, minute, completed=(), wins=(0, 0), number=1, frames=None,
+                      no_frames=False, schedule_fail=False, others=None):
+            g = {"id": f"G{number}", "number": number, "state": "inProgress",
+                 "teams": [{"id": "1", "side": "blue"}, {"id": "2", "side": "red"}]}
+            st = LiveState(game_id=g["id"], game_state="in_game", minute=minute, golddiff=2500, csdiff=30,
+                           blue_kills=6, red_kills=2, gold_total=30000,
+                           frame_time="2025-10-05T08:20:00.000Z", live=True)
+            det = {"teams": [{"id": "1", "name": names[0], "code": names[0][:3], "wins": wins[0]},
+                             {"id": "2", "name": names[1], "code": names[1][:3], "wins": wins[1]}],
+                   "games": [{"number": k, "id": f"G{k}", "state": "completed"} for k in range(1, number + 1)]}
+
+            class Feed:
+                live_ttl = 20
+                downsample = staticmethod(EsportsFeed.downsample)
+
+                def live(s):
+                    return [Match("M1", league, test.START, "inProgress", 5,
+                                  [TeamRef(n, n[:3], game_wins=w) for n, w in zip(names, wins)])]
+
+                def schedule(s, lg, known=None):
+                    return []
+
+                def games(s, mid):
+                    return det["games"][:-1] + [g]
+
+                def probe_games(s, mid):
+                    return [] if no_frames else [(g, st)]
+
+                def current_game(s, mid):
+                    return None if no_frames else (g, st)
+
+                def window(s, gid, **k):
+                    return None if no_frames else st
+
+                def _get(s, url, ttl):
+                    return {"data": {"event": {"match": {"teams": [
+                        {"id": "1", "name": names[0]}, {"id": "2", "name": names[1]}]}}}}
+
+                def frame_sides(s, gid):
+                    return {"blue": "1", "red": "2"}
+
+                def ddragon_version(s):
+                    return "16.16.1"
+
+                def players(s, gid):
+                    return []
+
+                def game_metadata(s, gid):
+                    return {}
+
+                def match_wins(s, mid):
+                    return {}
+
+                def gold_timeline(s, gid, upto=None):
+                    return [{"minute": float(m), "golddiff": 200 * m, "blue_kills": m // 3, "red_kills": 1,
+                             "csdiff": 2 * m, "blue_gold": 1800 * m} for m in range(1, (minute or 0) + 1)]
+
+                # ── C 用的五个 ──
+                def event_tournament(s, mid):
+                    test.xcalls.append("event_tournament")
+                    return "T9"
+
+                def league_tournament(s, lg, start):
+                    test.xcalls.append("league_tournament")
+                    return "T9"
+
+                def completed_events(s, tid):
+                    test.xcalls.append("completed_events")
+                    return None if schedule_fail else list(completed)
+
+                def match_detail(s, mid, ttl=None):
+                    test.xcalls.append("match_detail")
+                    test.assertIsNone(ttl, "共用的 getEventDetails 只能按 live_ttl 读 (见 esports_feed.match_ids)")
+                    return det if mid == "M1" else (others or {}).get(mid)
+
+                def match_ids(s, mid):
+                    test.xcalls.append("match_ids")
+                    test.assertNotEqual(mid, "M1", "当前系列赛的比分要 match_detail 那一份")
+                    return (others or {}).get(mid)
+
+                def final_frame(s, gid):
+                    test.xcalls.append("final_frame")
+                    return (frames or {}).get(gid)
+
+            return Feed()
+
+        self.make_feed = make_feed
+
+    def tearDown(self):
+        if hasattr(self, "_old"):
+            self.api.STATE.clear()
+            self.api.STATE.update(self._old[0])
+            self.api.log_prediction = self._old[1]
+
+    def _board(self, feed, c=True):
+        if c:
+            self.api.STATE["xregion"], self.api.STATE["xregion_known"] = self.st, sorted(self.st["teams"])
+        else:
+            self.api.STATE.pop("xregion", None)
+            self.api.STATE.pop("xregion_known", None)
+        self.api.STATE["feed"] = feed
+        self.stage_calls.clear()
+        out = self.api.esports_board("M1", curves=True, points=60)
+        if "xregion" in out:
+            self.assertEqual(self.stage_calls, [], "C 的看板不该算 Stage 1/2")
+        return out
+
+    @staticmethod
+    def _ev(mid, start, a, b, wa, wb, bo=1):
+        return {"startTime": start, "match": {"id": mid, "strategy": {"count": bo},
+                                              "teams": [{"name": a, "code": a, "result": {"gameWins": wa}},
+                                                        {"name": b, "code": b, "result": {"gameWins": wb}}]}}
+
+    def test_跨赛区有C_开局以C为锚渐变_赛前线和说明都换成C(self):
+        import xregion as X
+        from ingame_service import NO_PRE_STATS
+        comp = [self._ev("E1", "2025-10-04T08:00:00Z", "K2", "L2", 1, 0)]
+        out = self._board(self.make_feed("Worlds", ["K1", "L1"], 8, completed=comp))
+        ser = [_xs("E1", "2025-10-04T08:00:00Z", "K2", "L2", 1, 0, bo=1, ids=(None, None)),
+               _xs("M1", self.START, "K1", "L1", 0, 0, bo=5, ids=("1", "2"))]
+        p = X.board_predict(self.st, "WORLDS", "K1", "L1", ser, "M1", 1)["probability_blue"]
+        xr = out["xregion"]
+        self.assertEqual((xr["probability_blue"], xr["replayed"], xr["updated"], xr["game_number"]), (p, 1, 1, 1))
+        pr = out["prediction"]
+        self.assertEqual(pr["pregame_probability_blue"], round(p, 4))
+        self.assertEqual(pr["pregame_source"], "xregion")
+        self.assertEqual(pr["blend_weight"], round((8 - 3) / 12, 4))
+        z = self.api._blend_prior(p, pr["ingame_probability_blue"], 8)[0]
+        self.assertAlmostEqual(pr["probability_blue"], z, places=3, msg="头条 = 局内模型以 C 为锚的渐变")
+        self.assertEqual(pr["warnings"][0], self.api._xregion_note([]))
+        self.assertNotIn(NO_PRE_STATS, pr["warnings"])
+        self.assertNotIn("postdraft_probability_blue", pr, "候选 D 没过闸: 没有 BP 后那条线")
+        # 曲线开局那段同一个锚 (和头条同一个调用)
+        pt = next(x for x in out["timeline"] if x["minute"] >= 3)
+        sd = self.api.IngameState(minute=pt["minute"], golddiff=pt["golddiff"], xpdiff=None,
+                                  csdiff=2 * pt["minute"], blue_kills=pt["blue_kills"], red_kills=pt["red_kills"],
+                                  gold_total=1800 * pt["minute"])
+        ref, _ = self.api._ingame_core("K1", "L1", "Worlds", sd, None, None, False, blend=True, blend_with=p)
+        self.assertEqual(pt["probability_blue"], ref["probability_blue"])
+        self.assertEqual([r["source"] for r in self.logged], ["ingame"], "两队都在四大里: 局内照常留档")
+
+    def test_开局头3分钟_赛前就是C并按xregion留档(self):
+        out = self._board(self.make_feed("Worlds", ["K1", "L1"], 2))
+        p = out["xregion"]["probability_blue"]
+        pr = out["prediction"]
+        self.assertTrue(pr["too_early"])
+        self.assertEqual((pr["source"], pr["probability_blue"], pr["pregame_probability_blue"]), ("xregion", p, p))
+        self.assertIsNone(pr["postdraft_probability_blue"])
+        self.assertEqual(pr["warnings"], [self.api._xregion_note([])])
+        self.assertIn("这里显示的是赛前的概率", pr["note"])
+        self.assertEqual([(r["source"], r["minute"]) for r in self.logged], [("xregion", None)])
+
+    def test_还没开打_看板自己带回C的赛前数(self):
+        import xregion as X
+        out = self._board(self.make_feed("Worlds", ["K1", "L1"], None, no_frames=True))
+        p = out["xregion"]["probability_blue"]
+        self.assertEqual(out["prediction"], self.api._xregion_pregame(p, self.api._xregion_note([])))
+        self.assertEqual(self.logged, [], "没有帧的看板从来不留档")
+        # 没有帧 = 不知道谁蓝方 (左右只是赛程顺序): 给两种选边的平均
+        self.assertTrue(out["xregion"]["side_neutral"])
+        ser = [_xs("M1", self.START, "K1", "L1", 0, 0, bo=5, ids=("1", "2"))]
+        self.assertEqual(p, X.board_predict(self.st, "WORLDS", "K1", "L1", ser, "M1", 1, sides_known=False)
+                         ["probability_blue"])
+        with_frames = self._board(self.make_feed("Worlds", ["K1", "L1"], 2))
+        self.assertFalse(with_frames["xregion"]["side_neutral"])
+        self.assertNotEqual(with_frames["xregion"]["probability_blue"], p, "有帧之后按帧的蓝红")
+
+    def test_比分没跟上局号_不给C_看板和原来一字不差(self):
+        # 第 3 局开打 (有帧, 第 2 分钟), 比分还停在 1-0: 不给 C、不留档, 也不取终局帧
+        frames = {"G1": _xf("1", "2", (9, 2))}
+
+        def feed():
+            return self.make_feed("Worlds", ["K1", "L1"], 2, wins=(1, 0), number=3, frames=frames)
+        lag = self._board(feed())
+        self.assertNotIn("xregion", lag)
+        self.assertNotIn("final_frame", self.xcalls)
+        self.assertEqual(self.logged, [], "两段都算不出来: 不留档")
+        self.assertEqual(lag, self._board(feed(), c=False), "保持原来的行为和每一句话")
+
+    def test_四大之外的队_C认识也不留档_没有记录的赛区点名(self):
+        out = self._board(self.make_feed("DCGI", ["C3", "K1"], 2))
+        self.assertFalse(out["match"]["predictable"])
+        self.assertEqual(out["xregion"]["no_history"], ["LCP"])
+        self.assertEqual(out["prediction"]["warnings"],
+                         [self.api._XREGION_NOTE + "; LCP 此前没有跨赛区国际赛记录, 这个数主要靠先验"])
+        self.assertEqual(self.logged, [])
+
+    def test_赛程取不到就不给C_看板和原来一字不差(self):
+        def feed():
+            return self.make_feed("Worlds", ["K1", "L1"], 8, schedule_fail=True)
+        with_c = self._board(feed())
+        self.assertNotIn("xregion", with_c)
+        self.logged.clear()
+        self.assertEqual(with_c, self._board(feed(), c=False),
+                         "赛程取不到 = 只剩'隔天'版本, 没过闸 —— 不给 C, 保持原来的行为和每一句话")
+        self.assertTrue(with_c["prediction"]["warnings"][0].startswith("跨赛区对阵: 赛前和 BP 后模型只在赛区内战上"))
+
+    def test_国内和同母赛区的看板一字不差_也不发C的请求(self):
+        for league, names in (("LCK", ["T1", "Gen.G"]), ("LCK", ["K1", "L1"]), ("Worlds", ["T1", "Gen.G"])):
+            for minute in (2, 12, None):
+                def mk():
+                    return self.make_feed(league, names, minute, no_frames=minute is None)
+                self.xcalls.clear()
+                a = self._board(mk())
+                if minute == 12 and names == ["T1", "Gen.G"]:
+                    self.assertIn("pre_draft", self.stage_calls, "比的是正常带赛前特征的看板, 不是退化的")
+                self.assertEqual(self.xcalls, [], f"{league} {names}: 不该碰 C 的赛程")
+                self.assertNotIn("xregion", a)
+                self.assertEqual(a, self._board(mk(), c=False), f"{league} {names} 第 {minute} 分钟")
+
+    def test_当前系列赛打到第3局_前两局按终局帧重放(self):
+        import xregion as X
+        frames = {"G1": _xf("2", "1", (2, 9)), "G2": _xf("1", "2", (3, 10))}    # 两局都是蓝方输
+        out = self._board(self.make_feed("Worlds", ["K1", "L1"], 12, wins=(1, 1), number=3, frames=frames))
+        xr = out["xregion"]
+        self.assertEqual((xr["game_number"], xr["replayed"]), (3, 2))
+        ser = [_xs("M1", self.START, "K1", "L1", 1, 1, bo=5, ids=("1", "2"),
+                   frames={"1": frames["G1"], "2": frames["G2"]})]
+        self.assertEqual(xr["probability_blue"], X.board_predict(self.st, "WORLDS", "K1", "L1", ser, "M1", 3)
+                         ["probability_blue"])
+        games = X.board_replay(self.st, ser, "M1", 3)["games"]
+        self.assertEqual([(g["blue"], g["blue_win"], g["how"]) for g in games],
+                         [("L1", 0, "frames"), ("K1", 0, "frames")])
+
+    def test_别的系列赛取不到帧_那个系列赛交替_C照给(self):
+        comp = [self._ev("E1", "2025-10-04T08:00:00Z", "K2", "L2", 2, 1, bo=3)]
+        out = self._board(self.make_feed("Worlds", ["K1", "L1"], 2, completed=comp, others={}))
+        self.assertEqual(out["xregion"]["replayed"], 3, "详情 / 终局帧取不到不让整场的 C 消失")
+        self.assertEqual(out["prediction"]["source"], "xregion")
+        self.assertIn("match_ids", self.xcalls, "别的系列赛的 id 走 match_ids, 不碰共用缓存的有效期")
+
+    def test_别的系列赛按终局帧解码(self):
+        import xregion as X
+        comp = [self._ev("E1", "2025-10-04T08:00:00Z", "K2", "L2", 2, 1, bo=3)]
+        others = {"E1": {"teams": [{"id": "9", "name": "K2", "code": "K2"}, {"id": "8", "name": "L2", "code": "L2"}],
+                         "games": [{"number": k, "id": f"E1G{k}"} for k in (1, 2, 3)]}}
+        frames = {"E1G1": _xf("8", "9", (9, 2)), "E1G2": _xf("9", "8", (9, 2))}     # 第 1 局 L2 赢, 第 2 局 K2 赢
+        out = self._board(self.make_feed("Worlds", ["K1", "L1"], 2, completed=comp, others=others, frames=frames))
+        ser = [_xs("E1", "2025-10-04T08:00:00Z", "K2", "L2", 2, 1, bo=3, ids=("9", "8"),
+                   frames={"1": frames["E1G1"], "2": frames["E1G2"]}),
+               _xs("M1", self.START, "K1", "L1", 0, 0, bo=5, ids=("1", "2"))]
+        self.assertEqual(out["xregion"]["probability_blue"],
+                         X.board_predict(self.st, "WORLDS", "K1", "L1", ser, "M1", 1)["probability_blue"])
+        self.assertEqual(self.xcalls.count("final_frame"), 2, "决胜局归胜者, 不取")
+
+
+class XregionMatchIdsCache(unittest.TestCase):
+    """坑 (2026-10-04 复核): 重放别的系列赛时用 match_detail(mid, 3600) 取 id, 把共用的 getEventDetails 按一小时
+    写进缓存 —— _get 认第一个写入者给的有效期, 那场比赛自己的看板、页面顶上的比分就停在一小时前。"""
+
+    def test_id照常按live_ttl读_齐了另记一份(self):
+        from esports_feed import EsportsFeed
+        f = EsportsFeed()
+        calls = []
+        payload = {"data": {"event": {"match": {
+            "teams": [{"id": "1", "name": "A", "code": "A", "result": {"gameWins": 2}},
+                      {"id": "2", "name": "B", "code": "B", "result": {"gameWins": 1}}],
+            "games": [{"number": k, "id": f"G{k}", "state": "completed"} for k in (1, 2, 3)]}}}}
+
+        def fake_get(url, ttl, *a, **k):
+            calls.append(ttl)
+            return payload
+        f._get = fake_get
+        ids = f.match_ids("M9")
+        self.assertEqual([g["id"] for g in ids["games"]], ["G1", "G2", "G3"])
+        self.assertEqual(calls, [f.live_ttl])
+        self.assertNotIn("wins", ids["teams"][0], "会变的比分不记")
+        f.match_ids("M9")
+        self.assertEqual(calls, [f.live_ttl], "齐了就不再请求")
+        payload["data"]["event"]["match"]["games"][2]["id"] = None
+        f2 = EsportsFeed()
+        f2._get = fake_get
+        f2.match_ids("M9")
+        f2.match_ids("M9")
+        self.assertEqual(calls, [f.live_ttl] * 3, "不齐不记, 下次再取")
+
+
+class PredictionLogXregionSource(unittest.TestCase):
+    """坑: 留档的 source 多了 "xregion", 回填和打分不认识它 —— 跨赛区的赛前数混进别的组, 或者整行被丢。"""
+
+    def test_回填和打分按自己的一组(self):
+        import contextlib
+        import io
+        import json
+        import tempfile
+        import prediction_log as PL
+        old = PL.LOG
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                PL.LOG = Path(d) / "log.jsonl"
+                rows = []
+                for k in range(6):
+                    rows.append({"t": "2026-10-05T08:00:00+00:00", "match_id": f"m{k}", "game_id": f"g{k}",
+                                 "game_number": 1, "league": "Worlds", "blue": "T1", "red": "Bilibili Gaming",
+                                 "minute": None, "minute_key": None, "probability_blue": 0.6, "source": "xregion",
+                                 "y": k % 2})
+                    rows.append(dict(rows[-1], minute=20.0, minute_key=20, probability_blue=0.8, source="ingame"))
+                PL.LOG.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    PL.score()
+                txt = buf.getvalue()
+        finally:
+            PL.LOG = old
+        line = next(x for x in txt.splitlines() if x.strip().startswith("xregion"))
+        self.assertIn("6 局 /     6 条", line)
+        self.assertIn("准确率 0.500", line)
