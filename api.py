@@ -412,6 +412,24 @@ def _early_prediction(minute, p1, p2, why_kind, why):
     return out
 
 
+def _log_trained_through(source, xr=None):
+    """留档行的 trained_through (见 prediction_log.log_prediction): 产出这条概率的模型的训练数据截止日。
+
+    xregion 记 C 状态的 oe_asof —— 它单独构建, 构建失败时线上留的是旧的那一份, 不一定和其余模型同一天。
+    其余 (赛前 / BP 后 / 局内) 记局内模型的 trained_through: Stage 1/2 的 calib 不记日期, 但它们和局内模型
+    是同一次日更、同一份 CSV 训练出来, 作为一组 (daily_update.ARTIFACT_FILES) 一起换上线的。
+    只用于留档, 出任何问题都返回 None, 不影响看板。
+    """
+    try:
+        if source == "xregion":
+            a = ((xr or {}).get("public") or {}).get("oe_asof")
+            return str(a)[:10] if a else None
+        ig = STATE.get("ingame_live") or STATE.get("ingame")
+        return getattr(ig, "trained_through", None)
+    except Exception:
+        return None
+
+
 def _predict_core(blue, red, league, playoffs, draft):
     """只要一个 Stage 2 概率, 不要整个响应。draft 是
     {side: {role: {player, champion}}}。算不出来返回 None, 不抛。"""
@@ -1196,7 +1214,8 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                            red=minfo.teams[1].model_name,
                            probability_blue=pr0["probability_blue"],
                            source=pr0["source"],
-                           minute=None, game_number=chosen.get("number"))
+                           minute=None, game_number=chosen.get("number"),
+                           trained_through=_log_trained_through(pr0["source"], xr))
     elif two and (ig_live or ig_full):
         try:
             sd = IngameState(**st.to_state())
@@ -1249,6 +1268,16 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
             # 原因放第一条; 故意不带赛前特征时去掉局内模型那句"没有可用的赛前队伍统计"
             pred["warnings"] = _board_warnings(pred["warnings"], why_kind, why)
             if minfo.predictable:
+                # 渐变的锚是谁 —— 和上面三条分支一一对应 (_ingame_core: 锚 = blend_with, 没有就用赛前概率;
+                # 两个都没有就不渐变, blend_weight 不出现)。只进留档, 不进响应 (响应要和浏览器版逐字一致)
+                bw = pred.get("blend_weight")
+                a_src = a_p = None
+                if bw is not None:
+                    if use_pre:
+                        a_src, a_p = (("post_draft", p2) if p2 is not None
+                                      else ("pre_draft", pred.get("pregame_probability_blue")))
+                    elif xr is not None:
+                        a_src, a_p = "xregion", xr["p"]
                 log_prediction(match_id=match_id, game_id=st.game_id,
                                league=minfo.league, blue=bl, red=rl,
                                probability_blue=pred.get("probability_blue"),
@@ -1256,7 +1285,12 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                                slice_used=pred.get("slice_used"),
                                game_number=chosen.get("number"),
                                golddiff=st.golddiff,
-                               blue_kills=st.blue_kills, red_kills=st.red_kills)
+                               blue_kills=st.blue_kills, red_kills=st.red_kills,
+                               # 没渐变时响应里没有 ingame_probability_blue, 那时头条就是局内模型自己的数
+                               ingame_probability_blue=pred.get("ingame_probability_blue",
+                                                                pred.get("probability_blue")),
+                               blend_weight=bw, anchor_probability_blue=a_p, anchor_source=a_src,
+                               trained_through=(pred.get("model") or {}).get("trained_through"))
             if p2 is not None:
                 pred["postdraft_probability_blue"] = p2
 
@@ -1536,7 +1570,7 @@ def _ingame_core(req_blue, req_red, league, st, bch, rch, include_pre, raw=False
     # blend=True (看板用): 开局那段从 blend_with (BP 后概率; None 则用赛前概率) 渐变过渡到局内模型,
     # 见 _blend_prior。/predict/ingame 不开 —— 它回答的是"局内模型怎么看", 不掺别的模型。
     #
-    # league 只决定局内模型自己的 is_* 和 LPL 那条警告; 赛前特征 (_pre_context) 按 pre_league 算,
+    # league 只决定局内模型自己的 is_*; 赛前特征 (_pre_context) 按 pre_league 算,
     # 不给就同 league。两者分开是为国际赛: 同母赛区对阵时看板传 pre_league = 两队的母赛区, 而
     # league 仍是赛事本身 (is_* 全 0, 和训练时国际赛的编码一致) —— 见 pregame_league。
     # include_pre=False 就是**不带**赛前特征: 不用 pre_ctx, 也不会退回按 league 去算 _pre_context。

@@ -67,6 +67,41 @@ XP_DERIVED = {"xpdiff", "x_xp_scaling"}
 # 被 Platt 压成 93.3%。**模型判断是对的, 是校准层把它压扁了。**
 CLIP = 0.01               # 保序回归会输出 0 和 1; 绝对确定既不真实也无必要
 
+# 线上实际服务的赛区 (OE 的写法): 四大 + 国际赛, 也就是 esports_feed.LEAGUE_IDS 经 backfill_late.oe_league
+# 换成的 OE 名字 (DCGI 两边同名)。tests 里有一条核对两者一致 —— LEAGUE_IDS 加了赛区忘了改这里会红。
+SERVED_OE_LEAGUES = ("LPL", "LCK", "LEC", "LCS", "WLDs", "MSI", "FST", "EWC", "DCGI")
+
+
+def served_per_T(tt) -> dict:
+    """metrics 里的 per_T_served: 同一个测试段只取线上服务的赛区, 按切片给准确率 / Brier / log loss 和 95% 区间。
+
+    为什么要另存一份: per_T 是**全赛区**的测试段 (2026-10 约 9400 局, 四大 + 国际只占约 22%)。次级联赛更好
+    预测, 线上真账 (prediction_log.score) 拿它对照, 线上就显得系统性偏低 —— 当时 per_T 写 71.1/75.1/79.2/82.6%
+    (10/15/20/25 分钟), 四大 + 国际只有 68.1/72.4/75.6/80.7%。"线上比留出低 5-7 个点"有一半是口径造成的。
+    per_T 原样保留 (界面的置信说明、免责声明、浏览器版都在读它), 这里只是加一个键。
+
+    tt 要有 league / T / y / p 四列, 每局每个切片一行, 所以 ±(1.96·SD/√n, 存的是半宽) 就是按局算的区间。
+    准确率按 p > .5 判, 和 per_T 一致。
+    """
+    out = {}
+    s_all = tt[tt["league"].isin(SERVED_OE_LEAGUES)]
+    for T in SLICES:
+        s = s_all[s_all["T"] == T]
+        if len(s) < 20:
+            continue
+        y = s["y"].astype(int).to_numpy()
+        p = s["p"].astype(float).to_numpy()
+        hit = ((p > .5).astype(int) == y).astype(float)
+        sq = (p - y) ** 2
+        pc = np.clip(p, 1e-6, 1 - 1e-6)
+        ll = -(y * np.log(pc) + (1 - y) * np.log(1 - pc))
+        h = lambda v: float(1.96 * v.std(ddof=1) / np.sqrt(len(v)))
+        out[str(T)] = {"n": int(len(s)),
+                       "accuracy": float(hit.mean()), "accuracy_ci95": h(hit),
+                       "brier": float(sq.mean()), "brier_ci95": h(sq),
+                       "log_loss": float(ll.mean()), "log_loss_ci95": h(ll)}
+    return out
+
 
 def train_variant(mdf, sc, feats, suffix, title):
     """训练 + 校准 + 存盘。suffix 为空是完整模型, "_live" 是实时变体。"""
@@ -104,6 +139,13 @@ def train_variant(mdf, sc, feats, suffix, title):
         per_T[str(T)] = {"accuracy": float(a), "n": int(len(s)),
                          "high_conf_share": conf}
         print(f"    {T:>6}{len(s):>7}{a:>9.1%}{conf:>9.1%}")
+
+    # 线上服务的赛区 (四大 + 国际) 单算一份, 给线上真账对照用 —— 见 served_per_T
+    per_T_served = served_per_T(tt)
+    print("    线上服务的赛区 (四大 + 国际):")
+    for T, v in per_T_served.items():
+        print(f"    {T:>6}{v['n']:>7}{v['accuracy']:>9.1%} ± {v['accuracy_ci95']:.1%}"
+              f"   Brier {v['brier']:.4f}   LL {v['log_loss']:.4f}")
 
     m.save_model(str(OUT / f"model_ingame{suffix}.json"))
 
@@ -143,6 +185,8 @@ def train_variant(mdf, sc, feats, suffix, title):
             "ece": float(ece(p, yte)),
             "p_min": float(p.min()), "p_max": float(p.max()),
             "per_T": per_T,
+            # 测试段只取四大 + 国际赛区 (见 served_per_T)。新加的键, 上面的键一个都不动
+            "per_T_served": per_T_served,
         },
     }
     with open(OUT / f"calib_ingame{suffix}.json", "w", encoding="utf-8") as fh:

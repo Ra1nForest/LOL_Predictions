@@ -181,13 +181,8 @@ export function buildRow(model: IngameModel, preRow: Record<string, number> | nu
         `相差 ${pyFixed(Math.abs(T - minute), 0)} 分钟, 精度会下降。`,
     );
   }
-  if (inp.league === "LPL") {
-    warn.push(
-      "LPL 在局内训练集里样本偏薄 (约 9%, 且全部来自 2026 年) " +
-        "—— Oracle's Elixir 在 2022-2025 不提供 LPL 的分钟级快照。" +
-        "结论在 LPL 上的可靠性弱于其他三大赛区。",
-    );
-  }
+  // LPL 那条"局内训练集里样本偏薄 (约 9%)"的警告 2026-10-17 删了 (和 Python 同步): 线上那几棵树的训练段里
+  // 一局 LPL 都没有, 而测试段 538 局 LPL 的 Brier 0.1764 和四大合计 0.1756 持平 —— 见 ingame_service.make_row。
 
   let bSc = NaN;
   let rSc = NaN;
@@ -366,7 +361,7 @@ export interface IngameState {
 export interface IngameArgs {
   blue: string;
   red: string;
-  /** 局内模型自己的赛区 (is_* 和 LPL 那条警告)。国际赛就是赛事本身, is_* 全 0, 和训练时一样 */
+  /** 局内模型自己的赛区 (只决定 is_*)。国际赛就是赛事本身, is_* 全 0, 和训练时一样 */
   league: string;
   state: IngameState;
   blueChamps: string[] | null;

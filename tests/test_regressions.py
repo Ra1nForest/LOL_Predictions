@@ -1961,7 +1961,26 @@ class IngameIntlLeagueEncoding(unittest.TestCase):
             row, warns = m.make_row(minute=20, golddiff=1500, xpdiff=None, csdiff=20, blue_kills=5,
                                     red_kills=3, gold_total=35000, league=lg)
             self.assertEqual([row[k] for k in ("is_lpl", "is_lck", "is_lec", "is_lcs")], [0, 0, 0, 0], lg)
-            self.assertFalse(any("LPL" in w for w in warns), "LPL 样本偏薄那条警告只给 LPL")
+            self.assertFalse(any("LPL" in w for w in warns), "国际赛的局内警告里不该出现 LPL")
+
+
+class IngameNoStaleLplWarning(unittest.TestCase):
+    """坑: 局内模型对 LPL 发"局内训练集里样本偏薄 (约 9%), 可靠性弱于其他三大赛区"。
+
+    这条警告过时了两次: 先写"一场都没有", 改成"约 9%"后又不对 —— split_by_game 按日期切, 线上那几棵树的
+    训练段里 LPL 0 局 (校准段 5 局, 测试段 538 局)。它暗示的结论也不成立: 测试段 538 局 LPL 上 live 变体的
+    Brier 0.1764, 四大合计 0.1756。Stage 3 的 agent 和界面会把警告当事实引用, 所以整条删掉 (2026-10-17);
+    浏览器版 web/ingame.ts 同步删了, test:golden 逐条比对 LPL 用例的 warnings。
+    """
+
+    def test_LPL不再发样本偏薄的警告(self):
+        from ingame_service import IngameModel
+        m = IngameModel.__new__(IngameModel)
+        m.slices, m.scaling, m.features, m.has_xpdiff = [10, 15, 20, 25], {}, [], False
+        row, warns = m.make_row(minute=20, golddiff=1500, xpdiff=None, csdiff=20, blue_kills=5,
+                                red_kills=3, gold_total=35000, league="LPL")
+        self.assertEqual(row["is_lpl"], 1, "删的只是警告, LPL 的编码不变")
+        self.assertFalse(any("LPL" in w or "样本偏薄" in w or "可靠性弱于" in w for w in warns), warns)
 
 
 class OeLeagueNameIsCaseInsensitive(unittest.TestCase):
@@ -3223,6 +3242,58 @@ class XregionBoard(unittest.TestCase):
         self.assertEqual(pr["warnings"], [self.api._xregion_note([])])
         self.assertIn("这里显示的是赛前的概率", pr["note"])
         self.assertEqual([(r["source"], r["minute"]) for r in self.logged], [("xregion", None)])
+        self.assertEqual(self.logged[0]["trained_through"], self.st["oe_asof"][:10],
+                         "C 的行记 C 状态的截止日 —— 它单独构建, 不一定和别的模型同一天")
+
+    @staticmethod
+    def _meta10():
+        out = {}
+        for i, r in enumerate(("top", "jungle", "mid", "bottom", "support")):
+            out[i + 1] = {"summoner_name": f"T1P{i}", "champion": "LeeSin", "role": r, "side": "blue"}
+            out[i + 6] = {"summoner_name": f"GenQ{i}", "champion": "Azir", "role": r, "side": "red"}
+        return out
+
+    def test_留档记下渐变前的局内读数和锚(self):
+        # 坑: 留档只记渐变后的数, 第 3-15 分钟的线上真账没法和留出集 (局内模型自己的数) 同口径对照, 也分不清
+        # 每条是哪一代模型说的。锚的来源要和看板的三条分支一一对应; 这些只进留档, 不进响应 (逐字比对浏览器版)
+        comp = [self._ev("E1", "2025-10-04T08:00:00Z", "K2", "L2", 1, 0)]
+        out = self._board(self.make_feed("Worlds", ["K1", "L1"], 8, completed=comp))
+        pr, r = out["prediction"], self.logged[-1]
+        self.assertEqual((r["source"], r["anchor_source"]), ("ingame", "xregion"))
+        self.assertEqual(r["anchor_probability_blue"], out["xregion"]["probability_blue"])
+        self.assertEqual(r["blend_weight"], pr["blend_weight"])
+        self.assertEqual(r["ingame_probability_blue"], pr["ingame_probability_blue"])
+        self.assertNotEqual(r["ingame_probability_blue"], r["probability_blue"], "第 8 分钟渐变前后不是一个数")
+        self.assertEqual(r["trained_through"], self.ig.trained_through)
+        self.assertNotIn("anchor_source", pr)
+
+        # 国内: BP 后算得出 -> 锚是 BP 后; 凑不齐十个人 (没有 BP 后) -> 锚是赛前
+        for meta, src, key in ((self._meta10(), "post_draft", "postdraft_probability_blue"),
+                               ({}, "pre_draft", "pregame_probability_blue")):
+            self.logged.clear()
+            f = self.make_feed("LCK", ["T1", "Gen.G"], 12)
+            f.game_metadata = lambda gid, m=meta: m
+            pr = self._board(f)["prediction"]
+            r = self.logged[-1]
+            self.assertEqual((r["source"], r["anchor_source"]), ("ingame", src))
+            self.assertEqual(r["anchor_probability_blue"], pr[key])
+            self.assertEqual(r["blend_weight"], round((12 - 3) / 12, 4))
+            self.assertEqual(r["trained_through"], self.ig.trained_through)
+
+        # 跨赛区又没有 C (赛程取不到): 不渐变 -> 没有锚, 局内读数就是头条
+        self.logged.clear()
+        out = self._board(self.make_feed("Worlds", ["K1", "L1"], 8, schedule_fail=True))
+        r = self.logged[-1]
+        self.assertEqual((r["blend_weight"], r["anchor_source"], r["anchor_probability_blue"]), (None, None, None))
+        self.assertEqual(r["ingame_probability_blue"], out["prediction"]["probability_blue"])
+
+    def test_国内赛前那条留档的trained_through(self):
+        self._board(self.make_feed("LCK", ["T1", "Gen.G"], 2))
+        r = self.logged[-1]
+        self.assertEqual((r["source"], r["minute"]), ("pre_draft", None))
+        self.assertEqual(r["trained_through"], self.ig.trained_through,
+                         "Stage 1/2 的 calib 不记日期; 它们和局内模型同一次日更训练、一起换上线")
+        self.assertIsNone(r.get("anchor_source"))
 
     def test_还没开打_看板自己带回C的赛前数(self):
         import xregion as X
@@ -3379,3 +3450,204 @@ class PredictionLogXregionSource(unittest.TestCase):
         line = next(x for x in txt.splitlines() if x.strip().startswith("xregion"))
         self.assertIn("6 局 /     6 条", line)
         self.assertIn("准确率 0.500", line)
+
+
+class PredictionLogQualifierFallback(unittest.TestCase):
+    """坑: 赛区内的世界赛资格赛, lolesports 标 "LPL", OE 标 "WLDs" —— 按赛区配永远配不上, 不报错。
+
+    2026-09-17~19 IG / TES / JDG / WE 的 LPL 资格赛, 留档里 193 条 (12 局) 一直是 y=None。四大赛区的行按本赛区
+    配不上时, 按 INTL_OE_RETRY (显式列表, WLDs 打头) 再配一次 —— 只换赛区名, 两队 + 局号 + 时间窗照旧都要对上;
+    四大之外的行不退。
+    """
+
+    def _oe(self):
+        import pandas as pd
+        return pd.DataFrame([
+            {"gameid": "W1", "league": "WLDs", "date": pd.Timestamp("2026-09-17 09:11"),
+             "teamname": "Invictus Gaming", "red_name": "Top Esports", "game": 1, "result": 1},
+            {"gameid": "W2", "league": "WLDs", "date": pd.Timestamp("2026-09-17 10:14"),
+             "teamname": "Invictus Gaming", "red_name": "Top Esports", "game": 2, "result": 0},
+            {"gameid": "L1", "league": "LPL", "date": pd.Timestamp("2026-08-01 10:00"),
+             "teamname": "A", "red_name": "B", "game": 1, "result": 0},
+        ])
+
+    def _resolve(self, rows):
+        import contextlib
+        import io
+        import json
+        import tempfile
+        from unittest import mock
+        import prediction_log as PL
+        old = PL.LOG
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                PL.LOG = Path(d) / "log.jsonl"
+                PL.LOG.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+                with mock.patch("backfill_late.oe_index", return_value=self._oe()), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    n = PL.resolve()
+                back = [json.loads(x) for x in PL.LOG.read_text(encoding="utf-8").splitlines()]
+        finally:
+            PL.LOG = old
+        return n, [r["y"] for r in back]
+
+    @staticmethod
+    def _row(league, blue, red, number, t="2026-09-17T09:40:00+00:00"):
+        return {"t": t, "match_id": "m", "game_id": f"{league}-{blue}-{red}-{number}-{t}", "game_number": number,
+                "league": league, "blue": blue, "red": red, "minute": 12.0, "minute_key": 12,
+                "probability_blue": 0.6, "source": "ingame", "y": None}
+
+    def test_四大的行按WLDs再配一次_规则不变(self):
+        rows = [self._row("LPL", "Invictus Gaming", "Top Esports", 1),          # WLDs 第 1 局, 蓝方赢
+                self._row("LPL", "Invictus Gaming", "Top Esports", 2),          # WLDs 第 2 局, 蓝方输
+                self._row("LPL", "Invictus Gaming", "JD Gaming", 1),            # 对手不对: 仍要两队都对上
+                self._row("LPL", "Top Esports", "Invictus Gaming", 1),          # 选边反了: 不猜
+                self._row("LPL", "Invictus Gaming", "Top Esports", 1, "2026-09-25T09:40:00+00:00"),  # 出了时间窗
+                self._row("LPL", "A", "B", 1, "2026-08-01T10:30:00+00:00"),     # 本赛区配得上的照旧
+                self._row("LCK Challengers", "Invictus Gaming", "Top Esports", 1)]  # 四大之外不退
+        n, ys = self._resolve(rows)
+        self.assertEqual(ys, [1, 0, None, None, None, 0, None])
+        self.assertEqual(n, 3)
+
+    def test_退路窗口窄_国内行不会配到前一天同对阵的国际赛(self):
+        # OE 晚一天收录: 国内局当天还不在 OE 里, 退路先跑。同一对阵 26 小时前在国际赛上打过同局号,
+        # 主路的 48h 窗口会把它永久配上 (2026-05-06 LCK DNS vs HLE 对 05-05 EWC, 实测)。退路只给 12h。
+        rows = [self._row("LPL", "Invictus Gaming", "Top Esports", 1, "2026-09-18T11:35:00+00:00"),  # +26.4h
+                self._row("LPL", "Invictus Gaming", "Top Esports", 1, "2026-09-17T20:00:00+00:00")]  # +10.8h
+        n, ys = self._resolve(rows)
+        self.assertEqual(ys, [None, 1])
+        self.assertEqual(n, 1)
+
+    def test_退路列表显式且就是国际赛的OE名(self):
+        from backfill_late import oe_league
+        from esports_feed import LEAGUE_IDS, is_major
+        import prediction_log as PL
+        self.assertEqual(PL.INTL_OE_RETRY[0], "WLDs")
+        self.assertEqual(set(PL.INTL_OE_RETRY), {oe_league(k) for k in LEAGUE_IDS if not is_major(k)})
+
+
+class PredictionLogContextFields(unittest.TestCase):
+    """坑: 留档只记渐变后的头条, 线上第 3-15 分钟和留出集 (局内模型自己的数) 比的不是同一个数; 也分不清每条是
+    哪一代模型说的。新加五个键 (局内读数 / 渐变权重 / 锚 / 锚的来源 / trained_through) —— 老调用方式和老记录
+    (没有这些键) 都要照常能用。"""
+
+    def _with_log(self, fn):
+        import tempfile
+        import prediction_log as PL
+        saved = (PL.LOG, set(PL._seen), PL._loaded)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                PL.LOG = Path(d) / "log.jsonl"
+                PL._seen.clear()
+                PL._loaded = False
+                return fn(PL)
+        finally:
+            PL.LOG = saved[0]
+            PL._seen.clear()
+            PL._seen.update(saved[1])
+            PL._loaded = saved[2]
+
+    def test_新键写进去_不给就是None(self):
+        import json
+
+        def go(PL):
+            base = dict(match_id="m", league="LCK", blue="T1", red="Gen.G", game_number=1)
+            PL.log_prediction(game_id="g1", probability_blue=0.612345, source="ingame", minute=8.0, **base,
+                              ingame_probability_blue=0.701234, blend_weight=5 / 12, anchor_probability_blue=0.55,
+                              anchor_source="post_draft", trained_through="2026-10-16")
+            PL.log_prediction(game_id="g2", probability_blue=0.4, source="pre_draft", **base)   # 老的调用方式
+            return [json.loads(x) for x in PL.LOG.read_text(encoding="utf-8").splitlines()]
+        a, b = self._with_log(go)
+        self.assertEqual((a["ingame_probability_blue"], a["blend_weight"], a["anchor_probability_blue"],
+                          a["anchor_source"], a["trained_through"]),
+                         (0.7012, 0.4167, 0.55, "post_draft", "2026-10-16"))
+        for k in ("ingame_probability_blue", "blend_weight", "anchor_probability_blue", "anchor_source",
+                  "trained_through"):
+            self.assertIn(k, b)
+            self.assertIsNone(b[k], k)
+
+    def test_打分新旧记录混着也能算_留出用四大加国际(self):
+        import contextlib
+        import io
+        import json
+        import tempfile
+
+        def go(PL):
+            rows = []
+            for k in range(8):
+                old = {"t": "2026-09-20T08:00:00+00:00", "match_id": f"m{k}", "game_id": f"g{k}", "game_number": 1,
+                       "league": "LCK", "blue": "T1", "red": "Gen.G", "minute": 10.0, "minute_key": 10,
+                       "probability_blue": 0.7, "source": "ingame", "y": k % 2}
+                rows.append(old if k < 3 else dict(old, ingame_probability_blue=0.9 if k % 2 else 0.2,
+                                                   blend_weight=0.5833, anchor_probability_blue=0.6,
+                                                   anchor_source="pre_draft", trained_through="2026-10-16"))
+            PL.LOG.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+            out = {}
+            with tempfile.TemporaryDirectory() as d:
+                calib = Path(d) / "calib_ingame_live.json"
+                old_calib = PL.INGAME_CALIB
+                PL.INGAME_CALIB = calib
+                try:
+                    served = {"10": {"n": 2101, "accuracy": 0.6811, "accuracy_ci95": 0.0199, "brier": 0.2085,
+                                     "brier_ci95": 0.0081, "log_loss": 0.6049, "log_loss_ci95": 0.0197}}
+                    for kind, m in (("served", {"per_T": {"10": {"accuracy": 0.7109, "n": 9417}},
+                                                "per_T_served": served}),
+                                    ("all", {"per_T": {"10": {"accuracy": 0.7109, "n": 9417}}}),
+                                    ("missing", None)):
+                        if m is None:
+                            calib.unlink()
+                        else:
+                            calib.write_text(json.dumps({"metrics": m}), encoding="utf-8")
+                        buf = io.StringIO()
+                        with contextlib.redirect_stdout(buf):
+                            PL.score()
+                        out[kind] = buf.getvalue()
+                finally:
+                    PL.INGAME_CALIB = old_calib
+            return out
+        out = self._with_log(go)
+        self.assertIn("留出  2101 局   准确率 0.681 ± 0.020", out["served"])
+        self.assertNotIn("0.711", out["served"], "有 per_T_served 就不拿全赛区的 per_T 对照")
+        self.assertIn("还没有 per_T_served", out["all"])
+        self.assertIn("准确率 0.711   (全赛区 per_T)", out["all"])
+        self.assertIn("不和留出集对照", out["missing"])
+        # 后 5 局带渐变前的读数: 局内模型自己全对 (奇数局 0.9 / 偶数局 0.2), 渐变后的 0.7 只对一半多
+        self.assertIn("其中 5 局记了渐变前的读数: 局内模型自己 准确率 1.000", out["served"])
+
+
+class ServedLeaguesHeldout(unittest.TestCase):
+    """坑: 线上真账拿全赛区的 per_T 对照。全赛区测试段约 9400 局, 四大 + 国际只占约 22%, 次级联赛更好预测 ——
+    线上显得系统性低 2-4 个点, 被当成"线上出了问题"。per_T_served 只算线上服务的赛区。"""
+
+    def _it(self):
+        import os
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"LOL_ARTIFACTS": d}):
+            import ingame_train
+        return ingame_train
+
+    def test_服务赛区就是LEAGUE_IDS的OE名(self):
+        from backfill_late import oe_league
+        from esports_feed import LEAGUE_IDS
+        self.assertEqual(set(self._it().SERVED_OE_LEAGUES), {oe_league(k) for k in LEAGUE_IDS})
+
+    def test_只算服务的赛区_带区间(self):
+        import numpy as np
+        import pandas as pd
+        IT = self._it()
+        rng = np.random.default_rng(0)
+        n = 200
+        tt = pd.DataFrame({"league": ["LPL"] * 60 + ["WLDs"] * 40 + ["LCKC"] * 100, "T": 10,
+                           "y": rng.integers(0, 2, n), "p": rng.uniform(0.01, 0.99, n)})
+        tt.loc[tt.league == "LCKC", "p"] = tt.loc[tt.league == "LCKC", "y"] * 0.98 + 0.01   # 次级联赛全对
+        got = IT.served_per_T(tt)
+        s = tt[tt.league != "LCKC"]
+        hit = ((s.p > .5).astype(int) == s.y).astype(float)
+        self.assertEqual(list(got), ["10"])
+        self.assertEqual(got["10"]["n"], 100)
+        self.assertAlmostEqual(got["10"]["accuracy"], hit.mean())
+        self.assertAlmostEqual(got["10"]["accuracy_ci95"], 1.96 * hit.std(ddof=1) / np.sqrt(100))
+        self.assertAlmostEqual(got["10"]["brier"], ((s.p - s.y) ** 2).mean())
+        for k in ("brier_ci95", "log_loss", "log_loss_ci95"):
+            self.assertGreater(got["10"][k], 0)

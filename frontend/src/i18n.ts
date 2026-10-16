@@ -394,8 +394,6 @@ const RULES: [string, string][] = [
   // ── 提醒 (ingame.ts / stage1.ts / teams.ts) ──
   ["你填的是第 {m} 分钟, 但模型只在 10/15/20/25 分钟这几个时间点训练过", "This is minute {m}, but the model was only trained at minutes 10/15/20/25"],
   ["已按最接近的 {t} 分钟评估, 相差 {d} 分钟, 精度会下降", "It was evaluated at the nearest one ({t} min), {d} min away, so accuracy drops"],
-  ["LPL 在局内训练集里样本偏薄 (约 9%, 且全部来自 2026 年) —— Oracle's Elixir 在 2022-2025 不提供 LPL 的分钟级快照", "LPL is thin in the in-game training set (about 9%, all from 2026) — Oracle's Elixir had no minute-level LPL snapshots for 2022–2025"],
-  ["结论在 LPL 上的可靠性弱于其他三大赛区", "Results are less reliable for LPL than for the other three leagues"],
   ["这几个英雄的历史样本不足, 算不出阵容强势期 —— 「领先但阵容吃亏」这类隐患本次无法识别", "Not enough history on these champions to compute comp scaling — risks like \"ahead but out-scaled\" can't be flagged this time"],
   ["没填双方阵容, 无法判断谁的阵容更耐拖 —— 同样的经济差在不同阵容下含义相反", "No lineups, so it can't tell whose comp scales better — the same gold lead means opposite things for different comps"],
   ["没填蓝方总经济, 按第 {t} 分钟的实测中位数 {g} 估算, 相对经济差可能有偏", "Blue team's total gold is missing; estimated from the median at minute {t} ({g}), so the relative gold lead may be off"],
