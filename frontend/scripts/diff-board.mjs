@@ -9,6 +9,11 @@
  * 为什么只挑**已经打完**的比赛: 帧定型了, 两边拉到的是同一批上游数据, 输出理应
  * 完全相同 —— 不同就是移植错了。进行中的比赛两边取数差几秒, 本来就会不一样。
  *
+ * **两边钉住同一个"此刻"** (Feed.pinnedNow ↔ board_oracle.py --at → esports_feed.PINNED_NOW)。打完的局并不是
+ * 任何 startingTime 都给同一批冻结帧: 2026-10-17 Worlds KC vs MVK 三局, startingTime 差 10 秒末帧就差一两秒、
+ * 经济差十几块 (esports_feed 模块顶部第 6 条)。startingTime 按"此刻"算, 两边各按各的时钟取, 就会在终局经济、
+ * 引用经济的理由、走势末点上不一致 —— 和移植错误分不开。钉住之后两边请求同一批 URL (同一个 URL 重复取逐字节相同)。
+ *
  * 不参与比对的字段 (都有理由, 不是为了让测试变绿):
  *   live.stale_seconds                     "此刻减帧时刻", 两边取数的时刻不同
  *
@@ -113,10 +118,12 @@ for (const [lg] of LEAGUE_IDS) {
 console.log(`最近 ${DAYS} 天、每赛区至多 ${PER} 场已完赛的系列赛, 共 ${targets.length} 局`);
 console.log("浏览器版和全新 Python 进程同时开算 (Python 要先加载五年 CSV) …\n");
 
-// ── 两边同时算 ──
+// ── 两边同时算 —— 取帧的"此刻"钉在同一个时刻 (见文件头) ──
+const AT = Date.now();
+Feed.pinnedNow = AT;
 const oracleP = promisify(execFile)(
   PY,
-  [ORACLE, ...targets.map((x) => `${x.m.match_id}:${x.g.id}`), "--lists"],
+  [ORACLE, ...targets.map((x) => `${x.m.match_id}:${x.g.id}`), "--lists", "--at", String(AT)],
   { encoding: "utf8", maxBuffer: 512 * 1024 * 1024, env: { ...process.env, PYTHONIOENCODING: "utf-8" } },
 );
 const t0 = Date.now();

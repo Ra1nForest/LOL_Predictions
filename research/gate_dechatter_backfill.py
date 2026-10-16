@@ -11,7 +11,7 @@
   基线  同一行原样的校准概率, 同样渐变。两边都 round 到 4 位 (看板吐出来的精度)。
   考卷  backfill/snapshots.jsonl 按 oe_gameid 接上 ingame_model.build() 的产出 (借赛前特征、阵容强势期、
         is_*、标签 —— merge_backfill.borrow_cols, 同 gate_anchor / gate_objectives), 只留 Stage 4 测试段
-        (split_by_game 的最后 20%) 里日期 ≥ 2026-01-15 的局。选边和 OE 对不上的局 (帧上第 10/15 分钟的经济差
+        (split_by_game 的最后 20%) 里日期 ≥ 2026-01-15 的局 (G2 之前的线上文件才成立: G2 起 Stage 4 存盘的是服务模型, 考卷那段它拟合时见过; 脚本里 ingame_train.require_unseen 会拒绝)。选边和 OE 对不上的局 (帧上第 10/15 分钟的经济差
         和 OE 的 golddiffat10/15 反号, |OE| > 300) 丢掉 —— 标签是 OE 蓝方的, 帧蓝方不是同一队时整局标签是反的。
   渐变锚  四大赛区: BP 后 (Stage 2) 概率, 取 feature_store.build_training_matrix 测试段里这一局的那一行
         (同 gate_anchor; 看板对国内比赛用的就是 BP 后)。国际赛和次级联赛: 回填里拿不到看板的锚
@@ -161,6 +161,9 @@ def main():
     print(f"      四大 {nmaj} 局里有 BP 后锚的 {sum(1 for g in X[X.major].game_id.unique() if g in anchor)} 局")
 
     live = IngameModel("_live")
+    # G2 之后线上 Stage 4 是服务模型, 考卷那段它拟合时见过 —— 样本内打分不报错, 只会偏乐观 (见 ingame_train.require_unseen)
+    from ingame_train import require_unseen
+    require_unseen(live, max(pd.Timestamp(SINCE), te["date"].min()), "gate_dechatter_backfill")
     X["T"] = X.minute.map(live.nearest_slice)
 
     def cal(frame: pd.DataFrame) -> np.ndarray:

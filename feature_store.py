@@ -8,12 +8,31 @@ Feature Store — 特征仓库
 
 关键: 在线路径必须和离线路径产出完全一致的特征, 否则模型输入分布错位。
       本模块是唯一的特征定义处, 训练和推理共用。
+
+赛区内 Elo (闸门 G1, 2026-10-17)
+--------------------------------
+10 局滚动窗口看不到长期实力; 赛区内 Elo 是线上残差里最强的信号。research/gate_pregame_package.py
+预先登记的组合包里, 全部收益几乎都来自它 (B0+{d} 单独 pre t +6.43 / post t +4.42; 上线配方 {a, d}
+= 浅树 + Elo 进校准层: pre t +6.55, post t +4.67)。这里是它**唯一**的定义 (elo_games / elo_replay /
+elo_rating), build_training_matrix 和 make_row 都走这一份:
+
+  · 每个联赛一个池 (特征库只装四大, LTA N → LCS 已在读 CSV 时改名), 初始 1500, K = 20, 胜负 0/1,
+    不带比分差; 每跨过一个日历年 (UTC) 交界, 池内所有队向池内均值回归 50% (跨 n 个交界就是 0.5^n)。
+  · 训练行: 一局的 Elo 只用**更早 UTC 日期**的比赛 —— 同一天的结果不进 (对齐 OE 晚一天登记)。
+  · 在线: 库里每一场之后的评分; 请求的年份晚于这个**池**最后一个比赛日的年份, 就补上那几次跨年回归。
+    回归是整池一起做的 (闸门就是这样): 一支队去年没打、池子今年打过, 它已经被今年的交界回归过一次,
+    不能按"这支队最后一场的年份"再回归一遍。
+  · 存成 elo_gap (蓝减红)。这个名字不以 diff_/b_/r_/sum_/is_ 开头, select_features 不会把它喂给树
+    —— Elo 只进校准层 (train.py 的 logit_elo; 闸门里 Elo 当树特征只拿到一半收益)。
 """
 from __future__ import annotations
+import math
 import re
 import pandas as pd, numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
+
+import fdlibm
 
 LEAGUES     = ["LPL", "LCK", "LEC", "LCS"]
 ROLL_WINDOW = 10
@@ -57,6 +76,121 @@ def champion_key(name) -> str:
     return CHAMP_ID_ALIAS.get(k, k)
 
 
+# ── 赛区内 Elo (见模块文档; 常数是闸门冻结的, 改了要重新过闸) ────────────
+ELO_K, ELO_INIT, ELO_REG = 20.0, 1500.0, 0.5
+# 训练矩阵 / make_row 里的列名。不许带 diff_/b_/r_/sum_/is_ 前缀: 那样 select_features 会把它喂给树
+ELO_COL = "elo_gap"
+# 校准层的两个输入: logit(clip(树的原始概率)) 和 elo_gap · ln(10)/400 (Elo 的对数几率单位)。
+# 两个常数都写进 calib 文件, api.Stage 和浏览器版从文件读, 不各自重算 (Math.log(10) 和 math.log(10)
+# 不保证同一个比特)
+LOGIT_CLIP = 1e-7
+ELO_SCALE = math.log(10) / 400
+
+
+def elo_games(teams: pd.DataFrame) -> pd.DataFrame:
+    """队伍行 → 每局一行 (gameid, league, date, b, r, y, day), 按 (date, gameid) 排好。
+
+    每局恰好两行队伍行的才算, participantid 小的是蓝方 —— 和 build_training_matrix 同一个口径。
+    排序和 research/gate_pregame_package.elo_inputs 一字不差: 同一天里按 (时间, gameid) 依次更新,
+    池内评分的插入顺序 (决定 np.mean 的加法顺序) 也就一样。
+    """
+    tt = teams.sort_values(["gameid", "participantid"], kind="stable")
+    tt = tt[tt.groupby("gameid")["gameid"].transform("size") == 2]
+    blue = tt.groupby("gameid").nth(0).set_index("gameid")
+    red = tt.groupby("gameid").nth(1).set_index("gameid").loc[blue.index]
+    G = pd.DataFrame({"gameid": blue.index.values, "league": blue["league"].values,
+                      "date": blue["date"].values, "b": blue["teamname"].values,
+                      "r": red["teamname"].values, "y": blue["result"].astype(int).values})
+    G = G.sort_values(["date", "gameid"], kind="stable").reset_index(drop=True)
+    G["day"] = G["date"].dt.normalize()
+    return G
+
+
+def elo_replay(G: pd.DataFrame, before=None) -> tuple[dict, dict]:
+    """按日重放 elo_games 的表, 返回 (pregame, pools)。
+
+      pregame  gameid → 蓝方 Elo − 红方 Elo, 只用**更早 UTC 日期**的比赛 (训练行用)
+      pools    联赛 → {"ratings": {队: 评分}, "year": 最后一个比赛日的年份, "mean": 池内均值,
+                       "last": {队: 在这个池里最后一场的日期}}  (在线用, 见 elo_rating)
+      before   只走 day < before 的比赛 —— make_row(as_of=...) 用, 和训练行同一个口径
+
+    逐行照抄闸门的 elo_inputs (连 y 是 numpy int64、评分从第一次更新起变成 np.float64 都一样),
+    不然 10 ** x 走的是另一条 pow, 末位就可能不同。新队从 1500 进、更新零和, 池内均值理论上恒为
+    1500 —— 照字面算均值, 不假设它。
+    """
+    if before is not None:
+        G = G[G["day"] < pd.Timestamp(before).normalize()]
+    pre, pools = {}, {}
+    for lg, g in G.groupby("league", sort=False):
+        R: dict = {}
+        last: dict = {}
+        cur_year = None
+        for day, d in g.groupby("day", sort=True):
+            yr = day.year
+            if cur_year is not None and yr > cur_year and R:
+                mean = float(np.mean(list(R.values())))
+                f = (1 - ELO_REG) ** (yr - cur_year)
+                for k in R:
+                    R[k] = mean + f * (R[k] - mean)
+            cur_year = yr
+            rows = list(zip(d["gameid"].values, d["b"].values, d["r"].values, d["y"].values))
+            for gid, bt, rt, _ in rows:
+                pre[gid] = R.get(bt, ELO_INIT) - R.get(rt, ELO_INIT)
+            for gid, bt, rt, yy in rows:
+                rb, rr = R.get(bt, ELO_INIT), R.get(rt, ELO_INIT)
+                e = 1.0 / (1.0 + 10 ** ((rr - rb) / 400.0))
+                R[bt], R[rt] = rb + ELO_K * (yy - e), rr - ELO_K * (yy - e)
+                last[bt] = last[rt] = day
+        pools[lg] = {"ratings": R, "year": cur_year, "last": last,
+                     "mean": float(np.mean(list(R.values()))) if R else ELO_INIT}
+    return pre, pools
+
+
+def elo_rating(pool: dict | None, team, year: int) -> float:
+    """某队在某池里的评分; 请求年份晚于池子最后一个比赛日的年份, 就补上跨年回归。
+
+    不在池里的队 (新队、别的赛区的队) 是初始 1500, 不回归 —— 闸门里 R.get(队, 1500) 就是这样。
+    浏览器版是 web/stage1.ts 的 eloRating, 数据来自 teams.json 的 elo (同一份 ratings / year / mean)。
+    """
+    if not pool or team not in pool["ratings"]:
+        return ELO_INIT
+    r = pool["ratings"][team]
+    if year > pool["year"]:
+        f = (1 - ELO_REG) ** (year - pool["year"])
+        r = pool["mean"] + f * (r - pool["mean"])
+    return float(r)
+
+
+def calib_logit(p, clip: float = LOGIT_CLIP):
+    """校准层的第一个输入: logit(clip(p))。标量 (线上) 走 fdlibm.log, 数组 (train.py 拟合 / 评估) 走 numpy。
+
+    线上用可移植的 log: 浏览器版 predictStage1 算同一个数, 平台的 log 两边会差一位 (见 fdlibm.py)。
+    训练那一路仍是 numpy —— 系数是在它上面拟的, 两种 log 至多差一位, 远在模型的意义之下。
+    """
+    if np.ndim(p) == 0:
+        q = min(max(float(p), clip), 1 - clip)
+        return fdlibm.log(q / (1 - q))
+    q = np.clip(np.asarray(p, dtype=np.float64), clip, 1 - clip)
+    return np.log(q / (1 - q))
+
+
+def logit_elo_inputs(p_raw, elo_gap, clip: float = LOGIT_CLIP, scale: float = ELO_SCALE) -> np.ndarray:
+    """train.py 拟合 / 评估 logit_elo 校准层的设计矩阵: [logit(clip(p_raw)), elo_gap · scale]。"""
+    return np.column_stack([calib_logit(p_raw, clip), np.asarray(elo_gap, dtype=np.float64) * scale])
+
+
+def logit_elo_prob(p_raw: float, elo_gap: float, coef, intercept: float,
+                   clip: float, scale: float) -> float:
+    """线上 logit_elo 校准: σ(c₁·logit(clip(p_raw)) + c₂·(elo_gap·scale) + b)。
+
+    运算顺序和 sklearn 的 decision_function 一样 ((x₁c₁ + x₂c₂) + b); 浏览器版 web/stage1.ts 的
+    predictStage1 照抄这一行。exp / log 用 fdlibm 的移植, 不用 math: 看板上 BP 后 / 赛前的概率不取整就输出,
+    平台的 exp / log 让约 4.5% 的输入两边差一位, test:diff 用 === 比 (2026-10-17 实测)。
+    """
+    z = calib_logit(p_raw, clip) * coef[0] + (elo_gap * scale) * coef[1] + intercept
+    return 1.0 / (1.0 + fdlibm.exp(-z))
+
+
 @dataclass
 class FeatureStore:
     """持有全部历史, 支持按 (队伍, 日期) 查询滚动统计。"""
@@ -66,6 +200,11 @@ class FeatureStore:
     roll_cols: list = field(default_factory=list)
     last_date: pd.Timestamp = None
     league_last: dict = field(default_factory=dict)   # 每个赛区最后一场的日期
+    # 赛区内 Elo (见模块文档): 每局一行的表 (make_row(as_of) 截断重放用)、库里全部比赛之后的各池状态、
+    # 每局"当天开始前"的 elo_gap (build_training_matrix 用)。直接构造 (测试) 时都是空的: elo_gap = 0
+    elo_table: pd.DataFrame = None
+    elo_pools: dict = field(default_factory=dict)
+    elo_pre: dict = field(default_factory=dict)
 
     # ── 构建 ────────────────────────────────────────────
     @classmethod
@@ -124,12 +263,15 @@ class FeatureStore:
                      if c.startswith("avg_") or c in ("rolling_wr", "streak")]
 
         ll = teams.groupby("league")["date"].max().to_dict()
+        eg = elo_games(teams)
+        e_pre, e_pools = elo_replay(eg)
         if verbose:
             print(f"    {len(hist)} teams, {len(champ)} champion-league pairs, "
                   f"{len(pchamp)} player-champion pairs")
             for k in sorted(ll):
                 print(f"      {k:<6} 数据截至 {ll[k].date()}")
-        return cls(hist, champ, pchamp, roll_cols, teams["date"].max(), ll)
+        return cls(hist, champ, pchamp, roll_cols, teams["date"].max(), ll,
+                   eg, e_pools, e_pre)
 
     # ── 查询 ────────────────────────────────────────────
     def team_snapshot(self, team: str, before: pd.Timestamp | None = None) -> dict | None:
@@ -196,6 +338,32 @@ class FeatureStore:
         p = [r for d, r in recs if before is None or d < before]
         wr = float(np.mean(p)) if len(p) >= 3 else np.nan
         return wr, len(p)
+
+    def elo_pools_asof(self, as_of: pd.Timestamp | None = None) -> dict:
+        """各池的 Elo 状态。as_of=None: 库里全部比赛之后; 否则只算 as_of 那天之前 (更早的 UTC 日期) 的比赛
+        —— 和训练行同一个口径, 所以 make_row(as_of=某局的时间) 拿到的 elo_gap 就是训练矩阵里那一格。
+        按天缓存: research/ 的脚本按比赛逐局调 make_row(as_of), 同一天的不必重放第二遍。"""
+        if as_of is None or self.elo_table is None:
+            return self.elo_pools
+        day = pd.Timestamp(as_of).normalize()
+        cache = self.__dict__.setdefault("_elo_asof_cache", {})
+        if day not in cache:
+            if len(cache) > 256:
+                cache.clear()
+            cache[day] = elo_replay(self.elo_table, before=day)[1]
+        return cache[day]
+
+    def elo_gap(self, blue: str, red: str, league: str,
+                as_of: pd.Timestamp | None = None, year: int | None = None) -> float:
+        """蓝方减红方的赛区内 Elo, 用 league 这个池 (国际赛同母赛区时调用方传母赛区, 见 api.pregame_league)。
+
+        year = 请求的年份, 决定要不要补跨年回归: 默认取 as_of 的年份, 没有 as_of 就是此刻的本地年份 ——
+        和 staleness 的"今天"同一个口径, 浏览器版用的也是本地的 today。只在元旦前后几小时和 UTC 不同。
+        """
+        if year is None:
+            year = (pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.now()).year
+        pool = self.elo_pools_asof(as_of).get(league)
+        return elo_rating(pool, blue, year) - elo_rating(pool, red, year)
 
     def home_league(self, team: str) -> str | None:
         """这支队的母赛区 = 它在特征库里最后一场比赛所在的赛区; 不认识返回 None。
@@ -281,7 +449,9 @@ class FeatureStore:
 
         m = {"is_lpl": int(league == "LPL"), "is_lck": int(league == "LCK"),
              "is_lec": int(league == "LEC"), "is_lcs": int(league == "LCS"),
-             "playoffs": int(playoffs)}
+             "playoffs": int(playoffs),
+             # 不进树, 只进校准层 (api.Stage 的 logit_elo); 见模块文档
+             ELO_COL: self.elo_gap(blue, red, league, as_of)}
         for c in self.roll_cols:
             bv, rv = float(bs.get(c, np.nan)), float(rs.get(c, np.nan))
             m[f"diff_{c}"], m[f"b_{c}"], m[f"r_{c}"] = bv - rv, bv, rv
@@ -366,6 +536,8 @@ def build_training_matrix(files: list[str], verbose: bool = True) -> pd.DataFram
 
         m = {"gameid": gid, "date": gd, "league": lg,
              "blue_team": bt, "red_team": rt, "y": bT["result"],
+             # 当天开始前的 Elo 差 (同一天的结果不进); 不进树, 只给 train.py 的校准层
+             ELO_COL: store.elo_pre.get(gid, np.nan),
              "is_lpl": int(lg=="LPL"), "is_lck": int(lg=="LCK"),
              "is_lec": int(lg=="LEC"), "is_lcs": int(lg=="LCS"),
              "playoffs": int(pd.to_numeric(bT.get("playoffs",0), errors="coerce") or 0)}
@@ -414,6 +586,7 @@ def select_features(mdf: pd.DataFrame, stage: str = "post_draft") -> list[str]:
              if (c.startswith(("diff_","b_","r_","sum_","is_")) or c == "playoffs")
              and c not in ("blue_team","red_team")
              and c not in EXCLUDED
+             and c != ELO_COL           # 名字本来就选不上; 显式再挡一道 —— Elo 只进校准层
              and mdf[c].dtype in ("float64","int64","float32","int32")]
     if stage == "pre_draft":
         feats = [c for c in feats if not _is_draft_feature(c)]

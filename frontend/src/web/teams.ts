@@ -32,8 +32,23 @@ export interface TeamsFile {
   league_last: Record<string, string>;
   /** lolesports 队名 → 模型队名 (esports_feed.TEAM_ALIASES) */
   aliases: Record<string, string>;
+  /**
+   * 赛区内 Elo 各池的状态 (FeatureStore.elo_pools, 库里全部比赛之后) —— 赛前 / BP 后校准层的第二个输入,
+   * 见 stage1.ts 的 eloRating。旧导出没有这一项 (那时校准层是 Platt, 用不到)。
+   */
+  elo?: EloFile;
   data_through: string;
   generated_at: string;
+}
+
+/** tools/export_web_model.export_elo */
+export interface EloFile {
+  column: string;
+  k: number;
+  init: number;
+  regress: number;
+  /** 赛区 → {year: 池子最后一个比赛日的年份, mean: 池内均值 (Python 算好的), teams: 队 → [评分, 最后一场日期]} */
+  pools: Record<string, { year: number; mean: number; teams: Record<string, [number, string]> }>;
 }
 
 export interface Snapshot {

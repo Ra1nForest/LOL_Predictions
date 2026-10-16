@@ -173,7 +173,11 @@ export interface Prediction {
   minute: number | null;
   slice_used: number | null;
   probability_blue: number | null;
+  /** 没挪过的那一行的树原始输出 (校准前)。看板上 (dechattered) 它和 probability_blue 不再是一对:
+   *  后者是经济差 ±200 邻域平均、再渐变过的 */
   probability_raw: number | null;
+  /** 看板上的局内数都带 true: 概率经过经济差邻域去抖 (闸门 G3); /predict/ingame 和 too_early 没有这个键 */
+  dechattered?: boolean;
   summary: string | null;
   /** **可能不存在。** 后端有三条路径返回不带 model 的 prediction:
    *  开局不足 10 分钟的 too_early、以及两个 {"error": …} 分支
@@ -365,8 +369,12 @@ export interface PreModelCard {
   baseline: number;
   lift: number;
   ece_cal: number;
-  p_min: number;
-  p_max: number;
+  /**
+   * 校准够不到的区间 (PreMatch 画成斜线死区)。logit_elo (G1) 没有硬上下限, 这时没有这两个键 ——
+   * range_note 里说的是"留出测试集上出现过的范围", 不是死区 (api._model_card)
+   */
+  p_min?: number;
+  p_max?: number;
   note: string | null;
   range_note: string | null;
 }

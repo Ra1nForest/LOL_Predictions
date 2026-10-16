@@ -42,6 +42,25 @@ GOLD_TOTAL_MEDIAN = {10: 15918, 15: 25037, 20: 34597, 25: 43854}
 # 第一条的说明重复 —— api._board_warnings 按原文把它去掉。浏览器版是 web/ingame.ts 的 NO_PRE_STATS。
 NO_PRE_STATS = "没有可用的赛前队伍统计, 本次只看局内数据。"
 
+# 看板的"经济差邻域平均"去抖 (闸门 G3, research/gate_dechatter.mjs, 2026-10-17)。
+#
+# 为什么: 局内模型是 XGBoost, 输出对经济差是分段常数 —— 经济差在某个分界线上下晃一百块, 胜率就来回
+# 跳几个百分点, 人头、塔、龙都没变。逐秒走势把这种抖动全露了出来 (每局无事件的 >=4pp 跳变平均 25.9 次)。
+# 在**时间**上平滑已经被否掉 (research/gate_smoothing.mjs: 只看过去的平均必然滞后, Brier t = −13.25)。
+# 这里在**特征空间**里做: 同一时刻, 把经济差换成 gd−200, gd−150, …, gd+200 这 9 个值, 由经济差派生的
+# 特征全部按 make_row 重算, 9 个**校准后**的概率取平均。不看过去, 没有滞后。
+#
+# 闸门 (协议先定死): 160 局 / 133 系列赛的逐秒走势, 系列赛 t = +2.39 —— 采纳规则是"不显著变差"
+# (t > −2.5, 只为显示的改动, 用户同意按这条判); 方向是变好, 但没到 +2.5, **不能说"更准"**。
+# 无事件 >=4pp 跳变 25.9 → 7.6 次/局。逐分钟回填复核 (gate_dechatter_backfill.py) 同向。
+#
+# 只在看板上开 (头条、曲线、逐秒走势、直播回放; api._ingame_core(dechatter=True) /
+# web/ingame.ts ingameResponse({dechatter: true})) —— /predict/ingame 和 /session tick 回答的是
+# "局内模型在这个局面上怎么看", 照旧是单点的原始读数。闸门量的就是这 9 个整数挪动量、这个顺序、
+# 校准之后求平均、再走 3-15 分钟渐变; 改其中任何一样都要重新过闸, 两份实现一起改
+# (浏览器版是 web/ingame.ts 的 DECHATTER_SHIFTS)。
+DECHATTER_SHIFTS = (-200, -150, -100, -50, 0, 50, 100, 150, 200)
+
 
 class IngameModel:
     """variant="" 是完整模型; variant="_live" 是不含经验差特征的实时变体。
@@ -75,6 +94,10 @@ class IngameModel:
         self.metrics = cfg["metrics"]
         self.slices = cfg["slices"]
         self.trained_through = cfg["trained_through"]
+        # 闸门 G2 起存盘的是"服务模型" (ingame_train 的文档): 它把 metrics 的那段留出数据也拟进去了,
+        # metrics 说的是同一配方的评估版。旧文件没有这个键 (None) —— 线上模型就是评估模型。
+        # 只有免责声明的措辞和研究脚本的检查 (ingame_train.require_unseen) 读它, 不影响任何概率
+        self.serving_fit = cfg.get("serving_fit")
         self.has_xpdiff = cfg.get("has_xpdiff", "xpdiff" in self.features)
         self.importance = dict(zip(self.features, self.model.feature_importances_))
 
@@ -229,6 +252,30 @@ class IngameModel:
         x = np.nan_to_num(x, nan=-999.0)
         raw = float(self.model.predict_proba(x)[0, 1])
         return raw, self.calibrate(raw)
+
+    def dechattered(self, row_for) -> float:
+        """看板的去抖读数: 经济差挪 DECHATTER_SHIFTS 里每个量各算一次**校准后**的概率, 求平均。
+
+        row_for(d) 必须返回"经济差 + d 之后由 make_row 重新组的那一行" —— 由经济差派生的列
+        (golddiff_norm、x_gold_scaling、x_goldnorm_scaling、lead_by_early_comp) 全靠 make_row 重算,
+        这里不另写一份派生公式 (另写一份就是第三份实现, 漏一列也不会报错)。总经济 gold_total 是独立
+        输入, 不跟着挪 —— 闸门就是这么量的。
+
+        9 行一次送进 predict_proba: 和逐行调用逐位相等 (实测 10314 行 0 处不同, XGBoost 3.4.1;
+        IngameDechatter 有一条测试守着), 快 6 倍多 —— 看板一条曲线 60 个点都要算 9 次。
+
+        求平均是**从左到右依次相加再除以 9**, 不用 sum() 也不用 np.mean: Python 3.12 起 sum() 对浮点数做
+        补偿求和, np.mean 是两两分组求和, 都和浏览器版 (web/ingame.ts dechatteredCal) 的顺序相加差一个
+        ulp, 而看板最后 round 到 4 位 —— 恰好压在进位线上的点两边就会差 0.0001, test:diff 分不清那是
+        求和顺序还是移植错了。
+        """
+        rows = [row_for(d) for d in DECHATTER_SHIFTS]
+        x = np.array([[float(r.get(f, np.nan)) for f in self.features] for r in rows])
+        x = np.nan_to_num(x, nan=-999.0)
+        s = 0.0
+        for raw in self.model.predict_proba(x)[:, 1]:
+            s += self.calibrate(float(raw))
+        return s / len(DECHATTER_SHIFTS)
 
     def evidence(self, row: dict, k: int = 6):
         out = []

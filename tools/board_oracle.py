@@ -16,7 +16,12 @@
 记一笔; 对着已经打完的比赛去记, 等于往预测留档里塞进"看过结局的预测" —— 那份留档
 是拿来给模型打分的 (prediction_log.py --resolve --score)。
 
-    python tools/board_oracle.py MATCH_ID:GAME_ID [...]  [--lists]
+**--at 毫秒时间戳: 钉住取帧的"此刻"** (esports_feed.PINNED_NOW)。打完的局, 不同的 startingTime 拿到的终局帧
+不一样 (esports_feed 模块顶部第 6 条: 末帧前后差一两秒, 经济差十几块), 而 startingTime 是按"此刻"算的 ——
+浏览器版和这里各按各的时钟取, 2026-10-17 就在 Worlds KC vs MVK 三局上差出了终局经济, 看着像移植错误。
+diff-board.mjs 把同一个时刻传给两边 (Feed.pinnedNow), 两边请求同一批 URL。
+
+    python tools/board_oracle.py MATCH_ID:GAME_ID [...]  [--lists] [--at EPOCH_MS]
     → stdout 一行 JSON: {"MATCH_ID:GAME_ID": board, ..., "__live__": ..., "__upcoming__": ...}
 """
 from __future__ import annotations
@@ -31,8 +36,14 @@ sys.path.insert(0, str(ROOT))
 
 
 def main() -> int:
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    lists = "--lists" in sys.argv
+    argv = sys.argv[1:]
+    at = None
+    if "--at" in argv:
+        i = argv.index("--at")
+        at = int(argv[i + 1])
+        del argv[i:i + 2]
+    args = [a for a in argv if not a.startswith("--")]
+    lists = "--lists" in argv
     real_stdout = sys.stdout
     out: dict = {}
 
@@ -44,6 +55,9 @@ def main() -> int:
         from ingame_service import IngameModel
 
         api.log_prediction = lambda *a, **k: None
+        if at is not None:
+            from datetime import datetime, timezone
+            EF.PINNED_NOW = datetime.fromtimestamp(at / 1000, tz=timezone.utc)
         api.STATE["store"] = FeatureStore.from_csv(api.DATA)
         api.STATE["stages"] = {n: api.Stage(n) for n in ("pre_draft", "post_draft")}
         api.STATE["ingame"], api.STATE["ingame_live"] = IngameModel.load_pair()

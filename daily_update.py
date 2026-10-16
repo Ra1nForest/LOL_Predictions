@@ -4,7 +4,8 @@
 拉新数据 → 训到暂存目录 → 指标过闸 → 换上线 → 重启服务 → 验活。
 
     python daily_update.py            完整流程
-    python daily_update.py --dry-run  只拉数据和训练, 不换不重启
+    python daily_update.py --dry-run  只拉数据和训练, 不换不重启。设了 LOL_ARTIFACTS 就训到那里
+                                      (和 train.py 一样的意思: 训练输出放哪), 不碰工作区; 见 _staging_for
     python daily_update.py --force    数据没变也强制重训
     python daily_update.py --publish-web   换上新模型后顺带更新 GitHub Pages 网站 (本机用,
                                            见 tools/publish_web.py)
@@ -49,7 +50,8 @@ for _s in (sys.stdout, sys.stderr):
 
 HERE = Path(__file__).parent
 ART = HERE / "artifacts"
-STAGING = HERE / "artifacts_staging"
+DEFAULT_STAGING = HERE / "artifacts_staging"
+STAGING = DEFAULT_STAGING            # --dry-run 且设了 LOL_ARTIFACTS 时换成它, 见 _staging_for
 PY = sys.executable
 
 # 允许的退化幅度。超过就不上线。
@@ -306,6 +308,25 @@ def _publish_web(a) -> None:
         log(f"      (网站发布留档失败: {type(e).__name__}: {e})")
 
 
+def _staging_for(dry_run: bool, env_out: str | None) -> Path:
+    """训练输出放哪。默认 artifacts_staging/; **只有 --dry-run** 时听 LOL_ARTIFACTS。
+
+    LOL_ARTIFACTS 对 train.py / ingame_train.py / xregion.py 的意思是"训练输出放哪", 这里原来一律无视它
+    (子进程的 LOL_ARTIFACTS 被设成 STAGING 盖掉), 于是想在别处试跑一遍 --dry-run 也会写进工作区的
+    artifacts_staging/ (2026-10-17: 在 worktree 里核对新配方时只能靠包一层脚本改全局)。
+    真正的更新不听它: 换上线只从 artifacts_staging/ 换, 不能取决于一个可能是做实验时 setx 留下的用户环境变量
+    (计划任务会继承它)。指向线上 artifacts/ (或互相包含) 时直接拒绝 —— 暂存那一步要先清掉目标目录里的模型文件。
+    """
+    if not (dry_run and env_out):
+        if env_out:
+            log(f"注意: LOL_ARTIFACTS={env_out} 只对 --dry-run 生效; 这次照旧训到 {DEFAULT_STAGING.name}/")
+        return DEFAULT_STAGING
+    p, art = Path(env_out).resolve(), ART.resolve()
+    if p == art or art in p.parents or p in art.parents:
+        raise ValueError(f"LOL_ARTIFACTS={env_out} 和线上的 {ART} 是同一处或互相包含 —— 拒绝在那里训练")
+    return p
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="不换不重启")
@@ -317,6 +338,13 @@ def main():
     ap.add_argument("--publish-web", action="store_true",
                     help="换上新模型后导出网站模型并推到 GitHub Pages (只在本机用)")
     a = ap.parse_args()
+
+    global STAGING
+    try:
+        STAGING = _staging_for(a.dry_run, os.environ.get("LOL_ARTIFACTS"))
+    except ValueError as e:
+        log(f"✗ {e}")
+        return 1
 
     code, stage, reason, fetch_ok = _pipeline(a)
 
@@ -368,9 +396,17 @@ def _pipeline(a) -> tuple[int, str | None, str | None, bool]:
 
     # 2. 训到暂存
     log("[2/5] 训练到暂存目录 (不碰线上 artifacts/)")
-    if STAGING.exists():
-        shutil.rmtree(STAGING)
-    STAGING.mkdir(parents=True)
+    if STAGING == DEFAULT_STAGING:
+        if STAGING.exists():
+            shutil.rmtree(STAGING)
+        STAGING.mkdir(parents=True)
+    else:
+        # LOL_ARTIFACTS 指定的目录 (--dry-run): 不整个删 (那是别人的目录), 只清掉这次要重新生成的文件 ——
+        # 留着上一轮的会让 gate 的"暂存目录缺文件"检查对一个没写出来的文件视而不见
+        log(f"      暂存目录: {STAGING} (LOL_ARTIFACTS)")
+        STAGING.mkdir(parents=True, exist_ok=True)
+        for f in [*ARTIFACT_FILES, XREGION_FILE]:
+            (STAGING / f).unlink(missing_ok=True)
     env = {"LOL_ARTIFACTS": str(STAGING)}
 
     games = snapshots = None

@@ -170,7 +170,19 @@ def _client():
 
 def build_brief(pred: dict, top_features: list[tuple[str, float, float]],
                 lang: str = "zh") -> str:
-    """把 ML 输出打包成给 agent 看的简报。"""
+    """把 ML 输出打包成给 agent 看的简报。
+
+    校准方式按 pred["calibrator"] 说 (api.Stage.calibrator; 没有这个键 = 旧的 Platt)。换成 logit_elo
+    之后还写 "Platt 校准 / 范围受限于", agent 会把一句过时的话当事实引用。
+    """
+    if pred.get("calibrator") == "logit_elo":
+        cal_lines = [f"  · 概率经校准层校准 (树的原始概率 + 两队赛区内 Elo 差, logistic 回归), "
+                     f"ECE {pred['model_ece']:.3f}",
+                     f"  · 留出测试集上概率出现过的范围 [{pred['p_range'][0]:.2f}, {pred['p_range'][1]:.2f}] "
+                     f"(不是硬上下限, Elo 差很大时可以越过)"]
+    else:
+        cal_lines = [f"  · 概率已做 Platt 校准, ECE {pred['model_ece']:.3f}",
+                     f"  · 概率输出范围受限于 [{pred['p_range'][0]:.2f}, {pred['p_range'][1]:.2f}]"]
     lines = [
         f"比赛: {pred['blue_team']} (蓝方) vs {pred['red_team']} (红方)  [{pred['league']}]",
         f"阶段: {pred['stage']}",
@@ -178,8 +190,7 @@ def build_brief(pred: dict, top_features: list[tuple[str, float, float]],
         f"",
         f"模型元信息:",
         f"  · 该模型在留出测试集上的准确率 {pred['model_accuracy']:.1%} (基线 {pred['model_baseline']:.1%})",
-        f"  · 概率已做 Platt 校准, ECE {pred['model_ece']:.3f}",
-        f"  · 概率输出范围受限于 [{pred['p_range'][0]:.2f}, {pred['p_range'][1]:.2f}]",
+        *cal_lines,
         f"",
         f"权重最高的特征证据:",
     ]

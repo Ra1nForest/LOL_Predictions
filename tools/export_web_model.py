@@ -14,6 +14,7 @@ Python、推理在 JS, 等于特征构造有了两份实现 —— 正是 CLAUDE
 期望值一律走线上的真函数, 不在这里另写一份:
   · 局内特征 / 概率 / 警告   ingame_service.IngameModel (make_row / predict)
   · 局内整条响应             api._ingame_core (看板头条和走势图每个点都用它)
+  · 看板的去抖读数           IngameModel.dechattered + api._ingame_core(dechatter=True) (闸门 G3)
   · 赛前整条响应             api.predict (POST /predict)
   · 赛前 9 项                api._pre_context
   · 数据范围                 api.DATA (五年列表, 和服务同一份 —— 见 CLAUDE.md)
@@ -24,14 +25,20 @@ explain.py 改一句话, 重新导出就跟上了。
 
 产物:
   frontend/public/web/ingame_live.json     局内模型 (树) + 保序表 + 阵容强势期表
-  frontend/public/web/stage1_pre.json      赛前模型 (树) + Platt 系数
-  frontend/public/web/stage2_post.json     BP 后模型 (树) + Platt + 英雄/选手-英雄的胜场场数表
+  frontend/public/web/stage1_pre.json      赛前模型 (树) + 校准层 (calibrator: logit_elo 的系数和常数;
+                                           旧文件是 Platt, 兼容 Platt 的 a / b 一直都在)
+  frontend/public/web/stage2_post.json     BP 后模型 (树) + 校准层 + 英雄/选手-英雄的胜场场数表
   frontend/public/web/teams.json           每队一行的滚动统计 (含母赛区) + 各赛区已知队伍及其并集 + 队名别名
+                                           + 赛区内 Elo 各池的状态 (elo: 评分、池子最后一年、池均值)
   frontend/public/web/explain.json         explain.py 的文案表
   frontend/public/web/xregion.json         跨赛区模型 C 的状态 (artifacts/xregion.json 原样, 过 sanity_check 才导出)
-  frontend/scripts/golden/ingame_cases.json    黄金用例 (不发布)
-  frontend/scripts/golden/stage1_cases.json
-  frontend/scripts/golden/stage2_cases.json
+  frontend/scripts/golden/ingame_cases.json    黄金用例 (不发布)。每条另带 cal_dc (看板去抖后的局内读数,
+                                               未舍入); 带整条响应的另带 resp_dc (看板的调法 + dechatter=True);
+                                               顶层 dechatter_shifts = ingame_service.DECHATTER_SHIFTS
+  frontend/scripts/golden/stage1_cases.json    POST /predict 的整条响应 (+ 每组对阵的 elo_gap 和未取整的
+                                               校准后概率 cal), 另有 elo (FeatureStore.elo_gap, 含跨年回归)、
+                                               explain_elo (Elo 那句话) 和 fdlibm (可移植的 log / exp) 三张小表
+  frontend/scripts/golden/stage2_cases.json    BP 后: 名字对齐、特征向量、elo_gap、概率
   frontend/scripts/golden/intl_cases.json      国际赛: pregame_league / _known_for / map_team,
                                                以及看板的 _pregame_reason / _early_prediction (开局
                                                头 3 分钟, test:diff 碰不到) / _board_warnings /
@@ -155,8 +162,31 @@ def export_ingame(ig) -> dict:
         "metrics": {"accuracy": m.get("accuracy"), "ece": m.get("ece"),
                     "per_T": m.get("per_T")},
         "trained_through": ig.trained_through,
+        # G2 的服务模型 (calib 的 serving_fit, 原样): 免责声明据此换措辞 (api._ingame_disclaimer), 研究脚本
+        # (research/gate_dechatter.mjs 等) 据此拒绝拿线上文件在它拟合过的日期上打分。旧文件是 None
+        "serving_fit": ig.serving_fit,
         "exported_at": _now(),
     }
+
+
+def _calib(s) -> dict:
+    """校准层, 取 api.Stage 读到的那份: 兼容 Platt 的 a / b (旧文件里它就是校准层本身), logit_elo 的系数和
+    常数 (见 train.py 的文档)。
+
+    **calibrator 永远写 "platt"**, logit_elo 由 logit_elo 段在不在决定 —— 和 calib 文件留着 coef / intercept
+    同一个道理: 新导出发布那一刻, 已经打开、还没加载过模型的标签页跑的是旧 bundle, 旧版 loadStage1 见到
+    calibrator 不是 "platt" 就抛错, 而 static-api 的 models() 把四个模型一起加载, 局内看板也跟着挂掉, 直到刷新。
+    写 "platt" 时旧代码读兼容 Platt 照常出数 (和旧版服务读新 calib 一样)。新代码 (stage1.ts 的 loadStage1)
+    只看 logit_elo 段。"""
+    out = {"calibrator": "platt", "platt": {"a": float(s.a), "b": float(s.b)}}
+    if s.logit_elo is not None:
+        le = s.logit_elo
+        out["logit_elo"] = {"coef": [float(v) for v in le["coef"]], "intercept": float(le["intercept"]),
+                            "logit_clip": float(le["logit_clip"]), "elo_scale": float(le["elo_scale"]),
+                            "elo_weight": float(le["elo_weight"]), "elo": dict(le["elo"])}
+        if le.get("elo_sd") is not None:
+            out["logit_elo"]["elo_sd"] = float(le["elo_sd"])
+    return out
 
 
 def export_stage1(s1, model_keys) -> dict:
@@ -167,8 +197,7 @@ def export_stage1(s1, model_keys) -> dict:
         "base_score": base,
         "trees": trees,
         "importance": {k: float(v) for k, v in s1.importance.items()},
-        "calibrator": "platt",
-        "platt": {"a": float(s1.a), "b": float(s1.b)},
+        **_calib(s1),
         "metrics": {k: s1.metrics[k] for k in model_keys if k in s1.metrics},
         "exported_at": _now(),
     }
@@ -203,8 +232,7 @@ def export_stage2(s2, store, model_keys) -> dict:
         "base_score": base,
         "trees": trees,
         "importance": {k: float(v) for k, v in s2.importance.items()},
-        "calibrator": "platt",
-        "platt": {"a": float(s2.a), "b": float(s2.b)},
+        **_calib(s2),
         "metrics": {k: s2.metrics[k] for k in model_keys if k in s2.metrics},
         "champion_alias": dict(CHAMP_ID_ALIAS),
         "champ_league": champ,
@@ -247,9 +275,27 @@ def export_teams(store) -> dict:
         "known_all": store.known_teams(None),
         "league_last": {lg: str(pd.Timestamp(d).date()) for lg, d in store.league_last.items()},
         "aliases": dict(TEAM_ALIASES),
+        "elo": export_elo(store),
         "data_through": str(store.last_date.date()),
         "generated_at": _now(),
     }
+
+
+def export_elo(store) -> dict:
+    """赛区内 Elo 的状态 (FeatureStore.elo_pools = 库里全部比赛之后), 浏览器版 stage1.ts 的 eloRating 读它。
+
+    每个池: year = 最后一个比赛日的年份, mean = 池内均值 (Python 这边 np.mean 算好的那个数 —— JS 不重算,
+    np.mean 的成对求和顺序没必要再移植一遍), teams = 队 → [评分, 在这个池里最后一场的日期]。请求年份晚于
+    year 就向 mean 回归 0.5^(差几年), 和 feature_store.elo_rating 同一行算术。常数 k / init 只作记录,
+    regress 和 init 浏览器版要用。队名不是字符串的 (OE 偶尔缺队名) 不导出: 请求里的队名总是字符串, 查不到它们。
+    """
+    from feature_store import ELO_COL, ELO_INIT, ELO_K, ELO_REG
+    pools = {}
+    for lg, p in store.elo_pools.items():
+        pools[lg] = {"year": int(p["year"]), "mean": float(p["mean"]),
+                     "teams": {t: [float(r), str(pd.Timestamp(p["last"][t]).date())]
+                               for t, r in p["ratings"].items() if isinstance(t, str)}}
+    return {"column": ELO_COL, "k": ELO_K, "init": ELO_INIT, "regress": ELO_REG, "pools": pools}
 
 
 def export_explain() -> dict:
@@ -265,6 +311,8 @@ def export_explain() -> dict:
         "role_cn": [[k, v] for k, v in EX.ROLE_CN.items()],
         "skip_in_reasons": sorted(EX.SKIP_IN_REASONS),
         "tone": [[th, t] for th, t in EX.TONE],
+        # 赛区内 Elo 的两句 (差值句式, 持平句式), 见 explain.ELO
+        "elo": list(EX.ELO),
     }
 
 
@@ -309,28 +357,38 @@ def _pre_for(api, cache, inp):
 
 def _expect(ig, api, cache, inp) -> dict:
     pre = _pre_for(api, cache, inp)
-    m, warns = ig.make_row(
-        minute=inp["minute"], golddiff=inp["golddiff"], xpdiff=None,
-        csdiff=inp["csdiff"], blue_kills=inp["blue_kills"], red_kills=inp["red_kills"],
-        gold_total=inp["gold_total"], blue_champs=inp["blue_champs"],
-        red_champs=inp["red_champs"], pre_row=pre, league=inp["league"])
+    kw = dict(minute=inp["minute"], xpdiff=None,
+              csdiff=inp["csdiff"], blue_kills=inp["blue_kills"], red_kills=inp["red_kills"],
+              gold_total=inp["gold_total"], blue_champs=inp["blue_champs"],
+              red_champs=inp["red_champs"], pre_row=pre, league=inp["league"])
+    m, warns = ig.make_row(golddiff=inp["golddiff"], **kw)
     # 和 IngameModel.predict() 里组向量的两行一字不差
     x = np.array([[float(m.get(f, np.nan)) for f in ig.features]])
     x = np.nan_to_num(x, nan=-999.0)
     raw, cal = ig.predict(m)
+    # 看板的去抖读数 (闸门 G3): 和 api._ingame_core(dechatter=True) 同一个调法 —— 挪过的行由 make_row 重组
+    cal_dc = ig.dechattered(lambda d: ig.make_row(golddiff=inp["golddiff"] + d, **kw)[0])
     return {"T": int(m["T"]), "x": [float(v) for v in x[0]],
-            "raw": float(raw), "cal": float(cal), "warnings": list(warns),
+            "raw": float(raw), "cal": float(cal), "cal_dc": float(cal_dc), "warnings": list(warns),
             "has_pre": pre is not None}
 
 
-def _ingame_resp(api, inp) -> dict:
+def _ingame_resp(api, inp, dechatter=False) -> dict:
     """api._ingame_core 的真实输出 —— 看板头条调它的方式 (不带 pre_ctx)。include_pregame 默认
     True; 国际赛用例另带 include_pregame=False (不带赛前特征) 或 pre_league (赛前特征按母赛区算)。
-    带 blend_with 的 (跨赛区模型 C 当开局渐变的锚) 按看板的调法: blend=True, blend_with=那个数。"""
+    带 blend_with 的 (跨赛区模型 C 或 BP 后当开局渐变的锚) 按看板的调法: blend=True, blend_with=那个数。
+
+    dechatter=True 是**看板**的调法 (esports_board 的三条分支, 闸门 G3 的去抖): 带赛前特征的一律
+    blend=True (blend_with 没给 = None, 锚退回赛前概率); 不带赛前特征的只在有 blend_with (C) 时渐变。
+    不去抖的那份保持原样 (= /predict/ingame 的口径, 老用例一个字节不变)。"""
     st = api.IngameState(minute=inp["minute"], golddiff=inp["golddiff"], xpdiff=None,
                          csdiff=inp["csdiff"], blue_kills=inp["blue_kills"],
                          red_kills=inp["red_kills"], gold_total=inp["gold_total"])
-    kw = {"blend": True, "blend_with": inp["blend_with"]} if "blend_with" in inp else {}
+    if dechatter:
+        blend = inp.get("include_pregame", True) or "blend_with" in inp
+        kw = {"blend": blend, "blend_with": inp.get("blend_with"), "dechatter": True}
+    else:
+        kw = {"blend": True, "blend_with": inp["blend_with"]} if "blend_with" in inp else {}
     out, _row = api._ingame_core(inp["blue"], inp["red"], inp["league"], st,
                                  inp["blue_champs"], inp["red_champs"],
                                  inp.get("include_pregame", True),
@@ -424,6 +482,12 @@ def synthetic_inputs(base: dict) -> list[tuple[str, dict]]:
     out.append(v("swap", blue=base["red"], red=base["blue"],
                  blue_champs=base["red_champs"], red_champs=base["blue_champs"],
                  golddiff=-base["golddiff"]))
+    # 国内看板以 BP 后概率为锚渐变 (blend_with): 去抖之后再渐变, 15 分钟起权重到 1
+    for mn in (3, 8, 14.99, 15, 22):
+        out.append(v(f"BP后锚@{mn}", minute=mn, blend_with=0.6123456789012345))
+    # 去抖跨过经济差 0 和大领先 (9 个挪动量里一部分顶到保序表两端)
+    for gd in (-120, 120, 9000, 15000):
+        out.append(v(f"去抖:golddiff={gd}", golddiff=gd, minute=28))
     return out
 
 
@@ -974,9 +1038,18 @@ def stage1_cases(api, store) -> list[dict]:
     def run(b, r, lg, po=False):
         inp = {"blue_team": b, "red_team": r, "league": lg, "playoffs": po}
         try:
-            return {"in": inp, "resp": _jsonable(api.predict(api.PredictRequest(**inp)))}
+            out = {"in": inp, "resp": _jsonable(api.predict(api.PredictRequest(**inp)))}
         except HTTPException as e:
             return {"in": inp, "status": e.status_code, "error": e.detail}
+        # 校准层的第二个输入 —— 响应里只有取整后的概率和一句话, 差一点点看不出来; 这一格逐位核对。
+        # 取自 make_row (api.predict 用的同一行), 不另算
+        row = store.make_row(b, r, lg, playoffs=int(po))[0]
+        out["elo_gap"] = float(row["elo_gap"])
+        # 未取整的校准后概率 (看板的赛前 / BP 后就是不取整输出的): 校准层的 exp / log 两边都是 fdlibm 的移植,
+        # 这一格要逐位相同 —— 用平台的 exp / log 时约 4.5% 差一位, 响应里取整到 4 位看不出来
+        # raw 一起存: 树 (float32) 两边一样时, 校准层必须一个比特都不差 —— golden.mjs 按这个判
+        out["raw"], out["cal"] = (float(v) for v in api.STATE["stages"]["pre_draft"].predict(row))
+        return out
 
     k = {lg: store.known_teams(lg) for lg in LEAGUES}
     out = []
@@ -1005,6 +1078,63 @@ def stage1_cases(api, store) -> list[dict]:
     for t in extra:
         out.append(run(t, k["LPL"][0], "LPL"))
     return out
+
+
+def elo_cases(store) -> list[dict]:
+    """赛区内 Elo 差: FeatureStore.elo_gap(蓝, 红, 赛区, year=请求年份) 逐位核对 (web/stage1.ts 的 eloGap)。
+
+    年份取池子最后一年的前一年 / 当年 / 后一年 / 后三年 —— 晚于池子的年份要补跨年回归, 早于或等于的不补;
+    另有别的赛区的队 (不在这个池里 = 1500, 不回归)、不认识的队、不存在的池。
+    格式: {"in": [blue, red, league, year], "out": 蓝减红}。
+    """
+    from feature_store import LEAGUES
+    out = []
+    for lg in LEAGUES:
+        pool = store.elo_pools.get(lg)
+        if not pool:
+            continue
+        ts = [t for t in store.known_teams(lg) if t in pool["ratings"]][:4]
+        other = next(t for o in LEAGUES if o != lg for t in store.known_teams(o) if t not in pool["ratings"])
+        y0 = int(pool["year"])
+        for yr in (y0 - 1, y0, y0 + 1, y0 + 3):
+            for b, r in ((ts[0], ts[1]), (ts[2], ts[3]), (ts[1], ts[0]), (ts[0], other), (other, ts[0]),
+                         ("Definitely Not A Team", ts[2]), (ts[2], ts[2])):
+                out.append({"in": [b, r, lg, yr], "out": float(store.elo_gap(b, r, lg, year=yr))})
+    for lg in ("LTA", "Worlds", ""):
+        k = store.known_teams("LCK")
+        out.append({"in": [k[0], k[1], lg, 2026], "out": float(store.elo_gap(k[0], k[1], lg, year=2026))})
+    return out
+
+
+def fdlibm_cases() -> dict:
+    """可移植的 log / exp (fdlibm.py ↔ web/fdlibm.ts) 本身: Stage 1/2 的校准层要求逐位相同, 先核对函数。
+
+    log 取校准层真正会遇到的 q/(1-q) (q ∈ [1e-7, 1-1e-7]), 外加两端、次正规数、负数、0 (输入不放 inf: JSON 存不了);
+    exp 取校准层的 -z。格式: {"log": [{"in", "out"}], "exp": [...]}; inf / nan 存成字符串 (JSON 没有)。
+    """
+    import math
+    import random
+    import fdlibm
+    rng = random.Random(17)
+    enc = lambda v: v if math.isfinite(v) else repr(v)     # 'inf' / '-inf' / 'nan'
+    qs = [1e-7, 1 - 1e-7, 0.5, 0.25, 0.75, 1e-3, 0.999]
+    qs += [rng.uniform(1e-7, 1 - 1e-7) for _ in range(1500)]
+    xs = [q / (1 - q) for q in qs]
+    xs += [1.0, 2.0, 1 + 2 ** -52, 1 - 2 ** -53, 1 + 2 ** -21, 1 - 2 ** -21, 0.7071067811865476, 1.4142135623730951,
+           5e-324, 2.2250738585072014e-308, 1.7976931348623157e308, 1e-300, 1e300, 0.0, -0.0, -1.0]
+    xs += [10 ** rng.uniform(-300, 300) for _ in range(500)]
+    zs = [rng.uniform(-12, 12) for _ in range(1500)] + [0.0, -0.0, 1.0, -1.0, 40.0, -40.0, 709.0, -745.0]
+    return {"log": [{"in": x, "out": enc(fdlibm.log(x))} for x in xs],
+            "exp": [{"in": z, "out": enc(fdlibm.exp(z))} for z in zs]}
+
+
+def explain_elo_cases() -> list[dict]:
+    """explain.explain("elo_gap", v, 蓝, 红) 的那句话: 取整后为 0 说"相当", 五成双的边界, 正负号。
+    格式: {"in": [v, blue, red], "out": 句子}。"""
+    import explain as EX
+    vals = [0.0, -0.0, 0.4, 0.5, -0.5, 0.5000001, 1.5, 2.5, -2.5, 99.5, 250.49, -1234.5, 1e-9, 37.25, -61.0]
+    return [{"in": [v, "Blue Team", "Red Team"], "out": EX.explain("elo_gap", v, "Blue Team", "Red Team")}
+            for v in vals]
 
 
 def stage2_cases(api, store) -> dict:
@@ -1050,6 +1180,8 @@ def stage2_cases(api, store) -> dict:
                 x = np.nan_to_num(np.array([[float(row.get(f, np.nan)) for f in s2.features]]),
                                   nan=-999.0)
                 c["x"] = [float(v) for v in x[0]]
+                # 校准层的第二个输入 (不在树的向量里), 逐位核对
+                c["elo_gap"] = float(row["elo_gap"])
             except Exception as e:
                 c["error"] = str(e)
         return c
@@ -1181,23 +1313,32 @@ def main():
         # 两队都得有名字 —— 看板只对 predictable 的比赛调局内模型
         if inp["blue"] and inp["red"] and (src.startswith("syn:") or i % 5 == 0):
             c["resp"] = _ingame_resp(api, inp)
+            # 同一条输入按看板的调法再来一份 (去抖 + 看板的渐变口径), 见 _ingame_resp
+            c["resp_dc"] = _ingame_resp(api, inp, dechatter=True)
             n_resp += 1
         cases.append(c)
+    from ingame_service import DECHATTER_SHIFTS
     n = _write(OUT_GOLD / "ingame_cases.json", {
         "generated_at": _now(), "today": today, "features": list(ig.features),
+        "dechatter_shifts": list(DECHATTER_SHIFTS),
         "n_real": len(real), "n_synthetic": len(syn), "cases": cases})
     games = {c["src"].split("@")[0] for c in cases if not c["src"].startswith("syn:")}
     print(f"  ingame_cases.json  {n / 1024:>6,.0f} KB   真实 {len(real)} 条 ({len(games)} 局)  "
-          f"合成 {len(syn)} 条  其中带整条响应 {n_resp} 条")
+          f"合成 {len(syn)} 条  其中带整条响应 {n_resp} 条 (各另带一份看板去抖的)")
 
     s1c = stage1_cases(api, store)
-    n = _write(OUT_GOLD / "stage1_cases.json", {"generated_at": _now(), "today": today, "cases": s1c})
+    ge, gx, gf = elo_cases(store), explain_elo_cases(), fdlibm_cases()
+    n = _write(OUT_GOLD / "stage1_cases.json", {"generated_at": _now(), "today": today, "cases": s1c,
+                                                "calibrator": s1.calibrator, "elo": ge, "explain_elo": gx,
+                                                "fdlibm": gf})
     print(f"  stage1_cases.json  {n / 1024:>6,.0f} KB   {len(s1c)} 组对阵 "
-          f"(其中 {sum('error' in c for c in s1c)} 组预期报错)")
+          f"(其中 {sum('error' in c for c in s1c)} 组预期报错)  校准 {s1.calibrator}  "
+          f"Elo 差 {len(ge)} 条  Elo 那句话 {len(gx)} 条  fdlibm log {len(gf['log'])} / exp {len(gf['exp'])} 条")
 
     g2 = stage2_cases(api, store)
     n = _write(OUT_GOLD / "stage2_cases.json", {"generated_at": _now(), "today": today,
-                                                "features": list(s2.features), **g2})
+                                                "features": list(s2.features),
+                                                "calibrator": s2.calibrator, **g2})
     c2 = g2["cases"]
     print(f"  stage2_cases.json  {n / 1024:>6,.0f} KB   {len(c2)} 局阵容, 其中 "
           f"{sum('p2' in c for c in c2)} 局算出 BP 后概率、{sum(not c['draft'] for c in c2)} 局凑不齐十人、"

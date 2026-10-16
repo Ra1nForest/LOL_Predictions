@@ -14,6 +14,7 @@ live 变体)。胜率走势图因此在前 3 分钟是一段平线, 第 3 分钟
 胜负), 只取四大赛区, 并且**同时落在两个模型的测试段里**: Stage 2 是 train.py 按日期留出的最后 20%,
 Stage 4 是 ingame_model.split_by_game 按日期留出的最后 20%。用现在的数据重切一次得到的测试段只会
 更靠后 (数据只增不减), 所以一定是两份线上模型都没见过的比赛。
+(G2 之前的线上文件才成立: G2 起 Stage 4 存盘的是服务模型, 考卷那段它拟合时见过; 脚本里 ingame_train.require_unseen 会拒绝)。
 快照从第 5 分钟才开始 (backfill_late 当时认为 5 分钟前没信息量), 0-4 分钟这里从帧补取,
 缓存到 backfill/early_snapshots.jsonl, 重跑不再联网。
 
@@ -140,6 +141,9 @@ def main():
 
     print("[4/5] 逐局逐分钟算两个概率")
     live = IngameModel("_live")
+    # G2 之后线上 Stage 4 是服务模型, 考卷那段它拟合时见过 —— 样本内打分不报错, 只会偏乐观 (见 ingame_train.require_unseen)
+    from ingame_train import require_unseen
+    require_unseen(live, te4["date"].min(), "gate_early_minutes")
     s1, s2 = api.Stage("pre_draft"), api.Stage("post_draft")
     recs, flipped, no_early = [], 0, 0
     for gid, g in bf.groupby("game_id"):

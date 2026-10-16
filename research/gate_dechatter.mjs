@@ -18,7 +18,7 @@
  *         候选那一路是在这里按 curveCtx / curveProb 重搭的; 挪动量全取 0 时必须和基线**逐点相等**,
  *         否则整个对比不作数 (脚本里有这条自检, 不等就退出)。
  *   考卷  backfill/snapshots.jsonl 里四大赛区 + 国际赛 (feed.LEAGUE_IDS 里四大之外的那几个) 的局,
- *         日期 ≥ 2026-01-15 —— Stage 4 的测试段, 树和保序表都没见过。洗牌和 gate_smoothing 是同一个
+ *         日期 ≥ 2026-01-15 —— Stage 4 的测试段, 树和保序表都没见过 (G2 之前的导出才成立, 见 requireUnseen)。洗牌和 gate_smoothing 是同一个
  *         LCG, seed 1, 取前 160 局; 帧取不到、第 3 分钟起不到 300 个点的跳过 (同 gate_smoothing)。
  *         每局第 3 分钟起的每一个逐秒点都算。
  *   看板口径 (boardPlan)  四大 / 同母赛区的国际赛: 带赛前特征, 渐变的锚 = 赛前 (Stage 1) 概率 ——
@@ -32,7 +32,10 @@
  *   次要  每局无事件的 ≥4pp / ≥2pp 跳变次数 (事件 = 相邻两点之间人头、塔、龙、大龙、水晶任何一项有变化);
  *         逐分钟回填上的同一个候选 (Python, research/gate_dechatter_backfill.py); 9 倍树求值的 CPU 成本。
  *
- *     node research/gate_dechatter.mjs [--games 160] [--seed 1] [--cache DIR] [--out per_game.json]
+ *     node research/gate_dechatter.mjs [--games 160] [--seed 1] [--cache DIR] [--out per_game.json] [--ingame FILE]
+ *
+ * --ingame FILE: 局内模型用这份导出, 不用 public/web/ingame_live.json。G2 之后那份是服务模型, 考卷那段它拟合时
+ * 见过, 脚本会拒绝 (requireUnseen) —— 复现时指向 G2 之前的导出。
  *
  * --cache DIR: 把 feed.lolesports.com 的 200/204 响应存到 DIR (打完的局, 帧不会再变), 重跑不再打上游。
  *
@@ -54,6 +57,10 @@
  *   CPU (本机 Node 24, 单线程, 平均每局 1771 个逐秒点, 不含取帧): 现在整条走势 252 ms (每点 142 µs,
  *   大头是组响应和文案); 概率算 1 次 40 µs/点, 9 次 341 µs/点 —— 每局多 533 ms, 整条走势的计算约 ×3.1。
  *   直播中每秒新增一个点, 多约 0.3 ms。
+ *
+ * **已上线 (2026-10-17):** api._ingame_core(dechatter=True) / web ingameResponse({dechatter: true}), 只在看板上
+ * (头条、曲线、逐秒走势、直播回放), 9 个挪动量和求和顺序同这里 (ingame_service.DECHATTER_SHIFTS)。上线之后
+ * fineTimeline 默认就是候选那一路, 所以这里的基线显式传 dechatter: false —— 重跑仍是"上线之前的看板 vs 候选"。
  */
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -112,7 +119,25 @@ function cachedFetch(dir) {
 
 const J = (n) => JSON.parse(readFileSync(path.join(ROOT, "frontend", "public", "web", n), "utf8"));
 const teams = J("teams.json");
-const models = { ingame: loadIngame(J("ingame_live.json")), s1: loadStage1(J("stage1_pre.json")), s2: loadStage2(J("stage2_post.json")), ex: J("explain.json") };
+/**
+ * ingame_train.require_unseen 的同一道检查: G2 起 public/web/ingame_live.json 导出的是 Stage 4 的服务模型 (带
+ * serving_fit), 截至 serving_fit.iso.through 的每一局它拟合时都见过 —— 拿它在那之前的局上打分是样本内, 不报错,
+ * 只偏乐观。复现上线前的结论: --ingame 指向 G2 之前的导出, 例如
+ *   git show 203c887:frontend/public/web/ingame_live.json > old_ingame_live.json
+ */
+function requireUnseen(file, firstDay, who) {
+  const sf = file.serving_fit;
+  if (sf && firstDay <= sf.iso.through) {
+    console.error(
+      `${who}: 这份局内模型是 G2 的服务模型, 拟合时见过截至 ${sf.iso.through} 的每一局 (树 ${sf.trees.from}~${sf.trees.through}, ` +
+        `保序表 ${sf.iso.from}~${sf.iso.through}); 考卷从 ${firstDay} 开始, 是样本内打分。用 --ingame 指向 G2 之前的导出`,
+    );
+    process.exit(2);
+  }
+}
+const ingameFile = opt("ingame", null) ? JSON.parse(readFileSync(opt("ingame", null), "utf8")) : J("ingame_live.json");
+requireUnseen(ingameFile, SINCE, "gate_dechatter");
+const models = { ingame: loadIngame(ingameFile), s1: loadStage1(J("stage1_pre.json")), s2: loadStage2(J("stage2_post.json")), ex: J("explain.json") };
 const today = new Date().toISOString().slice(0, 10);
 
 // ── 考卷 (同 gate_smoothing 的取法) ──────────────────────────
@@ -192,7 +217,7 @@ async function one(g) {
   let pts = [];
   try {
     await fineTimeline(feed, teams, models, today,
-      { gameId: g.id, blue: plan.blue, red: plan.red, league: plan.league, preLeague: plan.preLeague, upto: g.last + 60_000, prior: null, xr: plan.xr },
+      { gameId: g.id, blue: plan.blue, red: plan.red, league: plan.league, preLeague: plan.preLeague, upto: g.last + 60_000, prior: null, xr: plan.xr, dechatter: false },
       (p) => { pts = p; });
   } catch (e) {
     skipped.frames++;

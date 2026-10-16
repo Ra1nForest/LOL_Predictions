@@ -92,13 +92,18 @@ def log_prediction(*, match_id, game_id, league, blue, red, probability_blue,
                    golddiff=None, blue_kills=None, red_kills=None,
                    ingame_probability_blue=None, blend_weight=None,
                    anchor_probability_blue=None, anchor_source=None,
-                   trained_through=None):
+                   trained_through=None, dechatter=None):
     """记一条。任何异常都不往外抛 —— 这是旁路, 不能拖垮预测接口。
 
-    后五个参数 (2026-10-17 加) 都可以不给, 不给就记 None —— 老的调用方式照旧能用:
+    后六个参数 (2026-10-17 加) 都可以不给, 不给就记 None —— 老的调用方式照旧能用:
       ingame_probability_blue  局内模型自己的数 (渐变之前)。看板第 3-15 分钟记的 probability_blue 是
                                渐变后的 (api._blend_prior), 拿它和留出集 (局内模型自己的数) 比不是同一个
                                口径; 没渐变时它就等于 probability_blue。赛前/BP 后那条为 None。
+                               dechatter 为 True 时它是**去抖后**的读数 (见下)
+      dechatter                True = 这条局内数是经济差 ±200 邻域 9 点平均过的 (看板的去抖, 闸门 G3,
+                               ingame_service.DECHATTER_SHIFTS), 渐变也是在去抖之后做的。留出集的 per_T 是
+                               单点读数, 两者不是同一个口径 —— 这一列就是为了事后分得开。None = 没说
+                               (更早的行、赛前/BP 后那条)
       blend_weight             局内模型在渐变里的权重 (0-1); None = 没渐变 (没有锚, 或不是局内那条)
       anchor_probability_blue  渐变的锚 (蓝方概率)
       anchor_source            锚从哪来: post_draft | pre_draft | xregion | None
@@ -131,12 +136,13 @@ def log_prediction(*, match_id, game_id, league, blue, red, probability_blue,
                 "slice_used": slice_used,
                 "golddiff": golddiff,
                 "blue_kills": blue_kills, "red_kills": red_kills,
-                # 2026-10-17 起才有的五个键, 含义见本函数的文档。更早的行没有它们 —— 读的地方一律 .get
+                # 2026-10-17 起才有的六个键, 含义见本函数的文档。更早的行没有它们 —— 读的地方一律 .get
                 "ingame_probability_blue": _r4(ingame_probability_blue),
                 "blend_weight": _r4(blend_weight),
                 "anchor_probability_blue": _r4(anchor_probability_blue),
                 "anchor_source": anchor_source,
                 "trained_through": trained_through,
+                "dechatter": None if dechatter is None else bool(dechatter),
                 "y": None,                     # 事后由 --resolve 回填
             }
             LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -331,6 +337,10 @@ def score():
         print(f"\n按固定时刻 (每局一条; 读不到 {INGAME_CALIB.name}, 不和留出集对照):")
     print("  第 3-15 分钟的线上数是渐变后的 (2026-09-13 起, api._blend_prior), 留出是局内模型自己的数; "
           "2026-10-17 起的记录另存了渐变前的读数, 有的话下面\"其中\"那一行拿它对照。")
+    nd = sum(1 for r in rows if r.get("dechatter"))
+    if nd:
+        print(f"  其中 {nd} 条 (dechatter=true) 的局内数是经济差 ±200 邻域平均过的 (看板去抖, 闸门 G3), "
+              "留出是单点读数 —— 去抖只为显示, 闸门上不显著变差 (方向是变好), 不是同一个口径。")
     for T in (10, 15, 20, 25):
         best = {}
         for i, r in enumerate(rows):

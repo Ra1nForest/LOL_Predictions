@@ -378,9 +378,16 @@ export class Feed {
     throw new FeedError(`${url} 取数失败: ${last}`);
   }
 
+  /**
+   * esports_feed.PINNED_NOW: 只给差分测试用 (scripts/diff-board.mjs) —— 钉住 lagged 不带 at 时的"此刻", 让
+   * 浏览器版和 Python 参照程序请求同一批 startingTime。打完的局, 不同 startingTime 拿到的终局帧不一样
+   * (esports_feed 模块顶部第 6 条), 两边各按各的时钟就会取到不同的终局经济。线上永远是 null
+   */
+  static pinnedNow: number | null = null;
+
   /** _lagged: 对齐 10 秒后再减 lag */
   static lagged(lagSec: number, at?: number): string {
-    const t = Math.floor((at ?? Date.now()) / 10_000) * 10_000;
+    const t = Math.floor((at ?? Feed.pinnedNow ?? Date.now()) / 10_000) * 10_000;
     return new Date(t - lagSec * 1000).toISOString().slice(0, 19) + "Z";
   }
 
@@ -543,8 +550,8 @@ export class Feed {
   }
 
   /**
-   * esports_feed.final_frame: 一局打完之后的终局帧。只对比分已经算上的局调 (= 确实打完了); 打完之后任何
-   * 更晚的 startingTime 都返回同一批冻结帧, 所以用当前的 lagged(60), 落空再试 300。蓝方是哪队取帧自己的
+   * esports_feed.final_frame: 一局打完之后的终局帧。只对比分已经算上的局调 (= 确实打完了); 打完之后更晚的
+   * startingTime 都返回终局附近的冻结帧 (末帧随 startingTime 前后差一两秒), 所以用当前的 lagged(60), 落空再试 300。蓝方是哪队取帧自己的
    * gameMetadata (和 frameSides 同一个理由)。帧已经 finished、或最后一帧停在 10 分钟以前, 就按 gameId 记住。
    */
   async finalFrame(gameId: string): Promise<FinalFrame | null> {
@@ -750,7 +757,9 @@ export class Feed {
     gameId: string,
     opts: { at?: number; fallbackLags?: number[]; preciseMinute?: boolean } = {},
   ): Promise<LiveState | null> {
-    const at = opts.at;
+    // 钉住了"此刻" (Feed.pinnedNow, 只在差分测试里) 就当成查那个历史时刻, 不走自适应 lag —— 它按真实时钟
+    // 试探, 两边节奏不同会用上不同的 lag (= 不同的 startingTime)。同 esports_feed.window
+    const at = opts.at ?? Feed.pinnedNow ?? undefined;
     const fallback = opts.fallbackLags ?? FALLBACK_LAGS;
     const now = Date.now();
     if (at === undefined) {

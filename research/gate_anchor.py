@@ -18,7 +18,7 @@
   C2 渐变       logit p = (1-w) logit(BP 后) + w logit(局内), w 从第 3 分钟的 0 线性升到第 15 分钟的 1
 
 考卷和 gate_early_minutes 一样: 532 局左右四大赛区比赛, 同时落在 Stage 2 和 Stage 4 的按日期留出
-测试段里, 两份线上模型都没见过; 0-4 分钟来自 backfill/early_snapshots.jsonl, 5 分钟起来自
+测试段里, 两份线上模型都没见过 (G2 之前的线上文件才成立: G2 起 Stage 4 存盘的是服务模型, 考卷那段它拟合时见过; 脚本里 ingame_train.require_unseen 会拒绝); 0-4 分钟来自 backfill/early_snapshots.jsonl, 5 分钟起来自
 backfill/snapshots.jsonl, 一直到终局。分钟段内每局取平均损失, 和 C0 逐局配对; 另把考卷按日期
 切 5 段按段配对。|t| > 2.5 才算数。另报"第 2 -> 3 分钟"这一步平均跳多少, 量连续性。
 
@@ -93,6 +93,9 @@ def main():
 
     print("[2/3] 逐局逐分钟算三种")
     live = IngameModel("_live")
+    # G2 之后线上 Stage 4 是服务模型, 考卷那段它拟合时见过 —— 样本内打分不报错, 只会偏乐观 (见 ingame_train.require_unseen)
+    from ingame_train import require_unseen
+    require_unseen(live, te4["date"].min(), "gate_anchor")
     s2 = api.Stage("post_draft")
     recs, flipped = [], 0
     for gid, g in bf.groupby("game_id"):

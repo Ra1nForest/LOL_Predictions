@@ -63,6 +63,11 @@ export interface IngameModelFile extends TreeModelFile {
     per_T?: Record<string, { accuracy?: number; n?: number; high_conf_share?: number }> | null;
   };
   trained_through: string;
+  /**
+   * 闸门 G2 起存盘的是服务模型, 导出时原样带上 calib 的 serving_fit ({split, trees, iso} 各段的日期和局数);
+   * 旧导出没有这个键 —— 线上模型就是评估模型。只有免责声明的措辞和研究脚本的检查读它, 不影响概率
+   */
+  serving_fit?: { split: number[]; trees: { from: string; through: string }; iso: { from: string; through: string } } | null;
 }
 
 export interface IngameModel {
@@ -86,6 +91,8 @@ export interface IngameModel {
   hasXpdiff: boolean;
   metrics: IngameModelFile["metrics"];
   trainedThrough: string;
+  /** 线上是不是 G2 的服务模型 (metrics 出自同一配方的评估版) —— 见 disclaimer */
+  servingFit: boolean;
 }
 
 export function loadIngame(file: IngameModelFile): IngameModel {
@@ -107,6 +114,7 @@ export function loadIngame(file: IngameModelFile): IngameModel {
     hasXpdiff: file.has_xpdiff,
     metrics: file.metrics,
     trainedThrough: file.trained_through,
+    servingFit: file.serving_fit != null,
   };
 }
 
@@ -298,6 +306,28 @@ export function predictRow(model: IngameModel, row: Record<string, number>): Pre
 }
 
 /**
+ * 看板的去抖 (闸门 G3) —— ingame_service.DECHATTER_SHIFTS, 两边必须是同一张表 (test:golden 核对)。
+ * 理由和闸门结果见 Python 那边的注释: XGBoost 对经济差是分段常数, 经济差在分界线上下晃一百块胜率就跳;
+ * 在时间上平滑会滞后 (gate_smoothing), 所以在经济差的邻域上取平均 —— 只为显示, "不显著变差"过的闸,
+ * 不能说"更准"。
+ */
+export const DECHATTER_SHIFTS: readonly number[] = [-200, -150, -100, -50, 0, 50, 100, 150, 200];
+
+/**
+ * IngameModel.dechattered: 经济差挪 DECHATTER_SHIFTS 里每个量, 由 buildRow 原样重组那一行 (由经济差派生的
+ * 列全由它重算, 不另写派生公式), 各算一次**校准后**的概率, 从左到右依次相加再除以 9 —— 和 Python 那边的
+ * for 循环同一个顺序 (不是 sum() 的补偿求和, 也不是 np.mean 的两两求和, 那两种会差一个 ulp)。
+ * 总经济 goldTotal 不跟着挪。代价是 9 次树求值: 逐秒走势每点约 0.3 ms (gate_dechatter 实测)。
+ */
+export function dechatteredCal(model: IngameModel, preRow: Record<string, number> | null, inp: IngameInput): number {
+  let sum = 0;
+  for (const d of DECHATTER_SHIFTS) {
+    sum += predictRow(model, buildRow(model, preRow, { ...inp, golddiff: inp.golddiff + d }).row).cal;
+  }
+  return sum / DECHATTER_SHIFTS.length;
+}
+
+/**
  * 概率有没有真的被校准的上下限夹住 —— IngameModel.clip_warning。
  * 必须看**实际输出**, 不能按经济差猜 (那条陈旧断言在 Python 那边踩过一次)。
  */
@@ -330,7 +360,10 @@ function evidence(model: IngameModel, row: Record<string, number>, k = 6): Evide
   return out.slice(0, k);
 }
 
-/** api._ingame_disclaimer —— 数字和校准方法全部从 metrics 读, 不写死 */
+/**
+ * api._ingame_disclaimer —— 数字和校准方法全部从 metrics 读, 不写死。线上是 G2 的服务模型时 (servingFit),
+ * metrics 是同一配方评估版的成绩, 线上这份没有自己的留出成绩, 措辞跟着换 (理由见 Python 那边)
+ */
 function disclaimer(model: IngameModel): string {
   const m = model.metrics;
   const acc = m.accuracy ?? null;
@@ -339,9 +372,12 @@ function disclaimer(model: IngameModel): string {
   const how = model.calibrator === "isotonic" ? "保序回归" : "Platt";
   const bits: string[] = [];
   if (acc !== null) {
-    let s = `局内模型在留出测试集上准确率约 ${pyPct(acc, 0)}`;
+    let s = model.servingFit
+      ? `局内模型的同一配方在留出测试集上准确率约 ${pyPct(acc, 0)}`
+      : `局内模型在留出测试集上准确率约 ${pyPct(acc, 0)}`;
     if (t25 !== null) s += `, 25 分钟时约 ${pyPct(t25, 0)}`;
     bits.push(s + "。");
+    if (model.servingFit) bits.push("线上这份把那段比赛也用来拟合了, 自身没有留出成绩。");
   }
   if (ece !== null) bits.push(`概率经${how}校准 (ECE ≈ ${pyFixed(ece, 3)})。`);
   bits.push("非投注建议。");
@@ -382,6 +418,11 @@ export interface IngameArgs {
   /** 看板用: 开局那段从 blendWith (BP 后概率; 没有就赛前) 渐变过渡到局内模型, 见 blendPrior */
   blend?: boolean;
   blendWith?: number | null;
+  /**
+   * 看板用 (api._ingame_core 的 dechatter): 局内读数换成经济差 ±200 邻域的平均 (dechatteredCal),
+   * 先去抖再渐变。理由、reasons、probability_raw 仍出自没挪过的那一行。/predict/ingame 不开
+   */
+  dechatter?: boolean;
 }
 
 /** api.BLEND_FROM / BLEND_TO —— 渐变区间 (分钟), 理由见 api.py 那段注释 */
@@ -430,7 +471,7 @@ export function ingameResponse(
   }
 
   const st = a.state;
-  const b = buildRow(model, preRow, {
+  const inp: IngameInput = {
     minute: st.minute,
     golddiff: st.golddiff,
     csdiff: st.csdiff,
@@ -440,14 +481,17 @@ export function ingameResponse(
     blueChamps: a.blueChamps,
     redChamps: a.redChamps,
     league: a.league,
-  });
+  };
+  const b = buildRow(model, preRow, inp);
   warns.push(...b.warnings);
   const p = predictRow(model, b.row);
-  let cal = p.cal;
+  // 局内模型的读数: 去抖时是邻域平均 (先去抖、再渐变); probability_raw 和理由仍出自没挪过的 b / p
+  const igCal = a.dechatter ? dechatteredCal(model, preRow, inp) : p.cal;
+  let cal = igCal;
   let wBlend: number | null = null;
   if (a.blend) {
     const anchor = a.blendWith ?? preP;
-    if (anchor !== null && anchor !== undefined) [cal, wBlend] = blendPrior(anchor, p.cal, st.minute);
+    if (anchor !== null && anchor !== undefined) [cal, wBlend] = blendPrior(anchor, igCal, st.minute);
   }
   // 夹住的警告看实际输出 (渐变之后的数)
   const cw = clipWarning(model, cal);
@@ -485,9 +529,11 @@ export function ingameResponse(
     }
   }
   if (wBlend !== null) {
-    out.ingame_probability_blue = pyRound(p.cal, 4);
+    out.ingame_probability_blue = pyRound(igCal, 4);
     out.blend_weight = pyRound(wBlend, 4);
   }
+  // 同 api._ingame_core: 概率是邻域平均过的, probability_raw 却是单点的树输出
+  if (a.dechatter) out.dechattered = true;
   card.note = confidenceNote(card);
   card.range_note = rangeNote(model.pMin, model.pMax);
   out.reasons = explainEvidence(ex, evidence(model, b.row), a.blue, a.red);

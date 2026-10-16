@@ -130,12 +130,16 @@ from feature_store import (LEAGUES, MIN_ROLL_PERIODS, ROLES, ROLL_STATS, ROLL_WI
                            build_training_matrix, select_features)
 from harness import paired_t
 from multiyear_gate import data_path
-import train   # 只取 XGB 参数和 DATA。导入时 OUT.mkdir(exist_ok=True): artifacts/ 已存在, 是空操作
+import train   # 只取 DATA (B0 的 XGB 参数冻结在下面的 XGB_B0)。导入时 OUT.mkdir(exist_ok=True): artifacts/ 已存在, 是空操作
 
 # ══════════════════════════════════════════════════════════
 #  冻结的常数 (协议的一部分, 不许按结果改)
 # ══════════════════════════════════════════════════════════
 YEARS = (2022, 2023, 2024, 2025, 2026)
+# B0 的 XGB 参数 = 闸门跑的时候 train.XGB 的值。原来直接读 train.XGB; 配方 {a, d} 上线后 train.XGB 就是浅树,
+# 再读它, B0 和 B0+a 会变成同一批树、整张表悄悄换了基线 —— 所以冻结在这里 (2026-10-17, 上线时改)。
+XGB_B0 = dict(n_estimators=400, max_depth=5, learning_rate=0.04, subsample=0.8, colsample_bytree=0.7,
+              eval_metric="logloss", random_state=42, verbosity=0)
 A_PARAMS = dict(max_depth=3, learning_rate=0.03, n_estimators=300, min_child_weight=10)
 K_SHRINK = 40.0
 ELO_K, ELO_INIT, ELO_REG = 20.0, 1500.0, 0.5
@@ -658,7 +662,7 @@ def evaluate(inp, log, jobs: int, quick: bool = False):
         for (a, b_, c), arm_list in cfg_arms.items():
             X = Xs if c else Xh
             # 复核: 只有显式给了 --jobs 才覆盖线程数; 默认和 train.py 一样不传 (线程数会改变随机流, 见文档开头)
-            params = {**train.XGB, **(A_PARAMS if a else {}), **({"n_jobs": jobs} if jobs else {})}
+            params = {**XGB_B0, **(A_PARAMS if a else {}), **({"n_jobs": jobs} if jobs else {})}
             for bi, te in enumerate(blocks):
                 s_ts = dates[te[0]]
                 pool = np.flatnonzero((dates < s_ts) & (is_maj | b_))
@@ -903,7 +907,7 @@ def main():
     log("\n" + md)
     payload = {"protocol": {"A_PARAMS": A_PARAMS, "K_SHRINK": K_SHRINK, "ELO": [ELO_K, ELO_INIT, ELO_REG],
                             "EVAL_START": str(EVAL_START.date()), "N_BLOCKS": N_BLOCKS, "SEEDS": SEEDS,
-                            "TREE_FRAC": TREE_FRAC, "T_PASS": T_PASS, "T_KEEP": T_KEEP, "XGB_B0": train.XGB,
+                            "TREE_FRAC": TREE_FRAC, "T_PASS": T_PASS, "T_KEEP": T_KEEP, "XGB_B0": XGB_B0,
                             "quick": a.quick, "n_jobs": a.jobs},
                "blocks": block_meta, "build_stats": inp["build_stats"], "minor_leagues": inp["leagues"],
                "verify": verify, "runtime_s": runtime, "n_fit": n_fit, "data_fingerprint": inp["fingerprint"],

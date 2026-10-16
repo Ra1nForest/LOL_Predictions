@@ -138,6 +138,18 @@ INTERACTION = {
 INTERACTION_NOTE = ("同样的经济差, 在不同阵容下含义相反 —— "
                     "领先方若拿的是前期阵容, 优势会随时间流失。")
 
+# ══════════════════════════════════════════════════════════
+#  赛区内 Elo (elo_gap = 蓝减红, 见 feature_store 的模块文档)
+#
+#  它不在树里, 只进 Stage 1/2 的校准层 (logit_elo), 却是闸门 G1 里几乎全部收益的来源 ——
+#  理由只从树的特征重要性里挑, 就永远看不到它。api.Stage.top_evidence 把它当一条依据放进去,
+#  这里给它一句话。(差值句式, 持平句式); {who} 分高的一方, {v} 差值取整。
+#  导出到 explain.json 的 elo, 浏览器版不手抄; i18n.ts 有对应的英文模板。
+# ══════════════════════════════════════════════════════════
+
+ELO = ("{who} 的赛区内 Elo 积分高 {v} 分 (按历年胜负累计的长期实力)",
+       "双方的赛区内 Elo 积分相当")
+
 
 # ══════════════════════════════════════════════════════════
 #  格式化
@@ -198,6 +210,14 @@ def explain(name: str, value, blue: str = "蓝方", red: str = "红方"):
     # ── 时间切片 ──
     if name == "T":
         return f"按第 {int(v)} 分钟的模型切片评估"
+
+    # ── 赛区内 Elo ──
+    if name == "elo_gap":
+        shown = f"{abs(v):.0f}"
+        # 取整后是 0 的说"相当", 不说"高 0 分"
+        if shown == "0":
+            return ELO[1]
+        return ELO[0].format(who=blue if v > 0 else red, v=shown)
 
     # ── 局内实时 ──
     if name == "killsum":
@@ -372,9 +392,20 @@ def confidence_note(metrics: dict) -> str:
     return " · ".join(parts)
 
 
-def range_note(p_min, p_max) -> str:
-    """模型够不到的区间 —— 前端的死区就是这个。"""
+def range_note(p_min, p_max, bounded: bool = True) -> str:
+    """概率范围的说明。
+
+    bounded=True  校准层有硬上下限 (Platt: 原始概率在 [0, 1] 里, 输出就在 σ(b)..σ(a+b) 之间; Stage 4 的保序表
+                  夹在 clip..1-clip): 模型够不到的区间 —— 前端的死区就是这个。
+    bounded=False Stage 1/2 的 logit_elo (闸门 G1): 没有硬上下限, p_min / p_max 只是留出测试段上出现过的两端,
+                  两队 Elo 差很大时会越过它们 (2026 年同赛区的对阵约 0.3% 落在外面)。还说"只会顶到边界"就是一句
+                  陈旧的断言 —— 界面和 Stage 3 会把它当事实引用 (ingame_service.clip_warning 踩过同一个坑)。
+    浏览器版: web/explain.ts 的 rangeNote。
+    """
     if p_min is None or p_max is None:
         return ""
+    if not bounded:
+        return (f"留出测试集上该模型给出的概率在 {p_min * 100:.0f}%–{p_max * 100:.0f}% 之间。"
+                f"这不是上下限, 两队赛区内 Elo 差很大时它会给出更极端的数字。")
     return (f"该模型的概率输出被校准限制在 {p_min * 100:.0f}%–{p_max * 100:.0f}%。"
             f"超出这个范围的一边倒对局, 它只会顶到边界, 不会给出更极端的数字。")

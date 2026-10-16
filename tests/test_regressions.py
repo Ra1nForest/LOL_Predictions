@@ -3223,13 +3223,15 @@ class XregionBoard(unittest.TestCase):
         self.assertEqual(pr["warnings"][0], self.api._xregion_note([]))
         self.assertNotIn(NO_PRE_STATS, pr["warnings"])
         self.assertNotIn("postdraft_probability_blue", pr, "候选 D 没过闸: 没有 BP 后那条线")
-        # 曲线开局那段同一个锚 (和头条同一个调用)
-        pt = next(x for x in out["timeline"] if x["minute"] >= 3)
+        # 曲线开局那段同一个锚 (和头条同一个调用, 包括去抖)。取第 5 分钟: 第 3 分钟渐变权重是 0, 什么都等于锚
+        pt = next(x for x in out["timeline"] if x["minute"] >= 5)
         sd = self.api.IngameState(minute=pt["minute"], golddiff=pt["golddiff"], xpdiff=None,
                                   csdiff=2 * pt["minute"], blue_kills=pt["blue_kills"], red_kills=pt["red_kills"],
                                   gold_total=1800 * pt["minute"])
-        ref, _ = self.api._ingame_core("K1", "L1", "Worlds", sd, None, None, False, blend=True, blend_with=p)
+        ref, _ = self.api._ingame_core("K1", "L1", "Worlds", sd, None, None, False, blend=True, blend_with=p,
+                                       dechatter=True)
         self.assertEqual(pt["probability_blue"], ref["probability_blue"])
+        self.assertTrue(pr["dechattered"])
         self.assertEqual([r["source"] for r in self.logged], ["ingame"], "两队都在四大里: 局内照常留档")
 
     def test_开局头3分钟_赛前就是C并按xregion留档(self):
@@ -3554,15 +3556,15 @@ class PredictionLogContextFields(unittest.TestCase):
             base = dict(match_id="m", league="LCK", blue="T1", red="Gen.G", game_number=1)
             PL.log_prediction(game_id="g1", probability_blue=0.612345, source="ingame", minute=8.0, **base,
                               ingame_probability_blue=0.701234, blend_weight=5 / 12, anchor_probability_blue=0.55,
-                              anchor_source="post_draft", trained_through="2026-10-16")
+                              anchor_source="post_draft", trained_through="2026-10-16", dechatter=True)
             PL.log_prediction(game_id="g2", probability_blue=0.4, source="pre_draft", **base)   # 老的调用方式
             return [json.loads(x) for x in PL.LOG.read_text(encoding="utf-8").splitlines()]
         a, b = self._with_log(go)
         self.assertEqual((a["ingame_probability_blue"], a["blend_weight"], a["anchor_probability_blue"],
-                          a["anchor_source"], a["trained_through"]),
-                         (0.7012, 0.4167, 0.55, "post_draft", "2026-10-16"))
+                          a["anchor_source"], a["trained_through"], a["dechatter"]),
+                         (0.7012, 0.4167, 0.55, "post_draft", "2026-10-16", True))
         for k in ("ingame_probability_blue", "blend_weight", "anchor_probability_blue", "anchor_source",
-                  "trained_through"):
+                  "trained_through", "dechatter"):
             self.assertIn(k, b)
             self.assertIsNone(b[k], k)
 
@@ -3651,3 +3653,926 @@ class ServedLeaguesHeldout(unittest.TestCase):
         self.assertAlmostEqual(got["10"]["brier"], ((s.p - s.y) ** 2).mean())
         for k in ("brier_ci95", "log_loss", "log_loss_ci95"):
             self.assertGreater(got["10"][k], 0)
+
+
+class IngameServingRefit(unittest.TestCase):
+    """坑 (闸门 G2): 局内模型上线的一直是 60/20/20 的评估模型 —— 树只拟最早 60% 的局, 保序表拟随后 20%,
+    最近 20% 只当考卷, 从不进线上模型。2026-10 线上的树截至 2024-11-16 (一局 LPL 都没有), calib 的
+    trained_through 却写 2026-10-16, 谁也看不出来。现在 ingame_train 每个变体拟两次: 评估模型只出
+    metrics, 服务模型 (树 80% + 保序最近 20%, research/gate_ingame_refit.py t = +6.54) 存盘上线。
+
+    这里守四件事, 每一件拿错都不报错, 只是数字悄悄变了含义:
+      · metrics 还是 60/20/20 评估模型的 —— daily_update 的指标闸拿新旧 calib 比, 换了口径就是两把尺子
+      · 存盘的树 / 保序表 / 兼容 Platt 是服务模型的, trees_through / iso_window 说的也是它
+      · p_min / p_max 是服务保序表的可达范围, 不是评估模型的考卷极值 —— clip_warning 拿它判断"顶到了
+        边界", 用错了要么贴着顶也不响, 要么没到顶就说顶到了
+      · 新加的说明字段服务端不读: 没有它们的旧 calib 照样加载
+    合成数据 + 40 棵树, 只为跑得快; 切分、校准、存盘走的是 ingame_train 的真代码。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import contextlib
+        import io
+        import json
+        import os
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+        import numpy as np
+        import pandas as pd
+        with tempfile.TemporaryDirectory() as d0, mock.patch.dict(os.environ, {"LOL_ARTIFACTS": d0}):
+            import ingame_train
+        cls.IT = IT = ingame_train
+        rng = np.random.default_rng(7)
+        rows = []
+        for g in range(400):
+            y = int(rng.integers(0, 2))
+            for T in IT.SLICES:
+                rows.append({"gameid": f"g{g:04d}", "date": pd.Timestamp("2025-01-01") + pd.Timedelta(days=g),
+                             "T": T, "y": y, "league": "LCK" if g % 2 else "LCKC",
+                             "golddiff": rng.normal((2 * y - 1) * 40 * T, 1500),
+                             "killdiff": rng.normal((2 * y - 1) * 0.1 * T, 3)})
+        cls.mdf = pd.DataFrame(rows)
+        cls.feats = ["golddiff", "killdiff"]
+        cls.xgb = {**IT.XGB, "n_estimators": 40}
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.out = Path(cls.tmp.name)
+        sc = SimpleNamespace(tbl={"Ahri": None}, get=lambda ch, end: 0.1)
+        with mock.patch.object(IT, "OUT", cls.out), mock.patch.object(IT, "XGB", cls.xgb), \
+                contextlib.redirect_stdout(io.StringIO()):
+            IT.train_variant(cls.mdf, sc, cls.feats, "_live", "测试")
+        cls.cfg = json.loads((cls.out / "calib_ingame_live.json").read_text(encoding="utf-8"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def _fit(self, frac_tr, frac_cal):
+        from unittest import mock
+        parts = self.IT.split_by_game(self.mdf, frac_tr, frac_cal)
+        with mock.patch.object(self.IT, "XGB", self.xgb):
+            return parts, self.IT.fit_calibrated(parts[0], parts[1], self.feats)
+
+    def _saved(self, X):
+        from xgboost import XGBClassifier
+        m = XGBClassifier()
+        m.load_model(str(self.out / "model_ingame_live.json"))
+        return m.predict_proba(X)[:, 1]
+
+    def test_metrics_仍出自60_20_20的评估模型(self):
+        import inspect
+        import numpy as np
+        IT = self.IT
+        sig = inspect.signature(IT.split_by_game).parameters
+        self.assertEqual(IT.EVAL_SPLIT, (sig["frac_tr"].default, sig["frac_cal"].default),
+                         "评估切分必须是以前的 60/20/20, 否则新旧 calib 的 metrics 不是同一口径")
+        self.assertEqual(sum(IT.SERVE_SPLIT), 1.0, "服务切分不留考卷, 否则最近那段局又进不了线上模型")
+        (tr, cal, te), (m, iso, _) = self._fit(*IT.EVAL_SPLIT)
+        p = np.clip(iso.predict(m.predict_proba(te[self.feats].astype(float))[:, 1]), IT.CLIP, 1 - IT.CLIP)
+        y = te["y"].to_numpy()
+        mt, src = self.cfg["metrics"], self.cfg["metrics_source"]
+        self.assertAlmostEqual(mt["accuracy"], float(((p > .5) == y).mean()), places=12)
+        self.assertAlmostEqual(mt["brier"], float(((p - y) ** 2).mean()), places=6)   # p 是 float32
+        self.assertEqual(src["model"], "evaluation")
+        self.assertEqual(src["split"], [0.6, 0.2, 0.2])
+        self.assertEqual((src["trees"]["games"], src["iso"]["games"], src["test"]["games"]), (240, 80, 80))
+        self.assertEqual(src["test"]["through"], "2026-02-04")          # 第 400 局 = 2025-01-01 + 399 天
+        self.assertEqual(src["test_p_range"], [float(p.min()), float(p.max())])
+        self.assertEqual(src["from_serving_model"], ["p_min", "p_max"])
+
+    def test_存盘的是树80加保序最近20的服务模型(self):
+        import numpy as np
+        (s_tr, s_cal, rest), (sm, siso, scb) = self._fit(*self.IT.SERVE_SPLIT)
+        self.assertTrue(rest.empty)
+        X = self.mdf[self.feats].astype(float)
+        np.testing.assert_allclose(self._saved(X), sm.predict_proba(X)[:, 1], rtol=0, atol=1e-9)
+        self.assertEqual(self.cfg["iso_x"], [float(v) for v in siso.X_thresholds_])
+        self.assertEqual(self.cfg["iso_y"], [float(v) for v in siso.y_thresholds_])
+        self.assertEqual((self.cfg["coef"], self.cfg["intercept"]),
+                         (float(scb.coef_[0][0]), float(scb.intercept_[0])))
+        # 前 320 局拟树 (截至第 320 天), 最近 80 局拟保序表, 一直到数据最后一天
+        self.assertEqual(self.cfg["trees_through"], "2025-11-16")
+        self.assertEqual(self.cfg["iso_window"], ["2025-11-17", "2026-02-04"])
+        self.assertEqual(self.cfg["trees_through"], self.cfg["serving_fit"]["trees"]["through"])
+        self.assertEqual(self.cfg["trained_through"], "2026-02-04", "trained_through 仍是数据最后一天")
+        # 确实不是评估模型那几棵树 (树多看了 20% 的局)
+        _, (m_eval, _, _) = self._fit(*self.IT.EVAL_SPLIT)
+        self.assertGreater(float(np.abs(self._saved(X) - m_eval.predict_proba(X)[:, 1]).max()), 1e-3)
+
+    def test_p_min_p_max是服务保序表的可达范围(self):
+        from unittest import mock
+        import ingame_service
+        with mock.patch.object(ingame_service, "ART", self.out):
+            ig = ingame_service.IngameModel("_live")
+        lo, hi = ig.calibrate(-1e9), ig.calibrate(1e9)            # 线上这张表真正能输出的两端
+        self.assertEqual((ig.metrics["p_min"], ig.metrics["p_max"]), (lo, hi))
+        self.assertEqual((lo, hi), self.IT.reachable_range(self.cfg["iso_y"]))
+        self.assertIsNotNone(ig.clip_warning(hi), "输出顶在服务表的上限, 警告必须响")
+        self.assertIsNotNone(ig.clip_warning(lo), "输出贴着服务表的下限, 警告必须响")
+        self.assertIsNone(ig.clip_warning(hi - 0.01))
+        self.assertIsNone(ig.clip_warning(lo + 0.01))
+        # 这份数据上考卷极值和服务表的可达范围确实不同 —— 拿错那个, 上面几条会红
+        self.assertNotEqual([lo, hi], self.cfg["metrics_source"]["test_p_range"])
+
+    def test_没有新字段的旧calib照样加载(self):
+        import json
+        import shutil
+        import tempfile
+        from unittest import mock
+        import ingame_service
+        old = {k: v for k, v in self.cfg.items()
+               if k not in ("trees_through", "iso_window", "serving_fit", "metrics_source")}
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copy(self.out / "model_ingame_live.json", Path(d) / "model_ingame_live.json")
+            (Path(d) / "calib_ingame_live.json").write_text(json.dumps(old), encoding="utf-8")
+            with mock.patch.object(ingame_service, "ART", Path(d)):
+                ig = ingame_service.IngameModel("_live")
+        self.assertEqual(ig.calibrator, "isotonic")
+        self.assertEqual(ig.calibrate(1e9), self.cfg["metrics"]["p_max"])
+
+
+def _team_rows(games):
+    """[(gameid, 时间, 赛区, 蓝, 红, 蓝方是否赢)] → OE 那种每局两行的队伍行 (participantid 小的是蓝方)。"""
+    import pandas as pd
+    rows = []
+    for gid, ts, lg, b, r, y in games:
+        for pid, tm, res in ((100, b, y), (200, r, 1 - y)):
+            rows.append({"gameid": gid, "league": lg, "date": pd.Timestamp(ts), "participantid": pid,
+                         "position": "team", "teamname": tm, "result": res})
+    return pd.DataFrame(rows)
+
+
+class PregameElo(unittest.TestCase):
+    """坑 (闸门 G1 的 (d)): 赛区内 Elo 进 Stage 1/2 的校准层。定义只在 feature_store (elo_games / elo_replay /
+    elo_rating), 训练矩阵和 make_row 共用; 下面每一条拿错都不报错, 只是 Elo 悄悄变成另一个数:
+
+      · 训练行只用**更早 UTC 日期**的比赛 —— 同一天前一局的结果混进来, 就是拿当天的赛果预测当天
+      · 跨年回归是**整池**一起做的: 一支队去年没打、池子今年打过, 它已经回归过一次; 线上不能按
+        "这支队最后一场的年份"再回归一遍 (那样和训练行不是一个数)
+      · make_row(as_of=比赛时间) 必须和训练矩阵那一格逐位相等, elo_gap 也不能被 select_features 喂给树
+    """
+
+    def test_同一天的结果不进本局的Elo(self):
+        from feature_store import elo_games, elo_replay
+        t = _team_rows([("g1", "2026-03-01 10:00", "LCK", "A", "B", 1),
+                        ("g2", "2026-03-01 14:00", "LCK", "A", "C", 0),
+                        ("g3", "2026-03-02 10:00", "LCK", "B", "A", 1)])
+        pre, pools = elo_replay(elo_games(t))
+        self.assertEqual(pre["g1"], 0.0)
+        self.assertEqual(pre["g2"], 0.0, "A 当天上午赢了 B, 那个结果不能进下午这局的输入")
+        e_a = 1 / (1 + 10 ** ((1500 - 1510) / 400))         # g2 时 A 已是 1510 (更新照常, 只是不进输入)
+        self.assertAlmostEqual(pre["g3"], 1490 - (1510 - 20 * e_a), places=9)
+        R = pools["LCK"]["ratings"]
+        self.assertAlmostEqual(R["C"], 1500 + 20 * e_a, places=9)
+        self.assertEqual(pools["LCK"]["year"], 2026)
+        self.assertEqual(str(pools["LCK"]["last"]["A"].date()), "2026-03-02")
+
+    def test_跨年整池向均值回归一半_线上不按队伍最后一场再回归(self):
+        import numpy as np
+        from feature_store import FeatureStore, elo_games, elo_rating, elo_replay
+        t = _team_rows([("a", "2025-05-01 09:00", "LCK", "A", "B", 1),
+                        ("b", "2025-06-01 09:00", "LCK", "C", "A", 1),
+                        ("c", "2026-02-01 09:00", "LCK", "A", "B", 1)])      # C 2026 年没打
+        G = elo_games(t)
+        pre, pools = elo_replay(G)
+        R25 = elo_replay(G[G["day"].dt.year == 2025])[1]["LCK"]["ratings"]
+        m25 = float(np.mean(list(R25.values())))
+        reg = {k: m25 + 0.5 * (v - m25) for k, v in R25.items()}
+        self.assertEqual(pre["c"], reg["A"] - reg["B"], "2026 年第一局的输入 = 2025 年末评分整池回归一半")
+        pool = pools["LCK"]
+        self.assertEqual(pool["ratings"]["C"], reg["C"])
+        self.assertEqual(elo_rating(pool, "C", 2026), reg["C"],
+                         "池子 2026 年打过, C 已经跟着回归过; 不能因为 C 最后一场在 2025 年再回归一次")
+        m = pool["mean"]
+        self.assertEqual(elo_rating(pool, "C", 2028), m + 0.25 * (reg["C"] - m), "晚两年 = 0.5²")
+        self.assertEqual(elo_rating(pool, "C", 2025), reg["C"], "早于池子最后一年的请求不回归")
+        self.assertEqual(elo_rating(pool, "Z", 2028), 1500.0, "不在池里的队是初始分, 不回归")
+        self.assertEqual(elo_rating(None, "A", 2026), 1500.0)
+        st = FeatureStore(elo_table=G, elo_pools=pools, elo_pre=pre)
+        self.assertEqual(st.elo_gap("C", "B", "LCK", year=2027),
+                         elo_rating(pool, "C", 2027) - elo_rating(pool, "B", 2027))
+        self.assertEqual(st.elo_gap("A", "B", "LPL", year=2026), 0.0, "别的池里没有这两队")
+        self.assertEqual(st.elo_gap("A", "B", "LCK", as_of="2026-02-01 18:00"), pre["c"],
+                         "as_of 截断重放 = 训练行的口径")
+
+    def test_训练矩阵和make_row同一份Elo_且不进树(self):
+        import tempfile
+        import numpy as np
+        import pandas as pd
+        from feature_store import ELO_COL, FeatureStore, build_training_matrix, select_features
+        rng = np.random.default_rng(3)
+        teams = ["T1", "Gen.G", "HLE", "KT", "DK", "BRO"]
+        games, d0 = [], pd.Timestamp("2025-11-20")
+        for i in range(70):                                  # 跨 2025/2026 交界, 每天两局 (同一天要排除)
+            b, r = rng.choice(teams, 2, replace=False)
+            ts = d0 + pd.Timedelta(days=i // 2, hours=8 + 3 * (i % 2))
+            games.append((f"G{i:03d}", ts, "LCK", b, r, int(rng.integers(0, 2))))
+        t = _team_rows(games)
+        t["side"] = np.where(t["participantid"] == 100, "Blue", "Red")
+        for c, mu in (("gamelength", 1900), ("teamkills", 15), ("teamdeaths", 15), ("kills", 15),
+                      ("deaths", 15), ("assists", 35), ("totalgold", 60000), ("towers", 6)):
+            t[c] = rng.normal(mu, mu / 10, len(t))
+        t["playoffs"], t["game"] = 0, 1
+        with tempfile.TemporaryDirectory() as d:
+            f = str(Path(d) / "x.csv")
+            t.to_csv(f, index=False)
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()):
+                mdf = build_training_matrix([f], verbose=False)
+                store = FeatureStore.from_csv([f], verbose=False)
+        self.assertGreater(len(mdf), 40)
+        for stage in ("pre_draft", "post_draft"):
+            self.assertNotIn(ELO_COL, select_features(mdf, stage), "Elo 只进校准层, 不能喂给树")
+        mdf["date"] = pd.to_datetime(mdf["date"])
+        for r in mdf.itertuples(index=False):
+            row, _w = store.make_row(r.blue_team, r.red_team, r.league, as_of=r.date)
+            self.assertEqual(row[ELO_COL], getattr(r, ELO_COL), f"{r.gameid}: 训练行和 make_row(as_of) 不是同一个数")
+        row, _w = store.make_row("T1", "Gen.G", "LCK")
+        self.assertEqual(row[ELO_COL], store.elo_gap("T1", "Gen.G", "LCK"))
+
+
+class PregameLogitEloCalibration(unittest.TestCase):
+    """坑 (闸门 G1 的 (d)): Stage 1/2 的校准层从 Platt 换成 logit_elo —— logistic 回归吃
+    [logit(clip(p_raw)), elo_gap · ln10/400]。train.train_stage 的真代码在合成数据上训一遍 (30 棵树), 守:
+
+      · 线上 api.Stage.predict 和训练时 metrics 用的是同一个式子 (运算顺序照 sklearn 的 decision_function)
+      · 新 calib 仍带 coef / intercept (同一校准段上的兼容 Platt): 合并后线上可能是旧代码 + 新文件
+      · 没有 calibrator 字段的旧 calib 退回 Platt (新代码 + 旧文件); 有 logit_elo 却缺 elo_gap 就报错,
+        不悄悄退回 Platt —— 那是另一个模型的数
+      · calib 里的 Elo 常数和 feature_store 对不上就拒绝加载 (特征库按自己的常数算 elo_gap, 不报错)
+      · Elo 不在树里, top_evidence 要把它当一条依据放进去, 不然理由里永远没有收益的主要来源; 权重按这一场的
+        |Elo 差| / elo_sd 缩放 —— 不缩放时两队差 7 分也排第一 (2026-10-17 实测 KRX 对 DNS)
+      · 线上的 exp / log 是 fdlibm 的移植 (浏览器版逐位相同), 不是 math 的
+      · logit_elo 没有硬上下限: 模型卡不给 p_min / p_max (前端不画"够不到"的死区), range_note 不说"只会顶到边界"
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import contextlib
+        import io
+        import json
+        import os
+        import tempfile
+        from unittest import mock
+        import numpy as np
+        import pandas as pd
+        with tempfile.TemporaryDirectory() as d0, mock.patch.dict(os.environ, {"LOL_ARTIFACTS": d0}):
+            import train
+        cls.TR = train
+        rng = np.random.default_rng(11)
+        n = 900
+        elo = rng.normal(0, 120, n)
+        a, b = rng.normal(0, 1, n), rng.normal(0, 1, n)
+        z = elo * np.log(10) / 400 + 0.4 * a
+        cls.mdf = pd.DataFrame({"diff_avg_kills": a, "diff_avg_towers": b, "is_lck": 1, "playoffs": 0,
+                                "elo_gap": elo, "y": (rng.random(n) < 1 / (1 + np.exp(-z))).astype(int)})
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.out = Path(cls.tmp.name)
+        with mock.patch.object(train, "OUT", cls.out), \
+                mock.patch.object(train, "XGB", {**train.XGB, "n_estimators": 30}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            cls.metrics = train.train_stage(cls.mdf, "pre_draft")
+        cls.cfg = json.loads((cls.out / "calib_pre_draft.json").read_text(encoding="utf-8"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def _stage(self, cfg=None):
+        import json
+        import shutil
+        import tempfile
+        from unittest import mock
+        import api
+        if cfg is None:
+            with mock.patch.object(api, "ART", self.out):
+                return api.Stage("pre_draft")
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copy(self.out / "model_pre_draft.json", Path(d) / "model_pre_draft.json")
+            (Path(d) / "calib_pre_draft.json").write_text(json.dumps(cfg), encoding="utf-8")
+            with mock.patch.object(api, "ART", Path(d)):
+                return api.Stage("pre_draft")
+
+    def _rows(self, idx):
+        return [dict(self.mdf.iloc[i]) for i in idx]
+
+    def test_线上和训练指标同一个式子(self):
+        import math
+        import numpy as np
+        from feature_store import ELO_SCALE, LOGIT_CLIP
+        st = self._stage()
+        self.assertEqual(st.calibrator, "logit_elo")
+        le = self.cfg["logit_elo"]
+        self.assertEqual((le["logit_clip"], le["elo_scale"]), (LOGIT_CLIP, ELO_SCALE))
+        n = len(self.mdf)
+        te = range(int(n * 0.8), n)
+        ys, ps = [], []
+        for row in self._rows(te):
+            raw, cal = st.predict(row)
+            q = min(max(raw, 1e-7), 1 - 1e-7)
+            z = math.log(q / (1 - q)) * le["coef"][0] + row["elo_gap"] * ELO_SCALE * le["coef"][1] + le["intercept"]
+            self.assertAlmostEqual(cal, 1 / (1 + math.exp(-z)), places=14)
+            ys.append(row["y"])
+            ps.append(cal)
+        ys, ps = np.array(ys), np.array(ps)
+        self.assertEqual(self.metrics["accuracy"], float(((ps > .5) == ys).mean()),
+                         "metrics 的测试段准确率要能用线上的式子复现")
+        self.assertAlmostEqual(self.metrics["brier"], float(((ps - ys) ** 2).mean()), places=12)
+        self.assertGreater(le["coef"][1], 0.5, "合成数据的胜负主要由 Elo 决定, Elo 系数应当明显为正")
+
+    def test_新calib仍带兼容Platt_旧calib退回Platt(self):
+        import math
+        import numpy as np
+        from sklearn.linear_model import LogisticRegression
+        st = self._stage()
+        n = len(self.mdf)
+        i_tr, i_cal = int(n * 0.6), int(n * 0.8)
+        X = self.mdf[st.features].astype(float).fillna(-999)
+        p_cal = st.model.predict_proba(X.iloc[i_tr:i_cal])[:, 1]
+        pl = LogisticRegression(C=1e6).fit(p_cal.reshape(-1, 1), self.mdf["y"].iloc[i_tr:i_cal])
+        self.assertAlmostEqual(self.cfg["coef"], float(pl.coef_[0][0]), places=9,
+                               msg="coef / intercept 是同一校准段上的兼容 Platt —— 旧版服务读的就是它")
+        self.assertAlmostEqual(self.cfg["intercept"], float(pl.intercept_[0]), places=9)
+        old = {k: v for k, v in self.cfg.items() if k not in ("calibrator", "logit_elo", "xgb")}
+        so = self._stage(old)
+        self.assertEqual(so.calibrator, "platt")
+        row = self._rows([5])[0]
+        raw, cal = so.predict(row)
+        import fdlibm
+        self.assertEqual(cal, 1.0 / (1.0 + fdlibm.exp(-(old["coef"] * raw + old["intercept"]))),
+                         "Platt 也走 fdlibm.exp —— 看板上不取整的赛前数要和浏览器版逐位相同")
+        self.assertNotIn("elo_gap", [f for f, _v, _i in so.top_evidence(row)], "Platt 时 Elo 不是依据")
+        nr = {k: v for k, v in row.items() if k != "elo_gap"}
+        self.assertEqual(len(so.predict(nr)), 2, "旧文件 + 新代码: 行里没有 elo_gap 也照样能算")
+        with self.assertRaises(ValueError):
+            self._stage().predict(nr)
+        with self.assertRaises(ValueError):
+            self._stage().predict({**row, "elo_gap": float("nan")})
+        self.assertTrue(np.isfinite(self._stage().predict(row)[1]))
+
+    def test_Elo常数对不上就拒绝加载(self):
+        import copy
+        bad = copy.deepcopy(self.cfg)
+        bad["logit_elo"]["elo"]["k"] = 32.0
+        with self.assertRaises(ValueError):
+            self._stage(bad)
+        bad = copy.deepcopy(self.cfg)
+        bad["calibrator"] = "isotonic"
+        with self.assertRaises(ValueError):
+            self._stage(bad)
+
+    def test_Elo当一条依据进理由(self):
+        import numpy as np
+        import explain as EX
+        from feature_store import logit_elo_inputs
+        st = self._stage()
+        le = self.cfg["logit_elo"]
+        n = len(self.mdf)
+        i_tr, i_cal = int(n * 0.6), int(n * 0.8)
+        X = self.mdf[st.features].astype(float).fillna(-999)
+        Z = logit_elo_inputs(st.model.predict_proba(X.iloc[i_tr:i_cal])[:, 1], self.mdf["elo_gap"].iloc[i_tr:i_cal])
+        a = np.abs(le["coef"]) * Z.std(axis=0)
+        self.assertAlmostEqual(le["elo_weight"], float(a[1] / a.sum()), places=12)
+        self.assertEqual(le["elo_sd"], float(np.std(self.mdf["elo_gap"].iloc[i_tr:i_cal].to_numpy())),
+                         "elo_sd 和 elo_weight 出自同一个校准段")
+        self.assertLess(le["elo_sd"], 153.6, "前提: 下面这一场的差超过一个标准差, 拿满份量")
+        row = {**self._rows([7])[0], "elo_gap": -153.6}
+        ev = st.top_evidence(row)
+        self.assertIn(("elo_gap", -153.6, le["elo_weight"]), ev)
+        self.assertEqual([i for _f, _v, i in ev], sorted((i for _f, _v, i in ev), reverse=True), "按权重排")
+        self.assertLessEqual(len(ev), 8)
+        rs = EX.explain_evidence(ev, "蓝队", "红队")
+        self.assertIn({"text": "红队 的赛区内 Elo 积分高 154 分 (按历年胜负累计的长期实力)",
+                       "weight": round(le["elo_weight"], 4)}, rs)
+
+    def test_Elo差很小时权重按比例缩小_不排第一(self):
+        st = self._stage()
+        le = self.cfg["logit_elo"]
+        row = {**self._rows([7])[0], "elo_gap": 7.0}
+        ev = st.top_evidence(row)
+        w = dict((f, i) for f, _v, i in ev).get("elo_gap")
+        self.assertEqual(w, le["elo_weight"] * min(1.0, 7.0 / le["elo_sd"]))
+        self.assertNotEqual(ev[0][0], "elo_gap", "差 7 分不该是第一条理由 (不缩放时它永远排第一)")
+        self.assertEqual([i for _f, _v, i in ev], sorted((i for _f, _v, i in ev), reverse=True))
+        import copy
+        old = copy.deepcopy(self.cfg)
+        old["logit_elo"].pop("elo_sd")
+        w_old = dict((f, i) for f, _v, i in self._stage(old).top_evidence(row))["elo_gap"]
+        self.assertEqual(w_old, le["elo_weight"], "早期的 logit_elo 文件没有 elo_sd: 不缩放, 照旧能跑")
+
+    def test_线上的exp和log是fdlibm的移植(self):
+        import fdlibm
+        st = self._stage()
+        le = self.cfg["logit_elo"]
+        for row in self._rows(range(0, 900, 37)):
+            raw, cal = st.predict(row)
+            q = min(max(raw, le["logit_clip"]), 1 - le["logit_clip"])
+            z = fdlibm.log(q / (1 - q)) * le["coef"][0] + row["elo_gap"] * le["elo_scale"] * le["coef"][1]                 + le["intercept"]
+            self.assertEqual(cal, 1.0 / (1.0 + fdlibm.exp(-z)), "逐位相同, 不是近似 —— 浏览器版照抄这一行")
+
+    def test_logit_elo的模型卡不说硬上下限(self):
+        import api
+        card = api._model_card(self._stage())
+        self.assertNotIn("p_min", card, "logit_elo 没有硬上下限, 前端拿到 p_min 会画'模型够不到'的斜线死区")
+        self.assertNotIn("p_max", card)
+        self.assertIn("不是上下限", card["range_note"])
+        self.assertNotIn("只会顶到边界", card["range_note"])
+        lo, hi = self.metrics["p_min"], self.metrics["p_max"]
+        self.assertIn(f"{lo * 100:.0f}%–{hi * 100:.0f}%", card["range_note"], "范围仍按测试段两端说")
+        old = {k: v for k, v in self.cfg.items() if k not in ("calibrator", "logit_elo", "xgb")}
+        oc = api._model_card(self._stage(old))
+        self.assertEqual((oc["p_min"], oc["p_max"]), (lo, hi), "Platt (旧文件) 照旧给死区")
+        self.assertIn("只会顶到边界", oc["range_note"])
+
+    def test_logit_elo时免责声明不说输出范围有限(self):
+        from unittest import mock
+        import api
+        row = self._rows([3])[0]
+
+        class _Store:
+            def make_row(self, *a, **k):
+                return dict(row), []
+
+            def staleness(self, league):
+                return {"level": "fresh", "last_date": "2026-10-01", "days": 1}
+
+        def disclaimer(stage):
+            with mock.patch.dict(api.STATE, {"store": _Store(), "stages": {"pre_draft": stage, "post_draft": stage}}):
+                return api.predict(api.PredictRequest(blue_team="A", red_team="B", league="LCK"))["disclaimer"]
+
+        limited = "模型概率输出范围有限"
+        self.assertNotIn(limited, disclaimer(self._stage()), "logit_elo 没有硬上下限, 这句不再成立")
+        old = {k: v for k, v in self.cfg.items() if k not in ("calibrator", "logit_elo", "xgb")}
+        self.assertIn(limited, disclaimer(self._stage(old)), "Platt (旧文件) 照旧")
+
+    def test_Elo那句话(self):
+        import explain as EX
+        f = lambda v: EX.explain("elo_gap", v, "蓝队", "红队")
+        self.assertEqual(f(115.31), "蓝队 的赛区内 Elo 积分高 115 分 (按历年胜负累计的长期实力)")
+        self.assertEqual(f(-2.5), "红队 的赛区内 Elo 积分高 2 分 (按历年胜负累计的长期实力)", "五成双, 和 .0f 一样")
+        for v in (0.0, -0.0, 0.4, 0.5, -0.5):
+            self.assertEqual(f(v), "双方的赛区内 Elo 积分相当", f"{v} 取整后是 0, 不说'高 0 分'")
+        self.assertIsNone(f(float("nan")))
+
+    def test_简报不再说Platt校准和范围受限(self):
+        import agents
+        pred = {"blue_team": "A", "red_team": "B", "league": "LCK", "stage": "1_pre_draft", "probability": 0.6,
+                "model_accuracy": 0.64, "model_baseline": 0.55, "model_ece": 0.03, "p_range": [0.1, 0.95]}
+        new = agents.build_brief({**pred, "calibrator": "logit_elo"}, [])
+        self.assertNotIn("Platt", new)
+        self.assertNotIn("受限于", new)
+        self.assertIn("不是硬上下限", new)
+        self.assertIn("Platt", agents.build_brief(pred, []), "旧文件 (没有 calibrator) 照旧是 Platt")
+
+
+# ══════════════════════════════════════════════════════════
+#  看板的经济差邻域去抖 (闸门 G3)
+# ══════════════════════════════════════════════════════════
+
+class _StepForest:
+    """假的局内树: 原始输出只看经济差那一列, 是一串台阶 (base; 到 steps 里每个 cut 就换成对应的值) ——
+    XGBoost 对经济差分段常数的样子。收到的每一批特征矩阵都记下来, 测试拿去和 make_row 独立组的行对照。"""
+
+    def __init__(self, features, steps, base):
+        self.i, self.steps, self.base = features.index("golddiff"), steps, base
+        self.seen = []
+
+    def predict_proba(self, x):
+        import numpy as np
+        x = np.asarray(x, dtype=float)
+        self.seen.append(x.copy())
+        p = np.full(len(x), self.base, dtype=float)
+        for cut, v in self.steps:
+            p = np.where(x[:, self.i] >= cut, v, p)
+        return np.stack([1 - p, p], axis=1)
+
+
+_DC_FEATS = ["golddiff", "csdiff", "killdiff", "killsum", "golddiff_norm", "scaling_diff",
+             "x_gold_scaling", "x_goldnorm_scaling", "lead_by_early_comp", "is_lck"]
+_DC_BLUE = ["Azir", "Orianna", "Jinx", "Nautilus", "Lee Sin"]
+_DC_RED = ["Gnar", "Viego", "Ahri", "Ezreal", "Rakan"]
+
+
+def _stub_ingame(steps=((10050.0, 0.999),), base=0.6):
+    """不读 artifacts 的局内模型: 真的 make_row / calibrate / dechattered / clip_warning / evidence, 假的树
+    (_StepForest)。保序表取恒等 (校准后 = 原始输出夹到 [0.01, 0.99]), p_min / p_max = 0.01 / 0.99。"""
+    import numpy as np
+    from ingame_service import IngameModel
+    m = IngameModel.__new__(IngameModel)
+    m.variant, m.features, m.has_xpdiff = "_live", list(_DC_FEATS), False
+    m.model = _StepForest(m.features, steps, base)
+    m.a, m.b, m.calibrator, m.clip = 1.0, 0.0, "isotonic", 0.01
+    m.iso_x, m.iso_y = np.array([0.0, 1.0]), np.array([0.0, 1.0])
+    m.scaling = {**{c: 1.0 for c in _DC_BLUE}, **{c: 0.4 for c in _DC_RED}}
+    m.metrics = {"accuracy": 0.77, "ece": 0.02, "p_min": 0.01, "p_max": 0.99, "per_T": {}}
+    m.slices, m.trained_through = [10, 15, 20, 25], "2026-10-16"
+    m.importance = {f: round(1 - k / 20, 3) for k, f in enumerate(m.features)}
+    return m
+
+
+class IngameDechatter(unittest.TestCase):
+    """坑: 看板的去抖 (闸门 G3, research/gate_dechatter.mjs) 悄悄变成另一样东西。闸门量的是一个很具体的候选:
+    经济差挪 −200, −150, …, +200 这 9 个**整数**, 由经济差派生的列 (golddiff_norm、x_gold_scaling、
+    x_goldnorm_scaling、lead_by_early_comp) 全部按 make_row 重算, 总经济不动; 9 个**校准后**的概率从左到右依次
+    相加除以 9, **然后**才走 3-15 分钟渐变; 夹住的警告看最终输出; 理由、probability_raw 出自没挪过的那一行;
+    /predict/ingame 和 /session tick 不去抖。任何一条走样都不报错, 只是一个看着合理的数 (只挪 golddiff 不重算
+    golddiff_norm、先渐变再平均、用 sum() 补偿求和差一个 ulp ……)。浏览器版由 test:golden 的 cal_dc / resp_dc 对账。"""
+
+    KW = dict(minute=28, xpdiff=None, csdiff=40, blue_kills=9, red_kills=4, gold_total=52000,
+              blue_champs=_DC_BLUE, red_champs=_DC_RED, pre_row=None, league="LCK")
+
+    def setUp(self):
+        import api
+        self.api = api
+        self._old = dict(api.STATE)
+
+    def tearDown(self):
+        self.api.STATE.clear()
+        self.api.STATE.update(self._old)
+
+    def _core(self, m, gd, minute=28, dechatter=True, **kw):
+        self.api.STATE.clear()
+        self.api.STATE.update(ingame_live=m, ingame=None)
+        st = self.api.IngameState(minute=minute, golddiff=gd, xpdiff=None, csdiff=40, blue_kills=9,
+                                  red_kills=4, gold_total=52000)
+        return self.api._ingame_core("蓝队", "红队", "LCK", st, _DC_BLUE, _DC_RED, False,
+                                     dechatter=dechatter, **kw)[0]
+
+    def test_挪动量是九个整数且派生列全按make_row重算(self):
+        from ingame_service import DECHATTER_SHIFTS
+        self.assertEqual(DECHATTER_SHIFTS, (-200, -150, -100, -50, 0, 50, 100, 150, 200), "闸门量的就是这一张表")
+        self.assertTrue(all(isinstance(d, int) for d in DECHATTER_SHIFTS))
+        m = _stub_ingame()
+        gd = 3210
+        m.dechattered(lambda d: m.make_row(golddiff=gd + d, **self.KW)[0])
+        x = m.model.seen[-1]
+        self.assertEqual(x.shape, (9, len(m.features)), "9 行一批")
+        for k, d in enumerate(DECHATTER_SHIFTS):
+            row, _ = m.make_row(golddiff=gd + d, **self.KW)
+            self.assertEqual(list(x[k]), [float(row[f]) for f in m.features], f"挪 {d} 那一行")
+        col = {f: list(x[:, i]) for i, f in enumerate(m.features)}
+        sc = m.make_row(golddiff=gd, **self.KW)[0]["scaling_diff"]
+        g = [gd + d for d in DECHATTER_SHIFTS]
+        self.assertEqual(col["golddiff"], g)
+        self.assertEqual(col["golddiff_norm"], [v / 52000 for v in g], "golddiff_norm 跟着挪, 分母 (总经济) 不动")
+        self.assertEqual(col["x_gold_scaling"], [v * sc for v in g])
+        self.assertEqual(col["x_goldnorm_scaling"], [(v / 52000) * sc for v in g])
+        self.assertEqual(col["lead_by_early_comp"], [v * -sc for v in g])
+        for f in ("csdiff", "killdiff", "killsum", "scaling_diff", "is_lck"):
+            self.assertEqual(len(set(col[f])), 1, f"{f} 和经济差无关, 不该跟着变")
+        # 看板真正走的那条路 (api._ingame_core) 送进树的也是这 9 行 —— 不能只挪 golddiff 一列
+        self._core(m, gd)
+        self.assertEqual(m.model.seen[-1].tolist(), x.tolist(), "_ingame_core(dechatter=True) 送进树的 9 行")
+
+    def test_九个校准概率依次相加再除以9(self):
+        import math
+        m = _stub_ingame(steps=(), base=0.1)        # 九个都是 0.1
+        got = m.dechattered(lambda d: m.make_row(golddiff=500 + d, **self.KW)[0])
+        s = 0.0
+        for _ in range(9):
+            s += 0.1
+        self.assertNotEqual(s / 9, math.fsum([0.1] * 9) / 9, "前提: 这组数上依次相加和补偿求和 (3.12 起的 sum()) 不同")
+        self.assertEqual(got, s / 9, "必须是依次相加 (浏览器版 dechatteredCal 的顺序), 不是 sum() / np.mean")
+
+    def test_先去抖再渐变_理由和raw出自没挪过的那一行(self):
+        from ingame_service import DECHATTER_SHIFTS
+        m = _stub_ingame()
+        gd, minute, anchor = 10000, 9.0, 0.3
+        out = self._core(m, gd, minute, raw=True, blend=True, blend_with=anchor)
+        one = self._core(m, gd, minute, dechatter=False, raw=True, blend=True, blend_with=anchor)
+        lo, hi = m.calibrate(0.6), m.calibrate(0.999)
+        cals = [hi if gd + d >= 10050 else lo for d in DECHATTER_SHIFTS]
+        s = 0.0
+        for c in cals:
+            s += c
+        mean = s / 9
+        self.assertEqual(out["ingame_probability_blue"], round(mean, 4), "局内读数 = 9 个校准概率的平均")
+        want = self.api._blend_prior(anchor, mean, minute)[0]
+        self.assertEqual(out["probability_blue"], round(want, 4), "先平均、再渐变")
+        wrong = sum(self.api._blend_prior(anchor, c, minute)[0] for c in cals) / 9
+        self.assertNotEqual(round(wrong, 4), out["probability_blue"], "前提: 先渐变再平均是另一个数")
+        self.assertTrue(out["dechattered"])
+        self.assertNotIn("dechattered", one)
+        self.assertEqual(one["ingame_probability_blue"], round(lo, 4))
+        self.assertEqual(out["probability_raw"], one["probability_raw"])
+        self.assertEqual(out["probability_raw"], 0.6, "probability_raw 是没挪过那一行的树输出, 不是平均")
+        for k in ("evidence", "reasons", "slice_used", "warnings"):
+            self.assertEqual(out[k], one[k], k)
+        self.assertIn({"feature": "golddiff", "value": 10000.0, "importance": 1.0}, out["evidence"],
+                      "理由说的是场上真实的经济差")
+
+    def test_夹住的警告看去抖后的最终输出(self):
+        m = _stub_ingame()
+        hit = lambda o: any("表达上限" in w for w in o["warnings"])
+        self.assertTrue(hit(self._core(m, 10050, dechatter=False)), "前提: 单点读数顶到 99%")
+        at = self._core(m, 10050)                   # 邻域里 −200…−50 那 4 个没到分界线
+        self.assertLess(at["probability_blue"], 0.99)
+        self.assertFalse(hit(at), "去抖后没顶到上限, 不能再说'顶到表达上限'")
+        self.assertTrue(hit(self._core(m, 10300)), "九个都顶格时照常提醒")
+
+    def test_predict_ingame和session_tick不去抖(self):
+        from ingame_service import SessionStore
+        m = _stub_ingame()
+        self.api.STATE.clear()
+        self.api.STATE.update(ingame_live=m, ingame=m, sessions=SessionStore())
+        st = dict(minute=28, golddiff=10000, xpdiff=None, csdiff=40, blue_kills=9, red_kills=4, gold_total=52000)
+        req = self.api.IngameRequest(blue_team="蓝队", red_team="红队", league="LCK",
+                                     state=self.api.IngameState(**st), blue_champions=_DC_BLUE,
+                                     red_champions=_DC_RED, include_pregame=False)
+        out = self.api.predict_ingame(req)
+        self.assertNotIn("dechattered", out)
+        self.assertEqual(out["probability_blue"], round(m.calibrate(0.6), 4), "单点读数")
+        sid = self.api.session_start(self.api.SessionStart(
+            blue_team="蓝队", red_team="红队", league="LCK",
+            blue_champions=_DC_BLUE, red_champions=_DC_RED))["session_id"]
+        tick = self.api.session_tick(sid, self.api.IngameState(**st))
+        self.assertNotIn("dechattered", tick)
+        self.assertEqual(tick["probability_blue"], out["probability_blue"])
+        self.assertNotEqual(self._core(m, 10000)["probability_blue"], out["probability_blue"],
+                            "前提: 同一个局面在看板上 (去抖) 是另一个数")
+
+    def test_九行一批预测和逐行逐位相等(self):
+        """dechattered 把 9 行一次送进 predict_proba, 浏览器版逐行算; 批量要是和逐行差一个 ulp, 两份实现就
+        对不上。XGBoost 3.4.1 上实测 10314 行 0 处不同 —— 换版本时这条先红。"""
+        import numpy as np
+        from ingame_service import DECHATTER_SHIFTS, IngameModel
+        try:
+            ig = IngameModel("_live")
+        except Exception as e:
+            self.skipTest(f"局内模型文件不在: {e}")
+        for minute in (4, 9, 12.5, 18, 26, 34):
+            for gd in (-6400, -1250, -130, 0, 75, 1250, 2600, 7100):
+                rows = [ig.make_row(minute=minute, golddiff=gd + d, xpdiff=None, csdiff=gd / 40, blue_kills=7,
+                                    red_kills=5, gold_total=1800 * minute + 9000, league="LPL")[0]
+                        for d in DECHATTER_SHIFTS]
+                x = np.nan_to_num(np.array([[float(r.get(f, np.nan)) for f in ig.features] for r in rows]),
+                                  nan=-999.0)
+                one = [ig.predict(r) for r in rows]
+                self.assertEqual([float(b) for b in ig.model.predict_proba(x)[:, 1]], [r for r, _ in one],
+                                 f"第 {minute} 分钟 经济差 {gd}")
+                s = 0.0
+                for _, c in one:
+                    s += c
+                by_d = dict(zip(DECHATTER_SHIFTS, rows))
+                self.assertEqual(ig.dechattered(lambda d: by_d[d]), s / 9)
+
+
+class IngameDechatterBoard(unittest.TestCase):
+    """坑: 看板的某一处 (头条 / 曲线 / 留档) 漏开去抖。头条、曲线 (以及浏览器版的逐秒走势和直播回放) 必须是同一个
+    数, 否则同一时刻两处对不上 —— 和当年曲线漏传阵容 (末端 75% 对头条 91.5%) 同一类。留档要标 dechatter: 线上真账
+    拿它和留出集 (单点读数) 对照, 不标就分不清口径。借 InternationalBoard 的假数据源, 树换成 _StepForest
+    (跨赛区看板: 不带赛前特征、不渐变, 局内数就是去抖后的读数本身)。"""
+
+    setUp = InternationalBoard.setUp
+    tearDown = InternationalBoard.tearDown
+    _board = InternationalBoard._board
+
+    def test_头条和曲线都去抖_留档标dechatter(self):
+        # 头条经济差 2500 (分界线 2550 下 50); 曲线第 7 分钟经济差 1400 (分界线 1450 下 50)
+        self.api.STATE["ingame_live"] = _stub_ingame(steps=((1450.0, 0.75), (2550.0, 0.999)), base=0.6)
+        out = self._board("Worlds", ["T1", "BILIBILI GAMING"], 8)
+        pr = out["prediction"]
+        self.assertTrue(pr["dechattered"])
+
+        def core(state, dechatter):
+            sd = self.api.IngameState(**state)
+            return self.api._ingame_core("T1", "Bilibili Gaming", "Worlds", sd, None, None, False,
+                                         dechatter=dechatter)[0]["probability_blue"]
+        st = out["live"]["state"]
+        self.assertEqual(pr["probability_blue"], core(st, True), "头条 = 看板的调法 (去抖)")
+        self.assertNotEqual(pr["probability_blue"], core(st, False), "前提: 这个局面在抖")
+        moved = 0
+        for pt in out["timeline"]:
+            if pt["minute"] < 3:
+                continue
+            s = dict(minute=pt["minute"], golddiff=pt["golddiff"], xpdiff=None, csdiff=2 * pt["minute"],
+                     blue_kills=pt["blue_kills"], red_kills=pt["red_kills"], gold_total=1800 * pt["minute"])
+            self.assertEqual(pt["probability_blue"], core(s, True), f"曲线第 {pt['minute']} 分钟")
+            moved += pt["probability_blue"] != core(s, False)
+        self.assertGreater(moved, 0, "前提: 曲线上至少一个点去不去抖不一样")
+        self.assertEqual([(r["source"], r["dechatter"]) for r in self.logged], [("ingame", True)],
+                         "留档标明这条局内数是去抖过的")
+
+
+# ══════════════════════════════════════════════════════════
+#  合并前复核时修的几处 (2026-10-17)
+# ══════════════════════════════════════════════════════════
+
+class PortableMath(unittest.TestCase):
+    """坑: 看板上的数由 Python 和浏览器版各算一遍, test:diff 用 === 比; 平台的 exp / log 两两之间会差一位
+    (本机 math 是 MSVC 的, Safari 用系统 libm)。Stage 1/2 的校准层 (看板上的赛前 / BP 后不取整就输出) 和模型 C
+    都走 fdlibm.py 的移植 (浏览器版 web/fdlibm.ts)。用平台的 exp / log 时约 4.5% 的输入两边差一位, test:diff 会
+    零星报出看着像移植错误的差异。这里守移植本身: 下面几个输入上本机 math 和 V8 差一位, 移植要等于 V8 的值
+    (V8 本来就是 fdlibm); 特殊值; 随机输入上和 math 至多差一位 (移植写错会差很多)。"""
+
+    def test_和V8逐位相同的实例(self):
+        import fdlibm
+        # (输入, V8 的 Math.log / Math.exp) —— 本机 math.log / math.exp 在这几个上各差一位
+        for x, v8 in ((0.7656791774779531, -0.2669920253324035), (0.5933654004583634, -0.5219448801081903),
+                      (0.06699565689807041, -2.7031274841090944)):
+            self.assertEqual(fdlibm.log(x), v8)
+        for y, v8 in ((-9.413970789474078, 8.157638075101723e-05), (10.810897767384446, 49557.93991496366),
+                      (-1.688799360835695, 0.18474119840893766)):
+            self.assertEqual(fdlibm.exp(y), v8)
+
+    def test_特殊值(self):
+        import math
+        import fdlibm
+        self.assertEqual(fdlibm.log(1.0), 0.0)
+        self.assertEqual(fdlibm.log(0.0), -math.inf)
+        self.assertEqual(fdlibm.log(-0.0), -math.inf)
+        self.assertTrue(math.isnan(fdlibm.log(-1.0)))
+        self.assertEqual(fdlibm.log(math.inf), math.inf)
+        self.assertAlmostEqual(fdlibm.log(5e-324), math.log(5e-324), places=12, msg="次正规数先放大再算")
+        self.assertEqual(fdlibm.exp(0.0), 1.0)
+        self.assertEqual(fdlibm.exp(-746.0), 0.0)
+
+    def test_和math至多差一位(self):
+        import math
+        import random
+        import fdlibm
+        rng = random.Random(3)
+        for _ in range(20000):
+            q = rng.uniform(1e-7, 1 - 1e-7)
+            x = q / (1 - q)
+            a, b = fdlibm.log(x), math.log(x)
+            self.assertLessEqual(abs(a - b), math.ulp(b), x)
+            z = rng.uniform(-30, 30)
+            a, b = fdlibm.exp(z), math.exp(z)
+            self.assertLessEqual(abs(a - b), math.ulp(b), z)
+
+    def test_模型C的exp就是这一份(self):
+        import fdlibm
+        import xregion
+        self.assertIs(xregion.portable_exp, fdlibm.exp, "两处各写一份迟早会改漏一处")
+
+
+class IngameServedDisclaimer(unittest.TestCase):
+    """坑 (闸门 G2 之后): 线上 Stage 4 是服务模型, 它把 metrics 那段留出数据也拟进去了; metrics 出自同一配方的
+    60/20/20 评估版。照旧说"局内模型在留出测试集上准确率约 X%"就是把评估版的成绩安在线上模型头上 —— 界面原样
+    印出、Stage 3 当事实引用。calib 有 serving_fit 时换措辞; 旧文件 (没有它) 线上就是评估模型, 原句照旧。"""
+
+    def _ig(self, serving_fit):
+        from types import SimpleNamespace
+        return SimpleNamespace(metrics={"accuracy": 0.7714, "ece": 0.0218, "per_T": {"25": {"accuracy": 0.8461}}},
+                               calibrator="isotonic", serving_fit=serving_fit)
+
+    def test_服务模型换措辞_旧文件照旧(self):
+        import api
+        new = api._ingame_disclaimer(self._ig({"split": [0.8, 0.2]}))
+        self.assertTrue(new.startswith("局内模型的同一配方在留出测试集上准确率约 77%, 25 分钟时约 85%。"), new)
+        self.assertIn("线上这份把那段比赛也用来拟合了, 自身没有留出成绩。", new)
+        old = api._ingame_disclaimer(self._ig(None))
+        self.assertTrue(old.startswith("局内模型在留出测试集上准确率约 77%, 25 分钟时约 85%。"), old)
+        self.assertNotIn("自身没有留出成绩", old)
+
+    def test_IngameModel读出serving_fit(self):
+        import json
+        import shutil
+        import tempfile
+        from unittest import mock
+        import ingame_service as IS
+        src = IS.ART / "calib_ingame_live.json"
+        if not src.exists():
+            self.skipTest("没有 artifacts")
+        cfg = json.loads(src.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copy(IS.ART / "model_ingame_live.json", Path(d) / "model_ingame_live.json")
+            for keep in (True, False):
+                c = dict(cfg) if keep else {k: v for k, v in cfg.items() if k != "serving_fit"}
+                (Path(d) / "calib_ingame_live.json").write_text(json.dumps(c), encoding="utf-8")
+                with mock.patch.object(IS, "ART", Path(d)):
+                    ig = IS.IngameModel("_live")
+                self.assertEqual(ig.serving_fit, cfg.get("serving_fit") if keep else None)
+
+
+class ResearchHeldoutGuard(unittest.TestCase):
+    """坑 (闸门 G2 之后): 线上 Stage 4 文件已经没有留出数据 —— 树拟最早 80% 的局, 保序表拟最近 20%。G2 之前写的
+    研究脚本把"split_by_game 的最后 20%"或"≥ 2026-01-15"当成线上模型没见过的考卷; 对着服务模型重跑是样本内打分,
+    不报错, 只偏乐观。ingame_train.require_unseen (和 .mjs 里的 requireUnseen) 拦住它。"""
+
+    SF = {"split": [0.8, 0.2], "trees": {"from": "2022-01-15", "through": "2026-01-15"},
+          "iso": {"from": "2026-01-15", "through": "2026-10-16"}}
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d0, mock.patch.dict(os.environ, {"LOL_ARTIFACTS": d0}):
+            import ingame_train
+        cls.IT = ingame_train
+
+    def test_服务模型见过的日期上打分要退出(self):
+        from types import SimpleNamespace
+        import pandas as pd
+        ru = self.IT.require_unseen
+        for first in ("2026-01-15", "2025-06-01", pd.Timestamp("2026-10-16 23:30")):
+            with self.assertRaises(SystemExit, msg=str(first)):
+                ru({"serving_fit": self.SF}, first, "测试")
+        with self.assertRaises(SystemExit):
+            ru(SimpleNamespace(serving_fit=self.SF), "2026-03-01", "测试")
+        ru({"serving_fit": self.SF}, "2026-10-17", "测试")              # 拟合之后的局, 没见过
+        ru({}, "2025-01-01", "测试")                                     # 旧文件: 线上就是评估模型
+        ru(SimpleNamespace(serving_fit=None), "2025-01-01", "测试")
+
+    def test_读线上局内模型的研究脚本都过这道检查(self):
+        for f in ("gate_anchor.py", "gate_early_minutes.py", "gate_calibration.py", "gate_international.py",
+                  "gate_dechatter_backfill.py"):
+            self.assertIn("require_unseen(", (_ROOT / "research" / f).read_text(encoding="utf-8"), f)
+        for f in ("gate_dechatter.mjs", "gate_smoothing.mjs"):
+            self.assertIn("requireUnseen(ingameFile", (_ROOT / "research" / f).read_text(encoding="utf-8"), f)
+
+
+class DailyUpdateStagingDir(unittest.TestCase):
+    """坑: daily_update 原来一律无视 LOL_ARTIFACTS (子进程的被设成 STAGING 盖掉), 想在别处试跑 --dry-run 也会写进
+    工作区的 artifacts_staging/。现在 --dry-run 听它 (和 train.py 同一个意思: 训练输出放哪); 真正的更新不听 ——
+    换上线只从 artifacts_staging/ 换, 不能取决于做实验时 setx 留下的用户环境变量 (计划任务会继承)。指向线上
+    artifacts/ 或互相包含时拒绝 (暂存那一步要先清掉目标目录里的模型文件)。"""
+
+    def test_只有dry_run才听LOL_ARTIFACTS(self):
+        import contextlib
+        import io
+        import tempfile
+        import daily_update as DU                    # 导入时会把本进程 stdout 改成 UTF-8
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(DU._staging_for(False, None), DU.DEFAULT_STAGING)
+            self.assertEqual(DU._staging_for(True, None), DU.DEFAULT_STAGING)
+            self.assertEqual(DU._staging_for(False, d), DU.DEFAULT_STAGING, "真正的更新只从 artifacts_staging 换")
+            self.assertEqual(DU._staging_for(True, d), Path(d).resolve())
+            for bad in (DU.ART, DU.ART / "sub", DU.HERE):
+                with self.assertRaises(ValueError, msg=str(bad)):
+                    DU._staging_for(True, str(bad))
+        self.assertEqual(DU.STAGING, DU.DEFAULT_STAGING, "模块默认值不变")
+
+
+class FeedPinnedNow(unittest.TestCase):
+    """坑: 打完的局并不是任何 startingTime 都给同一批冻结帧 (2026-10-17 Worlds KC vs MVK: 差 10 秒, 末帧差一两秒,
+    经济差十几块)。startingTime 按"此刻"算, test:diff 的两边各按各的时钟取, 就在终局经济上不一致 —— 和移植错误
+    分不开。esports_feed.PINNED_NOW (浏览器版 Feed.pinnedNow) 钉住"此刻", diff-board.mjs 把同一个时刻传给两边。"""
+
+    def test_钉住之后startingTime固定_线上不钉(self):
+        from unittest import mock
+        import esports_feed as EF
+        self.assertIsNone(EF.PINNED_NOW, "线上永远按真实时钟")
+        at = datetime(2026, 10, 17, 21, 3, 17, 500000, tzinfo=timezone.utc)
+        with mock.patch.object(EF, "PINNED_NOW", at):
+            self.assertEqual(EF.EsportsFeed._lagged(60), "2026-10-17T21:02:10Z")
+            self.assertEqual(EF.EsportsFeed._lagged(300), "2026-10-17T20:58:10Z")
+            self.assertEqual(EF.EsportsFeed._lagged(0, datetime(2026, 1, 1, 0, 0, 5, tzinfo=timezone.utc)),
+                             "2026-01-01T00:00:00Z", "显式传的 at 优先 (开局零点校准这类查历史时刻的调用)")
+        got = datetime.strptime(EF.EsportsFeed._lagged(60), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        self.assertLess(abs((datetime.now(timezone.utc) - got).total_seconds() - 60), 12)
+
+    def test_钉住时window不走自适应lag(self):
+        # 自适应 lag 按真实时钟每 lag_probe_sec 秒试探一次更近的档: 两个进程节奏不同就用上不同的 lag (= 不同的
+        # startingTime), 只钉 _lagged 不够 (2026-10-17 实测 KC vs MVK 照样差在终局帧上)。钉住时按查历史时刻处理
+        from unittest import mock
+        import esports_feed as EF
+        f = EF.EsportsFeed()
+        asked = []
+        frame = {"rfc460Timestamp": "2026-10-16T18:41:55.322Z", "gameState": "finished",
+                 "blueTeam": {"totalGold": 60000, "participants": []}, "redTeam": {"totalGold": 50000, "participants": []}}
+
+        def fake_window(gid, starting, ttl, empty_ttl=None):
+            asked.append(starting)
+            return {"frames": [frame]}
+
+        at = datetime(2026, 10, 17, 21, 3, 17, tzinfo=timezone.utc)
+        clock = [1000.0]
+        with mock.patch.object(EF, "PINNED_NOW", at), mock.patch.object(f, "_window", fake_window),                 mock.patch.object(f, "_game_start", lambda gid: None), mock.patch.object(EF.time, "time", lambda: clock[0]):
+            for _ in range(3):
+                self.assertIsNotNone(f.window("g1"))
+                clock[0] += 3600                     # 真实时钟走了很久: 不钉时这里会再试探更近的档
+        self.assertEqual(set(asked), {"2026-10-17T21:02:10Z"}, "每次都是钉住时刻的 lag 60, 没有试探 50 / 40")
+        self.assertNotIn("g1", f._lag, "钉住时不记自适应 lag (players() 也就退回 60)")
+
+    def test_差分测试两边传同一个时刻(self):
+        js = (_ROOT / "frontend" / "scripts" / "diff-board.mjs").read_text(encoding="utf-8")
+        self.assertIn("Feed.pinnedNow = AT", js)
+        self.assertIn('"--at", String(AT)', js)
+        self.assertIn("EF.PINNED_NOW = ", (_ROOT / "tools" / "board_oracle.py").read_text(encoding="utf-8"))
+        self.assertIn("static pinnedNow", (_ROOT / "frontend" / "src" / "web" / "feed.ts").read_text(encoding="utf-8"))
+
+
+class WebStage1ExportCompat(unittest.TestCase):
+    """坑: 新导出发布那一刻, 已经打开、还没加载过模型的标签页跑的是旧 bundle; 旧版 loadStage1 见到 calibrator 不是
+    "platt" 就抛错, 而 static-api 的 models() 把四个模型一起加载 —— 局内看板也跟着挂掉, 直到刷新。导出的
+    calibrator 永远写 "platt" (旧代码读兼容 Platt 照常出数), 新代码只看 logit_elo 段在不在。"""
+
+    def test_导出的calibrator永远是platt_logit_elo另放(self):
+        from types import SimpleNamespace
+        sys.path.insert(0, str(_ROOT / "tools"))
+        import export_web_model as EW
+        le = {"coef": [0.3, 1.0], "intercept": 0.17, "logit_clip": 1e-7, "elo_scale": 0.0057, "elo_weight": 0.78,
+              "elo_sd": 104.5, "elo": {"column": "elo_gap", "k": 20.0, "init": 1500.0, "regress": 0.5}, "inputs": []}
+        new = EW._calib(SimpleNamespace(calibrator="logit_elo", a=5.1, b=-2.5, logit_elo=le))
+        self.assertEqual(new["calibrator"], "platt")
+        self.assertEqual(new["platt"], {"a": 5.1, "b": -2.5})
+        self.assertEqual(new["logit_elo"]["elo_sd"], 104.5)
+        self.assertEqual(new["logit_elo"]["coef"], [0.3, 1.0])
+        old = EW._calib(SimpleNamespace(calibrator="platt", a=5.1, b=-2.5, logit_elo=None))
+        self.assertEqual(old, {"calibrator": "platt", "platt": {"a": 5.1, "b": -2.5}})
+        ts = (_ROOT / "frontend" / "src" / "web" / "stage1.ts").read_text(encoding="utf-8")
+        self.assertIn("file.logit_elo ?? null", ts, "浏览器版按 logit_elo 段在不在选校准方式")

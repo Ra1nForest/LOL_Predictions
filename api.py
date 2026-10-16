@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from xgboost import XGBClassifier
 
+import fdlibm
 from feature_store import FeatureStore, ROLES
 from ingame_service import IngameModel, SessionStore, NO_PRE_STATS
 import websearch as WS
@@ -45,7 +46,18 @@ STATE: dict = {}
 # ══════════════════════════════════════════════════════════
 
 class Stage:
+    """Stage 1/2 的一个阶段: 树 + 校准层。
+
+    校准方式按 calib 文件的 calibrator 字段 (train.py 的文档):
+      "logit_elo"  σ((logit(clip(p_raw))·c₁ + (elo_gap·scale)·c₂) + b) —— 闸门 G1 的 (d), elo_gap 来自
+                   FeatureStore.make_row (赛区内 Elo, 只进校准层不进树)
+      没有这个字段 旧文件: Platt σ(a·p_raw + b)。新代码配旧文件 (合并后、下次重训前) 照旧能跑
+    新文件里 coef / intercept 仍是同一校准段上的兼容 Platt —— 那是给旧版代码读的, 这里不用。
+    浏览器版是 web/stage1.ts 的 loadStage1 / predictStage1 / topEvidence。
+    """
+
     def __init__(self, name: str):
+        from feature_store import ELO_COL, ELO_INIT, ELO_K, ELO_REG
         self.name = name
         self.model = XGBClassifier()
         self.model.load_model(str(ART / f"model_{name}.json"))
@@ -54,16 +66,57 @@ class Stage:
         self.features = cfg["features"]
         self.metrics = cfg["metrics"]
         self.importance = dict(zip(self.features, self.model.feature_importances_))
+        self.calibrator = cfg.get("calibrator", "platt")
+        self.logit_elo = None
+        if self.calibrator == "logit_elo":
+            le = cfg["logit_elo"]
+            # 特征库按 feature_store 现在的常数算 elo_gap; 校准层是按训练时的常数拟的。两边对不上不会报错,
+            # 只会给出一个看着合理的错数 —— 宁可加载时就拒绝
+            want = {"column": ELO_COL, "k": ELO_K, "init": ELO_INIT, "regress": ELO_REG}
+            if le["elo"] != want:
+                raise ValueError(f"calib_{name}.json 的 Elo 常数 {le['elo']} 和 feature_store 的 {want} "
+                                 f"不一致 —— 重跑 train.py")
+            self.logit_elo = le
+        elif self.calibrator != "platt":
+            raise ValueError(f"calib_{name}.json: 不认识的校准方式 {self.calibrator}")
 
     def predict(self, row: dict) -> tuple[float, float]:
         x = np.array([[float(row.get(f, np.nan)) for f in self.features]])
         x = np.nan_to_num(x, nan=-999.0)
         raw = float(self.model.predict_proba(x)[0, 1])
-        cal = 1.0 / (1.0 + math.exp(-(self.a * raw + self.b)))
+        le = self.logit_elo
+        if le is None:
+            # fdlibm.exp 而不是 math.exp: 看板上的 BP 后 / 赛前概率不取整就输出, 浏览器版要逐位相同 (见 fdlibm.py)
+            cal = 1.0 / (1.0 + fdlibm.exp(-(self.a * raw + self.b)))
+        else:
+            from feature_store import ELO_COL, logit_elo_prob
+            g = row.get(ELO_COL)
+            if g is None or (isinstance(g, float) and math.isnan(g)):
+                # 不退回 Platt: Platt 的系数是给旧代码的兼容件, 悄悄换过去就是另一个模型的数
+                raise ValueError(f"{self.name}: 这一行没有 {ELO_COL}, 算不了 logit_elo 校准")
+            cal = logit_elo_prob(raw, float(g), le["coef"], le["intercept"],
+                                 le["logit_clip"], le["elo_scale"])
         return raw, cal
 
     def top_evidence(self, row: dict, k: int = 8):
+        """按权重取前 k 条依据: 树特征用全局重要性; logit_elo 时 Elo 差也算一条 (它不在树里)。
+        Elo 放在最前再做稳定排序, 同分时排前面。
+
+        Elo 那一条的权重 = elo_weight (它在校准层里的份量, 见 train.elo_weight) × min(1, |这一场的 Elo 差| /
+        elo_sd) —— 差距到了典型大小 (校准段上的一个标准差) 才拿满份量。不缩放时它是个常数 (~0.7-0.8, 树特征
+        都在 0.1 以下), 两队只差 7 分也排第一、气泡最大 (2026-10-17 实测 KRX 对 DNS); 缩放后小差距自然排到
+        后面。旧的 logit_elo 文件没有 elo_sd 就不缩放。浏览器版 web/stage1.ts 的 topEvidence 同一个式子。
+        """
         items = []
+        if self.logit_elo is not None:
+            from feature_store import ELO_COL
+            g = row.get(ELO_COL)
+            if g is not None and not (isinstance(g, float) and np.isnan(g)):
+                w = float(self.logit_elo["elo_weight"])
+                sd = self.logit_elo.get("elo_sd")
+                if sd:
+                    w = w * min(1.0, abs(float(g)) / float(sd))
+                items.append((ELO_COL, float(g), w))
         for f in self.features:
             v = row.get(f)
             if v is None or (isinstance(v, float) and np.isnan(v)):
@@ -176,9 +229,19 @@ MODEL_KEYS = ("accuracy", "baseline", "lift", "ece_cal", "p_min", "p_max")
 
 
 def _model_card(stage) -> dict:
+    """Stage 1/2 的模型卡。卡上的 p_min / p_max 的意思是"模型够不到的区间" (前端 PreMatch 画成斜线死区)。
+
+    logit_elo (闸门 G1) 没有硬上下限: metrics 里的 p_min / p_max 只是测试段的两端, Elo 差很大时输出会越过它们,
+    画成"够不到"就是错的。所以这时卡上不给这两个键 (前端拿不到就不画死区), 范围只在 range_note 里按
+    "出现过的范围, 不是上下限"说。Platt (旧文件) 照旧。浏览器版: web/stage1.ts 的 modelCard。
+    """
     d = {k: stage.metrics[k] for k in MODEL_KEYS if k in stage.metrics}
     d["note"] = EX.confidence_note(d)
-    d["range_note"] = EX.range_note(d.get("p_min"), d.get("p_max"))
+    if getattr(stage, "calibrator", "platt") == "logit_elo":
+        lo, hi = d.pop("p_min", None), d.pop("p_max", None)
+        d["range_note"] = EX.range_note(lo, hi, bounded=False)
+    else:
+        d["range_note"] = EX.range_note(d.get("p_min"), d.get("p_max"))
     return d
 
 
@@ -1248,15 +1311,17 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                     print(f"  Stage2 参考线跳过: {type(e).__name__}: {e}")
             board_p2 = p2
 
+            # 看板上的局内数一律去抖 (dechatter=True, 闸门 G3, 见 ingame_service.DECHATTER_SHIFTS):
+            # 头条、下面的曲线, 以及浏览器版的逐秒走势和直播回放, 四处同一个数
             if use_pre:
                 pred, _row = _ingame_core(bl, rl, minfo.league, sd, bch, rch, True,
-                                          blend=True, blend_with=p2, pre_league=pg_lg)
+                                          blend=True, blend_with=p2, pre_league=pg_lg, dechatter=True)
             elif xr is not None:
                 # 跨赛区模型 C: 局内模型照旧不带赛前特征 (同下), 但开局 3-15 分钟从 C 的赛前数渐变过渡 ——
                 # 和国内看板拿 BP 后当锚是同一个 _blend_prior。采纳理由同国内 ("不显著变差 + 连续"):
                 # 跨赛区历史局上渐变对硬切系列赛 t +2.27 (方向是变好), 第 3 分钟的跳变 18.6 → 0.11 个百分点。
                 pred, _row = _ingame_core(bl, rl, minfo.league, sd, bch, rch, False,
-                                          blend=True, blend_with=xr["p"])
+                                          blend=True, blend_with=xr["p"], dechatter=True)
                 pred["pregame_probability_blue"] = round(xr["p"], 4)
                 pred["pregame_source"] = "xregion"
             else:
@@ -1264,7 +1329,7 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                 # 自己的数。include_pre=False 是显式的 —— 不能让 _ingame_core 退回按比赛赛区去算
                 # _pre_context (那正是跨赛区上没有预测力的那套特征)。实测把局内模型的赛前特征整组
                 # 置空, 跨赛区国际赛上 Brier 差 +0.0007, t = +0.15: 丢掉它们不损失什么。
-                pred, _row = _ingame_core(bl, rl, minfo.league, sd, bch, rch, False)
+                pred, _row = _ingame_core(bl, rl, minfo.league, sd, bch, rch, False, dechatter=True)
             # 原因放第一条; 故意不带赛前特征时去掉局内模型那句"没有可用的赛前队伍统计"
             pred["warnings"] = _board_warnings(pred["warnings"], why_kind, why)
             if minfo.predictable:
@@ -1290,7 +1355,9 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                                ingame_probability_blue=pred.get("ingame_probability_blue",
                                                                 pred.get("probability_blue")),
                                blend_weight=bw, anchor_probability_blue=a_p, anchor_source=a_src,
-                               trained_through=(pred.get("model") or {}).get("trained_through"))
+                               trained_through=(pred.get("model") or {}).get("trained_through"),
+                               # 记下的局内数是去抖过的 (上面三条分支都开了), 和留出集的单点读数不是同一个口径
+                               dechatter=bool(pred.get("dechattered")))
             if p2 is not None:
                 pred["postdraft_probability_blue"] = p2
 
@@ -1352,20 +1419,20 @@ def esports_board(match_id: str, game_id: Optional[str] = None,
                         # include_pregame 必须和头条数字一致 (有赛前口径时 True)。
                         # 传 False 会让模型丢掉全部赛前特征, 实测同一时刻
                         # 曲线末端 81.7% 对头条 87.9% —— 差 6pp, 看着就像 bug。
-                        # blend 同头条: 曲线开局那段也从 BP 后渐变过渡, 两者同一个数
+                        # blend 同头条: 曲线开局那段也从 BP 后渐变过渡, 两者同一个数; dechatter 也同头条
                         if use_pre:
                             res, _row = _ingame_core(bl, rl, minfo.league, sd,
                                                      c_bch, c_rch, True,
                                                      pre_ctx=pre_ctx,
                                                      blend=True, blend_with=board_p2,
-                                                     pre_league=pg_lg)
+                                                     pre_league=pg_lg, dechatter=True)
                         elif xr is not None:
                             res, _row = _ingame_core(bl, rl, minfo.league, sd,
                                                      c_bch, c_rch, False,
-                                                     blend=True, blend_with=xr["p"])
+                                                     blend=True, blend_with=xr["p"], dechatter=True)
                         else:
                             res, _row = _ingame_core(bl, rl, minfo.league, sd,
-                                                     c_bch, c_rch, False)
+                                                     c_bch, c_rch, False, dechatter=True)
                         last_p = res.get("probability_blue")
                     except Exception as e:
                         # 这里以前是静默 pass, 于是元组解包失败也看不出来,
@@ -1444,7 +1511,8 @@ def predict(req: PredictRequest):
                         "model_accuracy": stg.metrics["accuracy"],
                         "model_baseline": stg.metrics["baseline"],
                         "model_ece": stg.metrics["ece_cal"],
-                        "p_range": [stg.metrics["p_min"], stg.metrics["p_max"]]}
+                        "p_range": [stg.metrics["p_min"], stg.metrics["p_max"]],
+                        "calibrator": stg.calibrator}
             rv = agents.review(pred_ctx, stg.top_evidence(row))
             out["stages"]["3_agent_review"] = rv
         except Exception as e:
@@ -1462,6 +1530,10 @@ def predict(req: PredictRequest):
     disc = ["概率来自留出测试集校准的统计模型, 非投注建议。",
             "模型概率输出范围有限, 对一边倒的对局判别力不足。",
             "walk-forward 估计的期望 lift 约 +0.13 ± 0.10, 单场预测不确定性大。"]
+    if getattr(stages["post_draft" if draft_dict else "pre_draft"], "calibrator", "platt") == "logit_elo":
+        # logit_elo 没有硬上下限 (见 _model_card): "输出范围有限" 不再成立, 陈旧的断言比没有更糟。
+        # 浏览器版 web/stage1.ts 的 predictResponse 同一条规则
+        disc.remove("模型概率输出范围有限, 对一边倒的对局判别力不足。")
     if draft_dict:
         disc.append("数据源已公告: 2026 年 BP 规则变更导致部分比赛的英雄选择记录"
                     "可能不正确, draft 相关特征存在已知误差。")
@@ -1525,17 +1597,26 @@ def _ingame_disclaimer(ig) -> str:
     回归之后真实是 77% / ECE 0.016, 那句话就成了假的 —— 而它会被界面原样
     印出来、被 Stage 3 的 agent 当事实引用。同一个坑今天在 clip_warning()
     上刚踩过一次: 陈旧的断言比没有断言更糟。
+
+    闸门 G2 起线上是"服务模型" (ig.serving_fit 不为空): metrics 出自同一配方的 60/20/20 评估版, 线上这份
+    把那段留出数据也拟进去了, 自己没有留出成绩 —— 照旧说"局内模型在留出测试集上准确率约 X%"就是把评估版的
+    成绩安在它头上。旧文件 (没有 serving_fit) 的线上模型就是评估模型, 原句照旧成立。
+    浏览器版: web/ingame.ts 的 disclaimer。
     """
     m = ig.metrics
     acc, ece = m.get("accuracy"), m.get("ece")
     t25 = ((m.get("per_T") or {}).get("25") or {}).get("accuracy")
     how = "保序回归" if getattr(ig, "calibrator", "platt") == "isotonic" else "Platt"
+    serving = getattr(ig, "serving_fit", None) is not None
     bits = []
     if acc is not None:
-        s = f"局内模型在留出测试集上准确率约 {acc:.0%}"
+        s = (f"局内模型的同一配方在留出测试集上准确率约 {acc:.0%}" if serving
+             else f"局内模型在留出测试集上准确率约 {acc:.0%}")
         if t25 is not None:
             s += f", 25 分钟时约 {t25:.0%}"
         bits.append(s + "。")
+        if serving:
+            bits.append("线上这份把那段比赛也用来拟合了, 自身没有留出成绩。")
     if ece is not None:
         bits.append(f"概率经{how}校准 (ECE ≈ {ece:.3f})。")
     bits.append("非投注建议。")
@@ -1566,9 +1647,19 @@ def _blend_prior(prior, ingame, minute):
 
 
 def _ingame_core(req_blue, req_red, league, st, bch, rch, include_pre, raw=False,
-                 pre_ctx=None, blend=False, blend_with=None, pre_league=None):
+                 pre_ctx=None, blend=False, blend_with=None, pre_league=None, dechatter=False):
     # blend=True (看板用): 开局那段从 blend_with (BP 后概率; None 则用赛前概率) 渐变过渡到局内模型,
     # 见 _blend_prior。/predict/ingame 不开 —— 它回答的是"局内模型怎么看", 不掺别的模型。
+    #
+    # dechatter=True (看板用, 闸门 G3; 见 ingame_service.DECHATTER_SHIFTS): 局内模型的数换成经济差
+    # ±200 邻域 9 个点的校准概率的平均, **先去抖、再渐变**, 夹住的警告看渐变后的最终输出。只有概率变:
+    #   · evidence / reasons、slice_used、warnings (除夹住那条) 都出自**没挪过**的那一行 —— 理由说的是
+    #     场上真实的经济差, 不是 9 个假想局面里的某一个
+    #   · probability_raw 仍是没挪过那一行的树原始输出 (校准前), 不是 9 个原始输出的平均。开了去抖之后
+    #     probability_blue 不再等于 calibrate(probability_raw) (第 15 分钟以后也一样), 响应里另带
+    #     dechattered: true 说明这一点
+    #   · ingame_probability_blue (渐变时才有) 是去抖后、渐变前的局内读数
+    # /predict/ingame 和 /session tick 不开 (照旧是单点读数, test:golden 的老用例一个字节不变)。
     #
     # league 只决定局内模型自己的 is_*; 赛前特征 (_pre_context) 按 pre_league 算,
     # 不给就同 league。两者分开是为国际赛: 同母赛区对阵时看板传 pre_league = 两队的母赛区, 而
@@ -1602,13 +1693,15 @@ def _ingame_core(req_blue, req_red, league, st, bch, rch, include_pre, raw=False
         except Exception as e:
             warns.append(f"赛前特征不可用: {e}")
 
-    row, w2 = ig.make_row(
-        minute=st.minute, golddiff=st.golddiff, xpdiff=st.xpdiff,
-        csdiff=st.csdiff, blue_kills=st.blue_kills, red_kills=st.red_kills,
-        gold_total=st.gold_total, blue_champs=bch, red_champs=rch,
-        pre_row=pre_row, league=league)
+    kw = dict(minute=st.minute, xpdiff=st.xpdiff, csdiff=st.csdiff,
+              blue_kills=st.blue_kills, red_kills=st.red_kills, gold_total=st.gold_total,
+              blue_champs=bch, red_champs=rch, pre_row=pre_row, league=league)
+    row, w2 = ig.make_row(golddiff=st.golddiff, **kw)
     warns += w2
     raw_p, cal = ig.predict(row)
+    if dechatter:
+        # 挪过的行由 make_row 原样重组 (警告不随经济差变, 丢掉即可); 挪动量 0 那一行就是 row 本身
+        cal = ig.dechattered(lambda d: ig.make_row(golddiff=st.golddiff + d, **kw)[0])
     ig_cal, w_blend = cal, None
     if blend:
         anchor = blend_with if blend_with is not None else pre_p
@@ -1648,9 +1741,12 @@ def _ingame_core(req_blue, req_red, league, st, bch, rch, include_pre, raw=False
             out["shift_note"] = (f"相比赛前, 局势已向 {side} 移动 "
                                  f"{abs(d) * 100:.0f} 个百分点")
     if w_blend is not None:
-        # 头条是渐变后的数; 局内模型自己的读数和它占的权重也给出来, 核对用
+        # 头条是渐变后的数; 局内模型自己的读数和它占的权重也给出来, 核对用 (去抖时是去抖后的读数)
         out["ingame_probability_blue"] = round(ig_cal, 4)
         out["blend_weight"] = round(w_blend, 4)
+    if dechatter:
+        # 概率是经济差邻域平均过的, probability_raw 却是单点的树输出 —— 两者不再是"校准前/校准后"的关系
+        out["dechattered"] = True
     out["model"]["note"] = EX.confidence_note(out["model"])
     out["model"]["range_note"] = EX.range_note(
         ig.metrics.get("p_min"), ig.metrics.get("p_max"))
@@ -1863,18 +1959,32 @@ def _brief_for(req: DebateRequest):
     # 只训练了 LCK/LEC, 对 LPL 是外推" —— 听着合理, 但是错的。而且三个 agent
     # 的信息缺口相同, 交叉质证反而会一起放大这个错误前提。
     # 凡是它们会拿来当论据的事实, 简报里就该有。
+    # 校准方式按 calib 文件说 —— 换成 logit_elo 之后还写 "Platt 校准" / "范围受限于", agent 会把一句
+    # 过时的话当事实引用 (局内模型的 clip_warning 踩过同一个坑)。logit_elo 没有硬上下限, 那两个数只是
+    # 测试段上出现过的两端。
+    if getattr(stg, "calibrator", "platt") == "logit_elo":
+        cal_lines = [f"  概率经校准层校准 (树的原始概率 + 两队赛区内 Elo 差, logistic 回归), "
+                     f"ECE {stg.metrics['ece_cal']:.3f}",
+                     f"  留出测试集上概率出现过的范围 [{stg.metrics['p_min']:.2f}, {stg.metrics['p_max']:.2f}] "
+                     f"(不是硬上下限, Elo 差很大时可以越过)"]
+    else:
+        cal_lines = [f"  概率已 Platt 校准, ECE {stg.metrics['ece_cal']:.3f}",
+                     f"  概率输出范围受限于 [{stg.metrics['p_min']:.2f}, {stg.metrics['p_max']:.2f}]"]
     L += ["",
           "模型元信息:",
           f"  留出测试集准确率 {stg.metrics['accuracy']:.1%} (基线 {stg.metrics['baseline']:.1%})",
-          f"  概率已 Platt 校准, ECE {stg.metrics['ece_cal']:.3f}",
-          f"  概率输出范围受限于 [{stg.metrics['p_min']:.2f}, {stg.metrics['p_max']:.2f}]",
+          *cal_lines,
           f"  训练样本 {stg.metrics.get('n_train', '?')} 局 "
           f"(赛前/BP 段), 覆盖 LPL/LCK/LEC/LCS 四大赛区 2022 年起的比赛"]
     if ig_block is not None:
-        igm = STATE["ingame_live" if req.ingame.xpdiff is None else "ingame"].metrics
+        igx = STATE["ingame_live" if req.ingame.xpdiff is None else "ingame"]
+        igm = igx.metrics
         L += [f"  局内模型: 训练集含全部联赛 (不限四大赛区), 整体准确率 "
               f"{igm.get('accuracy', 0):.1%}, 本切片 "
-              f"{igm.get('per_T', {}).get(str(ig_block['slice']), {}).get('accuracy', 0):.1%}",
+              f"{igm.get('per_T', {}).get(str(ig_block['slice']), {}).get('accuracy', 0):.1%}"
+              # G2 的服务模型: 这些是同一配方评估版的留出成绩 (见 _ingame_disclaimer), 别让 agent 当成线上这份的
+              + (" (同一配方评估版的留出成绩; 线上这份把留出段也拟进去了, 没有自己的留出成绩)"
+                 if getattr(igx, "serving_fit", None) is not None else ""),
               f"  局内概率范围 [{igm.get('p_min', 0):.2f}, {igm.get('p_max', 0):.2f}] "
               f"—— 这是校准的固有上限, 不是模型在低估领先方",
               "  (以上是事实, 不要据此推断训练集不含某赛区)"]

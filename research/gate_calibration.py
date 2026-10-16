@@ -87,8 +87,11 @@ def main():
     m = XGBClassifier()
     m.load_model(str(_ROOT / "artifacts/model_ingame.json"))
 
-    # 模型只在 tr 上训过, cal+te 都是它没见过的 —— 合起来做校准实验的池子
+    # 模型只在 tr 上训过, cal+te 都是它没见过的 —— 合起来做校准实验的池子。
+    # G2 之后线上的树拟在最早 80% 上, cal 那段它见过 —— 样本内, 不报错只偏乐观 (见 ingame_train.require_unseen)
     pool = pd.concat([cal, te], ignore_index=True)
+    from ingame_train import require_unseen
+    require_unseen(cfg, pool["date"].min(), "gate_calibration")
     pool["raw"] = m.predict_proba(pool[feats].astype(float).fillna(-999))[:, 1]
     print(f"校准实验池: {pool.gameid.nunique()} 局 / {len(pool)} 条 "
           f"(模型训练时没见过)")

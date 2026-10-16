@@ -575,8 +575,18 @@ async function curveCtx(
   return { blue, red, league, preLeague, preCtx, ln, prior, xr };
 }
 
-/** 曲线上一行的胜率, 和看板头条同一个函数。失败给 null, 调用方沿用上一个点 */
-function curveProb(m: Models, teams: TeamsFile, today: string, c: CurveCtx, row: TimelineRow): { p: unknown } | null {
+/**
+ * 曲线上一行的胜率, 和看板头条同一个函数。失败给 null, 调用方沿用上一个点。
+ * dechatter 同头条 (经济差 ±200 邻域平均, 闸门 G3); 只有研究脚本复现闸门之前的看板时才传 false
+ */
+function curveProb(
+  m: Models,
+  teams: TeamsFile,
+  today: string,
+  c: CurveCtx,
+  row: TimelineRow,
+  dechatter = true,
+): { p: unknown } | null {
   try {
     const base = {
       blue: c.blue,
@@ -592,6 +602,7 @@ function curveProb(m: Models, teams: TeamsFile, today: string, c: CurveCtx, row:
       },
       blueChamps: c.ln ? c.ln[0] : null,
       redChamps: c.ln ? c.ln[1] : null,
+      dechatter,
     };
     // 有赛前口径: 带赛前特征 (和头条一致) + 从 BP 后渐变; 没有但有 C: 不带赛前特征, 从 C 渐变;
     // 都没有: 局内模型自己的数。三种都同头条
@@ -615,11 +626,37 @@ function curveProb(m: Models, teams: TeamsFile, today: string, c: CurveCtx, row:
 }
 
 /**
+ * 让出主线程一次 (排一个宏任务)。不用 setTimeout(0): 后台标签页里它被限到每秒一次 (久了每分钟一次),
+ * 一局的逐秒走势要让十几次, 就得补十几秒甚至十几分钟; MessageChannel 的消息不受这个限制。
+ */
+function yieldToMain(): Promise<void> {
+  if (typeof MessageChannel === "undefined") return new Promise((r) => setTimeout(r, 0));
+  return new Promise((resolve) => {
+    const ch = new MessageChannel();
+    ch.port1.onmessage = () => {
+      ch.port1.close();
+      resolve();
+    };
+    ch.port2.postMessage(null);
+  });
+}
+
+/** 逐秒走势连续算多久让一次主线程 (毫秒)。一帧 16 ms, 留点余量给渲染和输入 */
+const FINE_SLICE_MS = 12;
+
+/**
  * 逐秒走势 (静态站的走势图用, 见 feed.fineRows): 每一行配上胜率, 和看板曲线同一套 (curveCtx / curveProb)。
  * 看板自己的 timeline 不动 —— 它是 test:diff 拿去和 Python 逐字段比的东西。
  * 每补完一批交一次。胜率按 (帧, 分钟数) 记在 memo 里: 传同一个 memo 反复重算, 只有新的点真算 ——
  * 键里带分钟数, 是因为暂停区间事后才认出来时, 同一帧的局内时间会被修正, 那就得重算。
  * blue / red / league / preLeague 的取法和看板曲线一样, 见 boardPlan。
+ *
+ * 去抖 (闸门 G3) 之后每个点要 9 次树求值, 整条走势的计算约是原来的 3 倍 (2026-10-17 本机 Node, 帧都在
+ * 缓存里: 10 局平均 160 → 555 ms/局; 手机上再慢几倍)。原来一批 (48 个窗口, 约 480 个新点) 在 fineRows 的
+ * 回调里一口气算完, 去抖后那就是一两百毫秒的整块卡顿。现在回调只把这一批行排进一条异步链, 链上每连续算
+ * FINE_SLICE_MS 毫秒就让一次主线程, 算完一批再交 onBatch —— 实测事件循环最长被占 25 ms, 取窗口和算概率
+ * 也能交叠进行。整个函数仍在最后一批交完之后才返回。
+ * a.dechatter 默认 true (同看板头条); false 只给研究脚本复现闸门之前的看板 (gate_dechatter / gate_smoothing)。
  */
 export async function fineTimeline(
   feed: Feed,
@@ -636,6 +673,8 @@ export async function fineTimeline(
     prior: number | null;
     /** 跨赛区模型 C 的赛前数 (看板响应的 xregion.probability_blue, 经 boardPlan); 没有就 null */
     xr?: number | null;
+    /** 经济差邻域去抖, 默认 true (同看板头条)。不同口径别共用同一个 memo */
+    dechatter?: boolean;
   },
   onBatch: (pts: Json[]) => void,
   memo: Map<string, { p: unknown } | null> = new Map(),
@@ -653,14 +692,24 @@ export async function fineTimeline(
     a.prior,
     a.xr ?? null,
   );
-  await feed.fineRows(a.gameId, a.upto, (rows) => {
+  const dechatter = a.dechatter !== false;
+  const emit = async (rows: TimelineRow[]): Promise<void> => {
+    let t0 = performance.now();
+    for (const row of rows) {
+      if (row.minute < 3) continue;
+      const key = `${row.t}|${row.minute}`;
+      if (memo.has(key)) continue;
+      memo.set(key, curveProb(models, teams, today, c, row, dechatter));
+      if (performance.now() - t0 > FINE_SLICE_MS) {
+        await yieldToMain();
+        t0 = performance.now();
+      }
+    }
     let lastP: unknown = null;
     onBatch(
       rows.map((row) => {
         if (row.minute >= 3) {
-          const key = `${row.t}|${row.minute}`;
-          if (!memo.has(key)) memo.set(key, curveProb(models, teams, today, c, row));
-          const got = memo.get(key);
+          const got = memo.get(`${row.t}|${row.minute}`);
           if (got) lastP = got.p;
         }
         return {
@@ -672,7 +721,18 @@ export async function fineTimeline(
         };
       }),
     );
-  });
+  };
+  // 各批按到达顺序排队 (后一批是前一批的超集, memo 让它只算新点); fineRows 自己出错时也要等链停下来
+  let chain: Promise<void> = Promise.resolve();
+  try {
+    await feed.fineRows(a.gameId, a.upto, (rows) => {
+      chain = chain.then(() => emit(rows));
+    });
+  } catch (e) {
+    await chain.catch(() => undefined);
+    throw e;
+  }
+  await chain;
 }
 
 async function lineups(feed: Feed, gameId: string): Promise<[string[], string[]] | null> {
@@ -1122,6 +1182,9 @@ export async function buildBoard(
         },
         blueChamps: ln ? ln[0] : null,
         redChamps: ln ? ln[1] : null,
+        // 看板上的局内数一律去抖 (经济差 ±200 邻域平均, 闸门 G3; 同 api.esports_board): 头条、曲线、
+        // 逐秒走势和直播回放四处同一个数
+        dechatter: true,
       };
       // 没有赛前口径 (跨赛区 / 队名不认识): 不带赛前特征, 第 3 分钟起就是局内模型自己的数 —— 有 C 时开局
       // 3-15 分钟从 C 的数渐变过渡 (采纳理由同国内的 BP 后锚: 不显著变差 + 连续; 跨赛区历史局上对硬切

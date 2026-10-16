@@ -23,6 +23,8 @@ export interface ExplainFile {
   role_cn: [string, string][];
   skip_in_reasons: string[];
   tone: [number, string][];
+  /** explain.ELO: 赛区内 Elo 差的 (差值句式, 持平句式)。旧导出没有 —— 那时也没有 Elo 这一条依据 */
+  elo?: [string, string];
 }
 
 export interface EvidenceItem {
@@ -124,6 +126,14 @@ export function explain(
     return scaling(name, v, blue, red);
   }
   if (name === "T") return `按第 ${Math.trunc(v)} 分钟的模型切片评估`;
+
+  // 赛区内 Elo: 取整后是 0 的说"相当", 不说"高 0 分"。句式来自 explain.json 的 elo
+  if (name === "elo_gap") {
+    if (!ex.elo) return null;
+    const shown = pyFixed(Math.abs(v), 0);
+    if (shown === "0") return ex.elo[1];
+    return fill(ex.elo[0], { who: v > 0 ? blue : red, v: shown });
+  }
 
   if (name === "killsum") return `双方已合计击杀 ${Math.trunc(v)} 个人头`;
   if (name === "golddiff_norm") {
@@ -232,9 +242,18 @@ export function confidenceNote(m: Record<string, unknown>): string {
   return parts.join(" · ");
 }
 
-/** explain.range_note: 模型够不到的区间 —— 前端的死区就是这个 */
-export function rangeNote(pMin: number | null | undefined, pMax: number | null | undefined): string {
+/**
+ * explain.range_note。bounded = true: 模型够不到的区间 —— 前端的死区就是这个。bounded = false: Stage 1/2 的
+ * logit_elo 没有硬上下限, 只说留出测试集上出现过的范围 (理由见 Python 那边)
+ */
+export function rangeNote(pMin: number | null | undefined, pMax: number | null | undefined, bounded = true): string {
   if (pMin === null || pMin === undefined || pMax === null || pMax === undefined) return "";
+  if (!bounded) {
+    return (
+      `留出测试集上该模型给出的概率在 ${pyFixed(pMin * 100, 0)}%–${pyFixed(pMax * 100, 0)}% 之间。` +
+      `这不是上下限, 两队赛区内 Elo 差很大时它会给出更极端的数字。`
+    );
+  }
   return (
     `该模型的概率输出被校准限制在 ${pyFixed(pMin * 100, 0)}%–${pyFixed(pMax * 100, 0)}%。` +
     `超出这个范围的一边倒对局, 它只会顶到边界, 不会给出更极端的数字。`

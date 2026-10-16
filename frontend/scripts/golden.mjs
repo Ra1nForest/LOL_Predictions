@@ -2,9 +2,16 @@
  * 黄金测试: 浏览器版模型 (src/web/) 必须和 Python 线上逐位一致。三组:
  *
  *   1. 局内特征/概率   IngameModel.make_row + predict
- *                      输入是 collected/ 的真实直播帧, 外加专打边界的合成局面
- *   2. 局内整条响应     api._ingame_core —— 看板头条和走势图每个点用的就是它
- *   3. 赛前整条响应     POST /predict —— 赛前页面
+ *                      输入是 collected/ 的真实直播帧, 外加专打边界的合成局面。
+ *                      外加看板的去抖读数 (闸门 G3): IngameModel.dechattered 对 web dechatteredCal (cal_dc),
+ *                      挪动量表 (ingame_service.DECHATTER_SHIFTS) 两边必须同一张
+ *   2. 局内整条响应     api._ingame_core —— 看板头条和走势图每个点用的就是它。每条两份: 不去抖的
+ *                      (= /predict/ingame 的口径) 和看板的调法 (dechatter=True + 看板的渐变口径, resp_dc)
+ *   3. 赛前整条响应     POST /predict —— 赛前页面。外加校准层 (logit_elo) 的第二个输入 elo_gap: 每组对阵
+ *                      逐位核对, 另有 FeatureStore.elo_gap 的小表 (跨年回归、池外的队、不存在的池) 和
+ *                      Elo 那句话 (explain_elo); 校准方式 (calibrator) 两边必须是同一种。另有未取整的
+ *                      校准后概率 (cal, 看板的赛前 / BP 后就是不取整输出的) 和校准层用的可移植 log / exp
+ *                      (fdlibm 小表, 逐位相等)
  *   4. BP 后            api._board_draft + api._predict_core —— 看板那条"BP 后"参考线。
  *                      名字对齐 (选手去战队前缀、英雄 id 归一化) 和特征向量逐位核对
  *   5. 国际赛         api.pregame_league (赛前/BP 后按哪个赛区算)、api._known_for (映射队名用
@@ -35,8 +42,10 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildRow, ingameResponse, loadIngame, predictRow } from "../src/web/ingame.ts";
-import { loadStage1, preContext, predictResponse } from "../src/web/stage1.ts";
+import { buildRow, DECHATTER_SHIFTS, dechatteredCal, ingameResponse, loadIngame, predictRow } from "../src/web/ingame.ts";
+import { eloGap, loadStage1, makeRow, preContext, predictResponse, predictStage1 } from "../src/web/stage1.ts";
+import { exp as fdExp, log as fdLog } from "../src/web/fdlibm.ts";
+import { explain } from "../src/web/explain.ts";
 import { draftVector, loadStage2, makeDraftRow, predictCore } from "../src/web/stage2.ts";
 import {
   boardWarnings,
@@ -118,10 +127,16 @@ function diff(js, py, path = "$") {
 const plain = (o) => JSON.parse(JSON.stringify(o));
 
 // ── 1. 局内特征 / 概率 ─────────────────────────────────────
-const f1 = { features: [], warnings: [], slice: [], prob: [] };
+const f1 = { features: [], warnings: [], slice: [], prob: [], dc: [] };
 let maxRaw = 0;
 let maxCal = 0;
 let exactRaw = 0;
+let maxDc = 0;
+let exactDc = 0;
+// 去抖的挪动量表: 两边各写了一份 (ingame_service.DECHATTER_SHIFTS / web/ingame.ts), 逐个相等
+if (JSON.stringify([...DECHATTER_SHIFTS]) !== JSON.stringify(gi.dechatter_shifts)) {
+  f1.dc.push({ src: "DECHATTER_SHIFTS", js: [...DECHATTER_SHIFTS], py: gi.dechatter_shifts });
+}
 for (const c of gi.cases) {
   const i = c.in;
   let pre = null;
@@ -145,6 +160,22 @@ for (const c of gi.cases) {
     league: i.league,
   });
   const p = predictRow(model, b.row);
+  // 看板的去抖读数: 9 个挪过经济差的行各算一次校准概率再平均 (树在 float32 上, 判据同概率)
+  const pDc = dechatteredCal(model, pre, {
+    minute: i.minute,
+    golddiff: i.golddiff,
+    csdiff: i.csdiff,
+    blueKills: i.blue_kills,
+    redKills: i.red_kills,
+    goldTotal: i.gold_total,
+    blueChamps: i.blue_champs,
+    redChamps: i.red_champs,
+    league: i.league,
+  });
+  const ddc = Math.abs(pDc - c.cal_dc);
+  if (ddc === 0) exactDc++;
+  maxDc = Math.max(maxDc, ddc);
+  if (!(ddc < TOL)) f1.dc.push({ src: c.src, js: pDc, py: c.cal_dc });
   const bad = [];
   for (let k = 0; k < p.x.length; k++) {
     if (!Object.is(p.x[k], c.x[k])) bad.push({ f: model.forest.features[k], js: p.x[k], py: c.x[k] });
@@ -164,43 +195,73 @@ for (const c of gi.cases) {
 
 // ── 2. 局内整条响应 ─────────────────────────────────────────
 const f2 = [];
+const f2dc = [];
 let n2 = 0;
+let n2dc = 0;
 for (const c of gi.cases) {
   if (!c.resp) continue;
   n2++;
   const i = c.in;
+  const base = {
+    blue: i.blue,
+    red: i.red,
+    league: i.league,
+    state: {
+      minute: i.minute,
+      golddiff: i.golddiff,
+      csdiff: i.csdiff,
+      blueKills: i.blue_kills,
+      redKills: i.red_kills,
+      goldTotal: i.gold_total,
+    },
+    blueChamps: i.blue_champs,
+    redChamps: i.red_champs,
+    includePregame: i.include_pregame ?? true,
+    preLeague: i.pre_league ?? null,
+  };
   const out = ingameResponse(
     model,
     s1,
     teams,
     ex,
-    {
-      blue: i.blue,
-      red: i.red,
-      league: i.league,
-      state: {
-        minute: i.minute,
-        golddiff: i.golddiff,
-        csdiff: i.csdiff,
-        blueKills: i.blue_kills,
-        redKills: i.red_kills,
-        goldTotal: i.gold_total,
-      },
-      blueChamps: i.blue_champs,
-      redChamps: i.red_champs,
-      includePregame: i.include_pregame ?? true,
-      preLeague: i.pre_league ?? null,
-      // 带 blend_with 的 (跨赛区模型 C 当锚) 按看板的调法: blend=True; 其余不渐变, 同 _ingame_resp
-      ...("blend_with" in i ? { blend: true, blendWith: i.blend_with } : {}),
-    },
+    // 带 blend_with 的 (跨赛区模型 C / BP 后当锚) 按看板的调法: blend=True; 其余不渐变, 同 _ingame_resp
+    { ...base, ...("blend_with" in i ? { blend: true, blendWith: i.blend_with } : {}) },
     gi.today,
   );
   const d = diff(plain(out), c.resp);
   if (d) f2.push({ src: c.src, ...d });
+  // 看板的调法 (同 _ingame_resp(dechatter=True)): 带赛前特征的一律渐变 (锚没给就退回赛前概率),
+  // 不带的只在有 blend_with (C) 时渐变; 再加去抖
+  if (c.resp_dc) {
+    n2dc++;
+    const blend = (i.include_pregame ?? true) !== false || "blend_with" in i;
+    const outDc = ingameResponse(
+      model,
+      s1,
+      teams,
+      ex,
+      { ...base, blend, blendWith: i.blend_with ?? null, dechatter: true },
+      gi.today,
+    );
+    const dd = diff(plain(outDc), c.resp_dc);
+    if (dd) f2dc.push({ src: c.src, ...dd });
+  }
 }
 
 // ── 3. 赛前整条响应 ─────────────────────────────────────────
+// 外加校准层的第二个输入 elo_gap (响应里只有取整后的数, 差一点看不出来): 每组对阵逐位核对;
+// elo 小表 (FeatureStore.elo_gap, 含跨年回归、池外的队、不存在的池) 和 Elo 那句话 (explain_elo) 也逐条核对
 const f3 = [];
+const f3e = { calibrator: [], gap: [], table: [], text: [], fdlibm: [], cal: [] };
+let n3cal = 0;
+let exact3cal = 0;
+let max3cal = 0;
+if ((gs.calibrator ?? "platt") !== (s1.logitElo ? "logit_elo" : "platt")) {
+  f3e.calibrator.push({ js: s1.logitElo ? "logit_elo" : "platt", py: gs.calibrator });
+}
+if ((g2.calibrator ?? "platt") !== (s2.logitElo ? "logit_elo" : "platt")) {
+  f3e.calibrator.push({ what: "stage2", js: s2.logitElo ? "logit_elo" : "platt", py: g2.calibrator });
+}
 for (const c of gs.cases) {
   const tag = `${c.in.blue_team} vs ${c.in.red_team} (${c.in.league}${c.in.playoffs ? ", 季后赛" : ""})`;
   try {
@@ -211,8 +272,41 @@ for (const c of gs.cases) {
     }
     const d = diff(plain(out), c.resp);
     if (d) f3.push({ src: tag, ...d });
+    if ("elo_gap" in c) {
+      const row = makeRow(teams, c.in.blue_team, c.in.red_team, c.in.league, c.in.playoffs ? 1 : 0, gs.today).row;
+      const g = row.elo_gap;
+      if (!Object.is(g, c.elo_gap)) f3e.gap.push({ src: tag, js: g, py: c.elo_gap });
+      if ("cal" in c) {
+        // 未取整的校准后概率: 树在 float32 上 (|Δ| < 1e-6 才算超差), 逐位相等的另计。校准层的 exp / log 是
+        // fdlibm 的移植 —— 树的输出 (raw) 两边一样时, 这里差一个比特就算失败 (换回 Math.exp / Math.log 会这样)
+        const { raw, cal } = predictStage1(s1, row);
+        n3cal++;
+        if (Object.is(cal, c.cal)) exact3cal++;
+        const d = Math.abs(cal - c.cal);
+        max3cal = Math.max(max3cal, d);
+        if (!(d < TOL) || (Object.is(raw, c.raw) && !Object.is(cal, c.cal))) {
+          f3e.cal.push({ src: tag, raw: [raw, c.raw], cal: [cal, c.cal] });
+        }
+      }
+    }
   } catch (e) {
     if (!c.error || e.message !== c.error) f3.push({ src: tag, path: "报错", js: e.message, py: c.error ?? "(不该报错)" });
+  }
+}
+for (const c of gs.elo ?? []) {
+  const js = eloGap(teams, c.in[0], c.in[1], c.in[2], c.in[3]);
+  if (!Object.is(js, c.out)) f3e.table.push({ in: c.in, js, py: c.out });
+}
+for (const c of gs.explain_elo ?? []) {
+  const js = explain(ex, "elo_gap", c.in[0], c.in[1], c.in[2]);
+  if (js !== c.out) f3e.text.push({ in: c.in, js, py: c.out });
+}
+// 可移植的 log / exp 本身 (fdlibm.py ↔ web/fdlibm.ts): 逐位相等。inf / nan 在 JSON 里存成字符串
+const fdNum = (v) => (typeof v === "number" ? v : v === "inf" ? Infinity : v === "-inf" ? -Infinity : NaN);
+for (const [name, fn] of [["log", fdLog], ["exp", fdExp]]) {
+  for (const c of gs.fdlibm?.[name] ?? []) {
+    const js = fn(c.in);
+    if (!Object.is(js, fdNum(c.out))) f3e.fdlibm.push({ fn: name, in: c.in, js, py: c.out });
   }
 }
 
@@ -220,6 +314,7 @@ for (const c of gs.cases) {
 const f4 = { names: [], draft: [], x: [], p: [] };
 let max4 = 0;
 let n4p = 0;
+let exact4 = 0;
 for (const c of g2.names) {
   const js = oePlayerName(c.in[0], c.in[1]);
   if (js !== c.out) f4.names.push({ in: c.in, js, py: c.out });
@@ -233,7 +328,8 @@ for (const c of g2.cases) {
   }
   if (!d) continue;
   try {
-    const x = draftVector(s2, makeDraftRow(s2, teams, c.in.blue, c.in.red, c.in.league, d, g2.today));
+    const row = makeDraftRow(s2, teams, c.in.blue, c.in.red, c.in.league, d, g2.today);
+    const x = draftVector(s2, row);
     if (c.error) {
       f4.p.push({ src: c.src, path: "应当报错", js: "没报错", py: c.error });
       continue;
@@ -242,9 +338,12 @@ for (const c of g2.cases) {
     for (let k = 0; k < x.length; k++) {
       if (!Object.is(x[k], c.x[k])) bad.push({ f: s2.forest.features[k], js: x[k], py: c.x[k] });
     }
+    // 校准层的第二个输入 (不在树的向量里)
+    if ("elo_gap" in c && !Object.is(row.elo_gap, c.elo_gap)) bad.push({ f: "elo_gap", js: row.elo_gap, py: c.elo_gap });
     if (bad.length) f4.x.push({ src: c.src, bad: bad.slice(0, 4) });
     const p = predictCore(s2, teams, c.in.blue, c.in.red, c.in.league, d, g2.today);
     n4p++;
+    if (Object.is(p, c.p2)) exact4++;
     const dp = Math.abs(p - c.p2);
     max4 = Math.max(max4, dp);
     if (!(dp < TOL)) f4.p.push({ src: c.src, js: p, py: c.p2 });
@@ -394,10 +493,21 @@ const n1 = gi.cases.length;
 console.log(`1. 局内特征/概率  ${n1} 条 (真实 ${gi.n_real} / 合成 ${gi.n_synthetic})`);
 console.log(`     特征不一致 ${f1.features.length}  警告不一致 ${f1.warnings.length}  切片不一致 ${f1.slice.length}  概率超差 ${f1.prob.length}`);
 console.log(`     max |Δraw| ${fmt(maxRaw)}  max |Δcal| ${fmt(maxCal)}  raw 逐位相等 ${exactRaw}/${n1}`);
-console.log(`2. 局内整条响应   ${n2} 条   不一致 ${f2.length}`);
-console.log(`3. 赛前整条响应   ${gs.cases.length} 条   不一致 ${f3.length}`);
+console.log(
+  `     看板去抖 (挪动量 ${[...DECHATTER_SHIFTS].join(",")}) 超差 ${f1.dc.length}  max |Δ| ${fmt(maxDc)}  逐位相等 ${exactDc}/${n1}`,
+);
+console.log(`2. 局内整条响应   ${n2} 条   不一致 ${f2.length}   看板去抖的调法 ${n2dc} 条 不一致 ${f2dc.length}`);
+console.log(`3. 赛前整条响应   ${gs.cases.length} 条   不一致 ${f3.length}   校准层 ${gs.calibrator ?? "platt"}`);
+console.log(
+  `     elo_gap 不一致 ${f3e.gap.length}  Elo 小表 ${(gs.elo ?? []).length} 条 不一致 ${f3e.table.length}  ` +
+    `Elo 那句话 ${(gs.explain_elo ?? []).length} 条 不一致 ${f3e.text.length}  校准方式不一致 ${f3e.calibrator.length}`,
+);
+console.log(
+  `     未取整的校准后概率 ${n3cal} 条 超差 ${f3e.cal.length}  max |Δ| ${fmt(max3cal)}  逐位相等 ${exact3cal}/${n3cal}  ` +
+    `fdlibm log ${(gs.fdlibm?.log ?? []).length} / exp ${(gs.fdlibm?.exp ?? []).length} 条 不一致 ${f3e.fdlibm.length}`,
+);
 console.log(`4. BP 后          ${g2.cases.length} 局阵容 (算出概率 ${n4p})  选手名 ${g2.names.length} 条`);
-console.log(`     名字不一致 ${f4.names.length}  BP 不一致 ${f4.draft.length}  特征不一致 ${f4.x.length}  概率超差 ${f4.p.length}  max |Δp| ${fmt(max4)}`);
+console.log(`     名字不一致 ${f4.names.length}  BP 不一致 ${f4.draft.length}  特征不一致 ${f4.x.length}  概率超差 ${f4.p.length}  max |Δp| ${fmt(max4)}  逐位相等 ${exact4}/${n4p}`);
 console.log(
   `5. 国际赛        pregame_league ${g5.pregame_league.length} 条  known_for ${g5.known_for.length} 条  map_team ${g5.map_team.length} 条`,
 );
@@ -429,8 +539,16 @@ show("1 特征", f1.features);
 show("1 警告", f1.warnings);
 show("1 切片", f1.slice);
 show("1 概率", f1.prob);
+show("1 看板去抖", f1.dc);
 show("2 局内响应", f2);
+show("2 局内响应 (看板去抖)", f2dc);
 show("3 赛前响应", f3);
+show("3 校准方式", f3e.calibrator);
+show("3 elo_gap", f3e.gap);
+show("3 Elo 小表", f3e.table);
+show("3 Elo 那句话", f3e.text);
+show("3 fdlibm", f3e.fdlibm);
+show("3 未取整的校准后概率", f3e.cal);
 show("4 选手名", f4.names);
 show("4 BP", f4.draft);
 show("4 特征", f4.x);
@@ -456,7 +574,9 @@ show("6 predict", f6.predict);
 show("6 看板重放", f6.replay);
 
 const total =
-  f1.features.length + f1.warnings.length + f1.slice.length + f1.prob.length + f2.length + f3.length +
+  f1.features.length + f1.warnings.length + f1.slice.length + f1.prob.length + f1.dc.length +
+  f2.length + f2dc.length + f3.length +
+  Object.values(f3e).reduce((a, v) => a + v.length, 0) +
   f4.names.length + f4.draft.length + f4.x.length + f4.p.length +
   f5.majors.length + f5.pregame.length + f5.known.length + f5.map.length +
   f5.reason.length + f5.early.length + f5.warns.length + f5.xnote.length + f5.xpre.length +

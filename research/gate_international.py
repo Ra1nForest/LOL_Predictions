@@ -519,6 +519,10 @@ def main():
         te = te.copy()
         t0 = te["date"].min()
         c4 = float(_tr["y"].astype(int).mean())
+    # G2 之后线上 Stage 4 是服务模型, trained_through 之前的局它都见过 —— 上面"按 trained_through 重切"的
+    # 复现只对 G2 之前的文件成立。样本内打分不报错, 只偏乐观 (见 ingame_train.require_unseen)
+    from ingame_train import require_unseen
+    require_unseen(live, te["date"].min(), "gate_international")
     X = te[live.features].astype(float).fillna(-999.0)
     te["raw"] = live.model.predict_proba(X)[:, 1]
     te["p"] = [live.calibrate(float(r)) for r in te["raw"]]

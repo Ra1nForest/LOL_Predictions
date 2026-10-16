@@ -297,6 +297,8 @@ export function liveView(board: BoardResponse, pf: PlayFrame, ctx: ViewCtx): Boa
     },
     blueChamps: bch.length === 5 ? bch : null,
     redChamps: rch.length === 5 ? rch : null,
+    // 同看板头条: 经济差 ±200 邻域去抖 (闸门 G3)。每帧 9 次树求值, 约 0.3 ms, 每秒几帧不成问题
+    dechatter: true,
   };
   const raw = ingameResponse(
     ctx.models.ingame,

@@ -8,7 +8,7 @@
  *     再各一次。同一时间戳的几局先全部取赛前值、再统一更新 (同时开打的局互相看不到)。
  *   · 新赛区的先验 = 迁入队伍原赛区偏移的均值, 用 pairwiseMean —— numpy 那种 8 路分块的成对求和, 顺序累加
  *     会差最后一两位。
- *   · **exp 不用 Math.exp**, 用下面的 exp (fdlibm e_exp.c 的逐行移植, Python 那边是 xregion.portable_exp):
+ *   · **exp 不用 Math.exp**, 用 fdlibm.ts 的 exp (fdlibm e_exp.c 的逐行移植, Python 那边是 xregion.portable_exp = fdlibm.exp):
  *     各平台的 exp 末位互不相同 (本机 Python 的 math.exp 是 MSVC 运行库的, 和 V8 有 7% 的输入差一位, Safari
  *     用系统 libm), 只有只用 IEEE 加减乘除的同一段算法两边才逐位相同。
  *   · 状态 (public/web/xregion.json) 是 export_web_model.py 从 artifacts/xregion.json 原样复制的同一份;
@@ -16,6 +16,10 @@
  * 全部由 test:golden 的 xregion_cases (引擎、predict、整条重放) 和 Python 逐位对账, test:diff 对整块看板。
  * 取数 (赛程、终局帧) 不在这里, 在 board.ts 的 xregionBoard (= api._xregion_board)。
  */
+// 可移植的 exp (fdlibm 的逐行移植): 实现在 fdlibm.ts (Stage 1/2 的校准层也用它), 这里照旧导出, 引用方不用改。
+// 为什么不用 Math.exp 见 fdlibm.py 的模块文档: Safari 的 Math.exp 是系统 libm, 和 Python 那边会差一位。
+import { exp } from "./fdlibm.ts";
+export { exp };
 
 // ── 状态文件的形状 (xregion.build_state, schema 1) ──
 
@@ -76,73 +80,6 @@ export interface XregionState {
 }
 
 const own = (o: object | null | undefined, k: string) => !!o && Object.prototype.hasOwnProperty.call(o, k);
-
-// ── 可移植的 exp (xregion.portable_exp 的逐行移植) ──
-
-const F64 = new Float64Array(1);
-const U32 = new Uint32Array(F64.buffer); // 小端: [低位字, 高位字]
-const FD_HALF = [0.5, -0.5];
-const FD_LN2HI = [6.9314718036912381649e-1, -6.9314718036912381649e-1]; // 0x3fe62e42 fee00000
-const FD_LN2LO = [1.90821492927058770002e-10, -1.90821492927058770002e-10]; // 0x3dea39ef 35793c76
-const FD_INVLN2 = 1.442695040888963387;
-const FD_P1 = 1.66666666666666019037e-1;
-const FD_P2 = -2.77777777770155933842e-3;
-const FD_P3 = 6.61375632143793436117e-5;
-const FD_P4 = -1.6533902205465251539e-6;
-const FD_P5 = 4.13813679705723846039e-8;
-const FD_HUGE = 1.0e300;
-const FD_TWOM1000 = 9.3326361850321887899e-302; // 2**-1000
-const FD_O_THRESHOLD = 7.09782712893383973096e2;
-const FD_U_THRESHOLD = -7.4513321910194110842e2;
-
-/**
- * fdlibm 的 __ieee754_exp: 只用 IEEE 加减乘除和 2 的整数次幂缩放, 在任何平台上都是同一个结果 ——
- * 和 Python 的 xregion.portable_exp 逐位相同 (test:golden 的 exp 用例), 也和 V8 的 Math.exp 相同
- * (V8 本来就是 fdlibm, 只对 x = 1 特判返回 Math.E —— 这里不跟), 但不依赖浏览器: Safari 的 Math.exp 是系统 libm。
- */
-export function exp(x: number): number {
-  F64[0] = x;
-  let hx = U32[1]! >>> 0;
-  const lx = U32[0]! >>> 0;
-  const xsb = (hx >>> 31) & 1;
-  hx = (hx & 0x7fffffff) >>> 0;
-  if (hx >= 0x40862e42) {
-    // |x| >= 709.78...
-    if (hx >= 0x7ff00000) {
-      if (((hx & 0xfffff) | lx) !== 0) return x + x; // NaN
-      return xsb === 0 ? x : 0.0; // exp(±inf)
-    }
-    if (x > FD_O_THRESHOLD) return Infinity;
-    if (x < FD_U_THRESHOLD) return 0.0;
-  }
-  let k = 0;
-  let hi = 0;
-  let lo = 0;
-  if (hx > 0x3fd62e42) {
-    // |x| > 0.5 ln2: 约简到 [-0.5 ln2, 0.5 ln2]
-    if (hx < 0x3ff0a2b2) {
-      hi = x - FD_LN2HI[xsb]!;
-      lo = FD_LN2LO[xsb]!;
-      k = 1 - xsb - xsb;
-    } else {
-      k = Math.trunc(FD_INVLN2 * x + FD_HALF[xsb]!); // 向零取整, 同 C 的 (int)
-      const t = k;
-      hi = x - t * FD_LN2HI[0]!;
-      lo = t * FD_LN2LO[0]!;
-    }
-    x = hi - lo;
-  } else if (hx < 0x3e300000) {
-    // |x| < 2**-28
-    if (FD_HUGE + x > 1) return 1 + x;
-  }
-  const t = x * x;
-  const c = x - t * (FD_P1 + t * (FD_P2 + t * (FD_P3 + t * (FD_P4 + t * FD_P5))));
-  if (k === 0) return 1 - ((x * c) / (c - 2.0) - x);
-  const y = 1 - (lo - (x * c) / (2.0 - c) - hi);
-  // fdlibm 直接往 y 的指数位上加 k —— 乘 2 的整数次幂是精确的, 结果一样; k = 1024 拆两步, 同 Python
-  if (k >= -1021) return k < 1024 ? y * 2 ** k : y * 2 * 2 ** 1023;
-  return y * 2 ** (k + 1000) * FD_TWOM1000;
-}
 
 // ── 常数 (xregion.py 同名) ──
 

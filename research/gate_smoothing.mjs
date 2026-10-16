@@ -11,7 +11,8 @@
  * 所以用 web 的实现直接算。
  *
  * 考卷: backfill/snapshots.jsonl 里的四大赛区局 —— 全部落在 Stage 2 / Stage 4 的按日期留出测试段里
- * (research/gate_anchor.py 核过), 两份线上模型都没见过。lolesports 只留约 95 天, 只取最近 80 天的,
+ * (research/gate_anchor.py 核过), 两份线上模型都没见过 (G2 之前的导出才成立: 之后的局内模型是服务模型, 见
+ * requireUnseen; 复现时 --ingame 指向 G2 之前的导出)。lolesports 只留约 95 天, 只取最近 80 天的,
  * 随机抽 N 局, 每局按线上同一套逐秒走势重算 (fineTimeline), 只看第 3 分钟起 (之前是 BP 后/赛前概率,
  * 本来就平)。渐变的先验用赛前概率 (这里拿不到 BP 名单) —— 原始和平滑两边一样, 不影响比较。
  * 赛前特征按"今天"取 (fineTimeline 的口径), 两边同样受影响, 也不影响比较。
@@ -19,7 +20,7 @@
  * 判据: 每局在段内按秒平均 Brier, 逐局配对, |t| > 2.5 才算显著; 平滑"不显著变差"即可采纳
  * (它是为了显示, 不是为了更准 —— 同 gate_anchor 的 C2)。另报每秒平均波动和 >=4pp 跳变的次数。
  *
- *     node research/gate_smoothing.mjs [--games 150] [--seed 1]
+ *     node research/gate_smoothing.mjs [--games 150] [--seed 1] [--ingame FILE]
  *
  * **结果 (2026-09-13, 150 局): 明显变差, 不上线。**
  *
@@ -61,7 +62,25 @@ const T_ACCEPT = 2.5;
 
 const J = (n) => JSON.parse(readFileSync(path.join(ROOT, "frontend", "public", "web", n), "utf8"));
 const teams = J("teams.json");
-const models = { ingame: loadIngame(J("ingame_live.json")), s1: loadStage1(J("stage1_pre.json")), s2: loadStage2(J("stage2_post.json")), ex: J("explain.json") };
+/**
+ * ingame_train.require_unseen 的同一道检查: G2 起 public/web/ingame_live.json 导出的是 Stage 4 的服务模型 (带
+ * serving_fit), 截至 serving_fit.iso.through 的每一局它拟合时都见过 —— 拿它在那之前的局上打分是样本内, 不报错,
+ * 只偏乐观。复现上线前的结论: --ingame 指向 G2 之前的导出, 例如
+ *   git show 203c887:frontend/public/web/ingame_live.json > old_ingame_live.json
+ */
+function requireUnseen(file, firstDay, who) {
+  const sf = file.serving_fit;
+  if (sf && firstDay <= sf.iso.through) {
+    console.error(
+      `${who}: 这份局内模型是 G2 的服务模型, 拟合时见过截至 ${sf.iso.through} 的每一局 (树 ${sf.trees.from}~${sf.trees.through}, ` +
+        `保序表 ${sf.iso.from}~${sf.iso.through}); 考卷从 ${firstDay} 开始, 是样本内打分。用 --ingame 指向 G2 之前的导出`,
+    );
+    process.exit(2);
+  }
+}
+const ingIdx = process.argv.indexOf("--ingame");
+const ingameFile = ingIdx > 0 ? JSON.parse(readFileSync(process.argv[ingIdx + 1], "utf8")) : J("ingame_live.json");
+const models = { ingame: loadIngame(ingameFile), s1: loadStage1(J("stage1_pre.json")), s2: loadStage2(J("stage2_post.json")), ex: J("explain.json") };
 const today = new Date().toISOString().slice(0, 10);
 
 // 考卷
@@ -80,6 +99,7 @@ let s = SEED;
 const rnd = () => ((s = (s * 1103515245 + 12345) % 2147483648) / 2147483648);
 pool = pool.map((g) => [rnd(), g]).sort((a, b) => a[0] - b[0]).map(([, g]) => g).slice(0, N);
 console.log(`考卷: 四大赛区回溯 ${games.size} 局, 最近 80 天 ${pool.length} 局参与`);
+if (pool.length) requireUnseen(ingameFile, pool.map((g) => g.date.slice(0, 10)).sort()[0], "gate_smoothing");
 
 const logit = (p) => Math.log(Math.min(Math.max(p, 1e-6), 1 - 1e-6) / (1 - Math.min(Math.max(p, 1e-6), 1 - 1e-6)));
 const sig = (z) => 1 / (1 + Math.exp(-z));
@@ -107,7 +127,8 @@ async function one(g) {
   if (!blue || !red) return;
   let pts = [];
   try {
-    await fineTimeline(feed, teams, models, today, { gameId: g.id, blue, red, league: g.league, upto: g.last + 60_000, prior: null }, (p) => { pts = p; });
+    // dechatter: false —— 这道闸量的是去抖 (闸门 G3, 2026-10-17 上线) 之前的看板, 重跑要复现同一个基线
+    await fineTimeline(feed, teams, models, today, { gameId: g.id, blue, red, league: g.league, upto: g.last + 60_000, prior: null, dechatter: false }, (p) => { pts = p; });
   } catch (e) {
     return;
   }

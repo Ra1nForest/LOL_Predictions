@@ -62,7 +62,6 @@ import argparse
 import json
 import math
 import os
-import struct
 import sys
 import warnings
 from collections import defaultdict
@@ -518,67 +517,12 @@ def to_t(ts) -> float:
 
 
 # ── 可移植的 exp (fdlibm e_exp.c) ─────────────────────────────
-# 为什么不用 math.exp: 看板的 C 由两份实现算 (这里和浏览器的 frontend/src/web/xregion.ts), test:diff 要求
-# 逐位相同, 而**没有哪两个平台的 exp 逐位一致**: 本机 math.exp 是 MSVC 运行库的 (实测 20 万个输入里 1147 个
-# 不是正确舍入), V8 的 Math.exp 是 fdlibm (和本机 math.exp 有 7% 的输入差一位), Safari 用系统 libm, Linux 上
-# 的 Python 用 glibc。差一位本身无所谓, 但它会让"同一个看板两边算出不同的数"变成常态, 真正的移植错误就藏在
-# 里面看不见。所以从导出的状态出发的那一段 (Engine.from_state 之后的重放、衰减、logistic) 两边都用这一份:
-# 只有 IEEE 加减乘除和 2 的整数次幂缩放, 每一步在任何平台上都是同一个结果。浏览器版是同一段代码的逐行移植,
-# 和 V8 的 Math.exp 在 20 万个随机输入上逐位相同 (V8 本来就是 fdlibm, 只对 x = 1 特判返回 Math.E; 这里不跟,
-# 两份移植一致就够)。
+# 实现搬到了 fdlibm.py (Stage 1/2 的校准层也要用, 而 feature_store 不能 import 本模块 —— 本模块 import 它)。
+# 为什么不用 math.exp 见那里的模块文档: 看板的 C 由两份实现算, 平台的 exp 两两之间都会差一位。从导出的状态
+# 出发的那一段 (Engine.from_state 之后的重放、衰减、logistic) 两边都用这一份; 浏览器版是 web/fdlibm.ts 的 exp。
 # 闸门和每天导出状态时整表走一遍 (run_elo / build_state) 仍用 math.exp: 闸门的复现 (重构前后 max|Δp| = 0)
 # 一个比特都不动, 状态本身是数据, 两份实现读的是同一个 JSON。两种 exp 至多差一位, 远在模型的意义之下。
-_FD_HALF = (0.5, -0.5)
-_FD_LN2HI = (6.93147180369123816490e-01, -6.93147180369123816490e-01)   # 0x3fe62e42 fee00000
-_FD_LN2LO = (1.90821492927058770002e-10, -1.90821492927058770002e-10)   # 0x3dea39ef 35793c76
-_FD_INVLN2 = 1.44269504088896338700e+00
-_FD_P = (1.66666666666666019037e-01, -2.77777777770155933842e-03, 6.61375632143793436117e-05,
-         -1.65339022054652515390e-06, 4.13813679705723846039e-08)
-_FD_HUGE = 1.0e+300
-_FD_TWOM1000 = 9.33263618503218878990e-302                          # 2**-1000
-_FD_O_THRESHOLD = 7.09782712893383973096e+02
-_FD_U_THRESHOLD = -7.45133219101941108420e+02
-
-
-def portable_exp(x) -> float:
-    """fdlibm 的 __ieee754_exp, 逐行移植 (理由见上)。浏览器版: xregion.ts 的 exp, 两边逐位相同 (test:golden)。"""
-    x = float(x)
-    bits = struct.unpack("<Q", struct.pack("<d", x))[0]
-    hx, lx = bits >> 32, bits & 0xFFFFFFFF
-    xsb = (hx >> 31) & 1
-    hx &= 0x7FFFFFFF
-    if hx >= 0x40862E42:                            # |x| >= 709.78...
-        if hx >= 0x7FF00000:
-            if ((hx & 0xFFFFF) | lx) != 0:
-                return x + x                        # NaN
-            return x if xsb == 0 else 0.0           # exp(±inf)
-        if x > _FD_O_THRESHOLD:
-            return math.inf
-        if x < _FD_U_THRESHOLD:
-            return 0.0
-    k, hi, lo = 0, 0.0, 0.0
-    if hx > 0x3FD62E42:                             # |x| > 0.5 ln2: 约简到 [-0.5 ln2, 0.5 ln2]
-        if hx < 0x3FF0A2B2:                         # 且 |x| < 1.5 ln2
-            hi, lo, k = x - _FD_LN2HI[xsb], _FD_LN2LO[xsb], 1 - xsb - xsb
-        else:
-            k = int(_FD_INVLN2 * x + _FD_HALF[xsb])     # 向零取整, 同 C 的 (int)
-            t = float(k)
-            hi = x - t * _FD_LN2HI[0]
-            lo = t * _FD_LN2LO[0]
-        x = hi - lo
-    elif hx < 0x3E300000:                           # |x| < 2**-28
-        if _FD_HUGE + x > 1.0:
-            return 1.0 + x
-    p1, p2, p3, p4, p5 = _FD_P
-    t = x * x
-    c = x - t * (p1 + t * (p2 + t * (p3 + t * (p4 + t * p5))))
-    if k == 0:
-        return 1.0 - ((x * c) / (c - 2.0) - x)
-    y = 1.0 - ((lo - (x * c) / (2.0 - c)) - hi)
-    # fdlibm 直接往 y 的指数位上加 k —— 乘 2 的整数次幂是精确的, 结果一样。2.0 ** 1024 在 Python 里溢出, 拆两步
-    if k >= -1021:
-        return y * 2.0 ** k if k < 1024 else y * 2.0 * 2.0 ** 1023
-    return y * 2.0 ** (k + 1000) * _FD_TWOM1000
+from fdlibm import exp as portable_exp          # noqa: E402  (名字照旧: 测试和研究脚本都用 xregion.portable_exp)
 
 
 def _iso(x) -> str:

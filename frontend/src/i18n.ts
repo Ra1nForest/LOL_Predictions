@@ -340,6 +340,9 @@ const RULES: [string, string][] = [
   ["{team} 阵容英雄平均胜率 {v}", "{team}'s champions average a {v} win rate"],
   ["{who} 这套阵容的总使用场次多 {v} 场", "{who}'s players have {v} more total games on these champions"],
   ["{team} 这套阵容累计使用 {v} 场", "{team}'s players have {v} total games on these champions"],
+  // 赛区内 Elo (explain.json 的 elo / explain.ELO): 赛前和 BP 后校准层的第二个输入
+  ["{who} 的赛区内 Elo 积分高 {v} 分 (按历年胜负累计的长期实力)", "{who}'s in-league Elo rating is {v} points higher (long-term strength built from results over the years)"],
+  ["双方的赛区内 Elo 积分相当", "The two teams' in-league Elo ratings are about even"],
 
   // ── 胜率解析: 局内和其余 (explain.ts 里写死的句子) ──
   ["双方经济持平", "Gold is even"],
@@ -380,8 +383,15 @@ const RULES: [string, string][] = [
   ["概率校准偏差偏大 (ECE {e})", "Calibration is off (ECE {e})"],
   ["该模型的概率输出被校准限制在 {lo}%–{hi}%", "Calibration limits this model's output to {lo}%–{hi}%"],
   ["超出这个范围的一边倒对局, 它只会顶到边界, 不会给出更极端的数字", "In games more one-sided than that it stops at the edge rather than going further"],
+  // logit_elo (Stage 1/2, G1) 没有硬上下限时的那两句 (explain.range_note(bounded=False))
+  ["留出测试集上该模型给出的概率在 {lo}%–{hi}% 之间", "On the held-out test set this model's probabilities ranged from {lo}% to {hi}%"],
+  ["这不是上下限, 两队赛区内 Elo 差很大时它会给出更极端的数字", "That is not a hard limit: when the two teams' in-league Elo ratings are far apart it can go further"],
   ["局内模型在留出测试集上准确率约 {a}, 25 分钟时约 {b}", "The in-game model is about {a} accurate on the held-out test set, about {b} at 25 minutes"],
   ["局内模型在留出测试集上准确率约 {a}", "The in-game model is about {a} accurate on the held-out test set"],
+  // 线上是 G2 的服务模型时 (api._ingame_disclaimer): 成绩出自同一配方的评估版
+  ["局内模型的同一配方在留出测试集上准确率约 {a}, 25 分钟时约 {b}", "The same in-game recipe is about {a} accurate on the held-out test set, about {b} at 25 minutes"],
+  ["局内模型的同一配方在留出测试集上准确率约 {a}", "The same in-game recipe is about {a} accurate on the held-out test set"],
+  ["线上这份把那段比赛也用来拟合了, 自身没有留出成绩", "The live copy was also fitted on those games, so it has no held-out score of its own"],
   ["概率经保序回归校准 (ECE ≈ {e})", "Probabilities are calibrated with isotonic regression (ECE ≈ {e})"],
   ["概率经Platt校准 (ECE ≈ {e})", "Probabilities are Platt-calibrated (ECE ≈ {e})"],
   ["概率来自留出测试集校准的统计模型, 非投注建议", "Probabilities come from a statistical model calibrated on a held-out test set; not betting advice"],

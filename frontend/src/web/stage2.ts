@@ -2,7 +2,8 @@
  * Stage 2 (BP 后) 的浏览器版 —— api._predict_core: FeatureStore.make_row 带 draft 的那条路
  * + Stage("post_draft").predict。只给看板那条"BP 后"参考线用, 所以只要一个概率, 不组响应。
  *
- * 队伍那部分和赛前完全一样 (stage1.makeRow); 多出来的 BP 特征靠两张查表:
+ * 队伍那部分和赛前完全一样 (stage1.makeRow, 连同校准层要的 elo_gap; 校准层本身也走 stage1.predictStage1,
+ * 按 calibrator 选 logit_elo 或旧导出的 Platt); 多出来的 BP 特征靠两张查表:
  *   champ_league  赛区 → 英雄 → [胜场, 场数]     至少 5 场才有胜率
  *   player_champ  选手 → 英雄 → [胜场, 场数]     至少 3 场才有胜率, 场数本身也是特征
  * 存整数, 在这里做同一次除法 —— np.mean 对 0/1 列表就是精确求和再除以 n, 逐位相同。

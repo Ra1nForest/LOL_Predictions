@@ -43,10 +43,11 @@ For experiments set `LOL_ARTIFACTS` to a scratch dir. Port 8000 is the always-on
 instance (the Vite dev proxy targets it); a second API instance writes to the same
 `predictions/log.jsonl` whenever it serves an in-game board unless `LOL_PRED_LOG` points elsewhere.
 
-Tests — stdlib `unittest`, no pytest, no extra dependency (deliberate). 206 tests, all in
+Tests — stdlib `unittest`, no pytest, no extra dependency (deliberate). 253 tests, all in
 `tests/test_regressions.py`, ~12s, no network or API keys (the debate tests stub the LLM). Without
-`artifacts/` the suite stays green but silently skips the two board classes (`InternationalBoard`,
-`XregionBoard`). Test method names are Chinese, so select by class:
+`artifacts/` the suite stays green but silently skips the three board classes (`InternationalBoard`,
+`XregionBoard`, `IngameDechatterBoard`), the batch-vs-row check in `IngameDechatter` and the
+`serving_fit` load check in `IngameServedDisclaimer`. Test method names are Chinese, so select by class:
 
 ```bash
 python -m unittest discover -s tests -v
@@ -67,7 +68,8 @@ Static GitHub Pages build — no backend at all; see `frontend/src/web/` under A
 ```bash
 python tools/export_web_model.py          # models + team table + xregion state -> frontend/public/web/, plus golden cases
 npm --prefix frontend run test:golden     # browser implementation vs Python (needs a prior export on this machine)
-npm --prefix frontend run test:diff       # browser board vs a fresh Python process, finished games (network + artifacts + data)
+npm --prefix frontend run test:diff       # browser board vs a fresh Python process, finished games (network + artifacts + data);
+                                          #   both sides fetch at one pinned "now" (Feed.pinnedNow / board_oracle.py --at)
 npm --prefix frontend run test:diff -- --days 7 --per 4
 npm --prefix frontend run dev:pages       # :5174
 npm --prefix frontend run build:pages     # -> dist-pages/
@@ -96,7 +98,8 @@ node research/gate_smoothing.mjs           # gates for display-only changes impo
 Unattended pipeline (what the local Windows scheduled tasks run — see Deployment):
 
 ```bash
-python daily_update.py --dry-run --no-fetch    # train into artifacts_staging/ + metric gate; no fetch, swap or restart
+python daily_update.py --dry-run --no-fetch    # train into artifacts_staging/ (or $LOL_ARTIFACTS) + metric gate vs artifacts/;
+                                               #   no fetch, swap or restart
 python daily_update.py --service LoL-Predict   # + fetch, gate, file-by-file swap (old set kept in artifacts_prev/,
                                                #   rolled back if /health fails), restart; --publish-web also updates the site
 python collect_live.py                     # one collection round (LoL-Collect, every 2 min): collected/ + prediction logging via :8000
@@ -106,7 +109,10 @@ python run_task.py collect collect_live.py --stdout   # run a task in the foregr
 ```
 
 Plain `--dry-run` stops right after the fetch when no CSV changed; `--no-fetch` (dead OAuth token,
-Drive quota) and `--force` make it train anyway. `--no-restart` swaps without restarting.
+Drive quota) and `--force` make it train anyway. `--no-restart` swaps without restarting. Only a
+`--dry-run` honours a user-set `LOL_ARTIFACTS` as its staging dir (it clears just the model files
+there, and refuses a path that is or contains `artifacts/`); a real run always stages in
+`artifacts_staging/` and says so if `LOL_ARTIFACTS` is set (`daily_update._staging_for`).
 
 ## Architecture
 
@@ -120,21 +126,53 @@ Python runtime modules live in the project root. `api.py` imports nothing from `
 - **`feature_store.py`** is the single definition of Stage 1/2 features, used by *both*
   `build_training_matrix()` (offline) and `FeatureStore.make_row()` (online). Any feature change
   belongs here and nowhere else. `select_features(mdf, stage)` decides which columns a stage sees;
-  `pre_draft` is `post_draft` minus anything matching `DRAFT_PREFIXES`.
-- **`train.py`** fits XGBoost + a **Platt** calibrator per stage and writes
+  `pre_draft` is `post_draft` minus anything matching `DRAFT_PREFIXES`. It is also the single
+  definition of the **in-league team Elo** (`elo_games` / `elo_replay` / `elo_rating`, G1's (d)):
+  stored as `elo_gap` (blue − red) in both the training matrix and `make_row`'s row, under a name
+  `select_features` never feeds to the trees (see the Elo invariant).
+- **`train.py`** fits XGBoost (shallow since G1: 300 trees, depth 3, lr 0.03, min_child_weight 10)
+  plus a calibration layer per stage, on the same 60/20/20 time split as always, and writes
   `artifacts/model_<stage>.json` plus `artifacts/calib_<stage>.json`. The calib file is the real
-  contract: it carries `coef`, `intercept`, the exact `features` list, and `metrics`. `api.py`'s
-  `Stage` class reads the feature list from there, so feature order is never re-derived at serving
-  time.
+  contract: the exact `features` list, `metrics`, and the calibrator. Since G1 that is
+  `calibrator: "logit_elo"` — a logistic regression on `[logit(clip(p_raw)), elo_gap · ln10/400]`,
+  coefficients/constants under `logit_elo` (incl. `elo_weight`, Elo's share of the calibrated
+  log-odds, and `elo_sd`, the calibration slice's `elo_gap` standard deviation — together they set
+  Elo's evidence weight, see `explain.py` below); `coef`/`intercept` are kept as a **compatibility Platt** fitted on the same calibration
+  slice, purely so an older service build can still load the file. `api.Stage` picks the calibrator
+  by that field, falls back to Platt when it is absent (new code + old artifacts), refuses to load
+  when the file's Elo constants differ from `feature_store`'s, and raises (does not fall back to
+  Platt) if a `logit_elo` row has no `elo_gap`. `api.py`'s `Stage` class reads the feature list from
+  the calib file, so feature order is never re-derived at serving time. Its `exp`/`log` (both
+  calibrators) are `fdlibm.exp`/`fdlibm.log`, not `math` — see the portable-math invariant.
+  `metrics.p_min`/`p_max` are still the test slice's extremes, but `logit_elo` has **no hard bound**
+  (≈0.3% of current same-league matchups fall outside them), so for `logit_elo` `api._model_card`
+  (twin `web/stage1.ts modelCard`) drops `p_min`/`p_max` from the card — the front end then draws no
+  "out of reach" hatched zone — and `range_note` says "observed on the test set, not a limit"
+  (`explain.range_note(bounded=False)`); `/predict` drops its "output range is limited" disclaimer
+  sentence, and the Stage 3 briefs say "not a hard bound". Platt (old artifacts) keeps all of them.
 - **`ingame_model.py` / `ingame_train.py` / `ingame_service.py`** are Stage 4. `ingame_model.build()`
   owns the snapshot table, the champion scaling index, and the interaction terms; `ingame_train.py`
   trains **two** variants from it — the full 28-feature model and a 26-feature `_live` variant with
   `xpdiff` and `x_xp_scaling` removed, because the live frame feed has no XP field.
   `/predict/ingame` picks the variant by whether `state.xpdiff` is null. Any new xp-derived column
   must be added to `XP_DERIVED` (in `ingame_train.py`) or the live variant leaks XP back in.
-  Stage 4 calibrates with isotonic regression (Stage 1/2 stay Platt, see Invariants); the
+  Stage 4 calibrates with isotonic regression (Stage 1/2 use `logit_elo`, see Invariants); the
   `calibrator` field in `calib_ingame*.json` selects it and `IngameModel.calibrate()` falls back to
-  Platt without it. **Stage 4 features have no single definition**: `ingame_model.build()` computes
+  Platt without it. **Each variant is fitted twice** (G2, `research/gate_ingame_refit.py`,
+  `t = +6.54`): the 60/20/20 *evaluation* fit produces every number in `metrics` and is discarded,
+  so `daily_update`'s metric gate keeps comparing like with like; the *served* fit (trees on the
+  earliest 80% of games, isotonic + compatibility Platt on the latest 20%, no test tail) is what
+  gets saved. Exception: `metrics.p_min`/`p_max` are the served table's reachable range, not test
+  extremes (see the clip-warning invariant). `trees_through` / `iso_window` / `serving_fit` /
+  `metrics_source` say which fit is which and change no number; `trained_through` is still the data
+  end (scaling table date), not the trees' cutoff. Only `serving_fit` is read (`IngameModel.serving_fit`,
+  exported into `ingame_live.json`): the in-game disclaimer then says the accuracy is "the same
+  recipe's" on the held-out set and that the live copy has no held-out score of its own
+  (`api._ingame_disclaimer` / `web/ingame.ts disclaimer`). **The served Stage 4 files have no held-out
+  data** — every game up to `trained_through` was fitted — so research scripts that score the live
+  Stage 4 files call `ingame_train.require_unseen` (`.mjs` gates: `requireUnseen`, plus `--ingame FILE`
+  to point at a pre-G2 export) and exit instead of scoring in-sample.
+  **Stage 4 features have no single definition**: `ingame_model.build()` computes
   them offline, `IngameModel.make_row()` recomputes the same columns online without importing
   `ingame_model`, `web/ingame.ts` is a third copy and `research/merge_backfill.derive` a fourth.
   Only `make_row` ↔ `ingame.ts` is pinned (`test:golden`); nothing checks `build()` ↔ `make_row()`,
@@ -144,7 +182,8 @@ Python runtime modules live in the project root. `api.py` imports nothing from `
   `STATE["xregion"]`) are built once in the `lifespan` handler and live in the module-level `STATE`
   dict. If `artifacts/xregion.json` is missing or fails `sanity_check`, cross-region boards simply
   show no C — visible only in the startup log and `/health`. Stage 4 inference goes through
-  `_ingame_core` (`/predict/ingame`, `/session/{sid}/tick`, the board). `/predict` builds its Stage
+  `_ingame_core` (`/predict/ingame`, `/session/{sid}/tick`, the board; only the board passes
+  `blend=True` and `dechatter=True`, see the invariants). `/predict` builds its Stage
   1/2 response inline; `_predict_core` is only the board's Stage-2 float. `esports_board` (~440
   lines) holds the board logic. `/debate`'s `_brief_for` calls the models itself and must keep the
   same variant choice as `_ingame_core`.
@@ -165,7 +204,13 @@ Python runtime modules live in the project root. `api.py` imports nothing from `
   `EsportsFeed._get` caches by URL with the **first caller's TTL**, so never read a URL that live
   data also uses (getEventDetails) with a long TTL — use `match_ids` for stable ids.
 - **`explain.py`** turns field names into sentences. Raw field names must never reach a response
-  unless `raw_features: true`; a field with no template is dropped, not shown raw.
+  unless `raw_features: true`; a field with no template is dropped, not shown raw. `elo_gap` has its
+  own pair of sentences (`ELO`, exported as `explain.json` → `elo`): Elo is not a tree feature, so
+  `Stage.top_evidence` (twin `web/stage1.ts topEvidence`) inserts it as an item — otherwise the
+  reasons would never mention where most of G1's gain comes from — weighted
+  `elo_weight × min(1, |elo_gap| / elo_sd)`. Unscaled, `elo_weight` (~0.7–0.8, every tree importance is
+  below 0.1) made a 7-point gap the first reason and the biggest bubble; a file without `elo_sd`
+  falls back to the unscaled weight.
 - **`debate.py`** (Stage 3) runs the 4-round protocol against NVIDIA NIM. `agents.py` is the older
   advisory layer, still reachable via `POST /predict` with `"agent_review": true` in the body.
   `websearch.py` provides retrieval (Tavily / Brave / Serper, probed in that order); with none
@@ -188,7 +233,15 @@ Python runtime modules live in the project root. `api.py` imports nothing from `
   `stage1.ts` / `ingame.ts` / `xgb.ts` run Stage 1 and the `_live` Stage 4 variant in the browser;
   `stage2.ts` computes the board's post-draft line from two exported tallies (champion×league,
   player×champion); `xregion.ts` ports the board half of `xregion.py` over `public/web/xregion.json`
-  (copied only if `sanity_check` passes); `teams.ts` stands in for the FeatureStore + `map_team`;
+  (copied only if `sanity_check` passes); `teams.ts` stands in for the FeatureStore + `map_team`
+  (`teams.json` → `elo` carries each pool's ratings, last year and Python-computed mean;
+  `stage1.ts eloRating`/`eloGap` apply the year regression, `predictStage1` the `logit_elo` layer);
+  `fdlibm.ts` is the portable `exp`/`log` (twin `fdlibm.py`) used by `predictStage1` and `xregion.ts`.
+  The exported `stage1_pre.json`/`stage2_post.json` always say `calibrator: "platt"` with the
+  compatibility Platt in `platt{a,b}` — that is what an already-open tab running the previous bundle
+  reads (its `loadStage1` throws on anything else, and `static-api.models()` loads all four models
+  together, so the in-game board would fail too); the new `loadStage1` switches on the presence of the
+  `logit_elo` block;
   `names.ts` and `pyfmt.ts` (Python's round-half-even formatting) keep strings identical;
   `explain.ts` ports `explain.py` (its text tables are *exported*, not copied). The static
   `/predict` is Stage 1 only and Stage 3 is absent. The browser calls lolesports directly — both
@@ -196,15 +249,23 @@ Python runtime modules live in the project root. `api.py` imports nothing from `
   Being a second implementation, **it is only trustworthy while two checks pass**: `test:golden`
   (six groups: Stage 4 features/probabilities, `_ingame_core` and `/predict` responses, the board's
   Stage 2 line, the international board helpers, model C — features, model C and response fields
-  bit-for-bit, tree probabilities within 1e-6 because the trees run in float32) and `test:diff` (the
-  whole board, against `tools/board_oracle.py`). The oracle is a **fresh** Python process on
-  purpose: the long-running service carries live-time cache state that is never recomputed, and
-  diffing against it measures that state, not the code. Any change to features, models, `explain.py`
+  bit-for-bit, tree probabilities within 1e-6 because the trees run in float32; Stage 1/2's unrounded
+  calibrated probability must be bit-identical whenever the tree output is, and the `fdlibm` table
+  exactly) and `test:diff` (the whole board, against `tools/board_oracle.py`). The oracle is a
+  **fresh** Python process on purpose: the long-running service carries live-time cache state that is
+  never recomputed, and diffing against it measures that state, not the code. Both sides fetch at one
+  pinned "now" (`Feed.pinnedNow` ↔ `board_oracle.py --at` → `esports_feed.PINNED_NOW`, which also
+  turns off the adaptive lag): a finished game's final window is **not** the same for every
+  `startingTime` (10 s apart → last frame 1–2 s apart, gold off by a dozen; `esports_feed` note 6), so
+  two clocks gave two final frames that looked like a porting bug. Any change to features, models, `explain.py`
   or `esports_feed.py` must be mirrored in `web/` and re-verified, and **after every retrain
   `tools/export_web_model.py` must be re-run** — the files in `frontend/public/web/` are a snapshot,
   and a stale one serves the old model without error. **Pages-only features have no Python twin and
   no check**: live per-frame playback (`web/player.ts` via `useLivePlayback.ts`) and the per-second
-  timeline (`board.ts fineTimeline` / `feed.ts fineRows`). Node 24 runs the `.ts` files directly
+  timeline (`board.ts fineTimeline` / `feed.ts fineRows`). Both call the same `ingameResponse` as the
+  board headline (de-chattered, so ~9 tree evaluations per point); `fineTimeline` computes new points
+  on an async chain that yields the main thread every ~12 ms (MessageChannel, not `setTimeout`, which
+  background tabs throttle to 1/s). Node 24 runs the `.ts` files directly
   (type stripping), which is why `erasableSyntaxOnly` is on and `web/` imports carry `.ts` extensions.
 - **`frontend/src/i18n.ts`** switches the UI to English unless the browser's first preferred
   language (`navigator.languages[0]`) is Chinese (`?lang=en|zh` forces it). Hard-coded UI text goes
@@ -289,16 +350,43 @@ do not), so a refactor near them needs a manual check.
   alone. There is no post-draft line (variant D failed). Before frames exist C shows the
   side-neutral mean, because its intercept is the blue-side edge. Domestic and same-home-league
   boards must stay byte-identical and send none of C's requests (`XregionBoard`). Every `exp` from
-  the exported state goes through `xregion.portable_exp` / `web/xregion.ts exp`, never
-  `math.exp`/`Math.exp`: libms differ by an ulp, and `test:diff` can't tell that from a porting bug;
-  the gate and `build_state` deliberately stay on `math.exp`. Replay rules and numbers live in the
-  `xregion.py` docstrings (pinned by `golden/xregion_cases.json` and `XregionReplay`).
+  the exported state goes through `xregion.portable_exp` (= `fdlibm.exp`) / `web/fdlibm.ts exp` (see
+  the portable-math invariant); the gate and `build_state` deliberately stay on `math.exp`. Replay
+  rules and numbers live in the `xregion.py` docstrings (pinned by `golden/xregion_cases.json` and
+  `XregionReplay`).
+- **Every `exp`/`log` behind a number both implementations print goes through `fdlibm.py` / `web/fdlibm.ts`**
+  (line-by-line ports of fdlibm's `e_exp.c`/`e_log.c`, identical to each other and to V8): model C's
+  replay and Stage 1/2's calibration layer (`feature_store.calib_logit`/`logit_elo_prob`, the Platt
+  branch of `api.Stage.predict`, `web/stage1.ts predictStage1`). Platform libms differ by an ulp
+  (this machine's `math` is MSVC's; Safari uses the system libm): with `math.exp`/`math.log` 18 of 513
+  golden Stage 1 probabilities and ~4.5% of random inputs differed from V8, and the board prints the
+  post-draft / pre-game numbers unrounded, so `test:diff` would flag ulp noise that looks like a
+  porting bug. Training (sklearn/numpy) stays on the platform functions. Pinned by `PortableMath`
+  and `golden/stage1_cases.json` (`fdlibm`, per-case `raw`/`cal`). Node runs V8, so `test:golden`
+  cannot catch a browser-side switch back to `Math.exp`/`Math.log` — only review can.
 - **Isotonic calibration is Stage 4 only.** It passed on ~35k snapshots (Brier `t = +6.91`) and
   failed on Stage 1/2's ~1.7k-game calibration set (`t = -4.74`, overfits exactly as README
-  describes; `research/gate_calibration{,_pre}.py`).
+  describes; `research/gate_calibration{,_pre}.py`). Stage 1/2 use `logit_elo` (next bullet).
+- **Stage 1/2's in-league Elo enters only the calibration layer, and only as gated**
+  (`research/gate_pregame_package.py`, recipe {a, d}: pre Brier `t = +6.55`, post `t = +4.67`;
+  the minor-league rows (b) and player-champion shrinkage (c) were dropped by the pre-registered
+  parsimony rule). One pool per league over the FeatureStore's four-major history, K = 20, start
+  1500, no margin term; at each calendar-year boundary the **whole pool** regresses 50% toward its
+  mean. A training row uses only games on **earlier UTC dates** (same-day results excluded);
+  online it is the rating after every stored game, regressed further only if the request year is
+  later than the **pool's** last game year — never by the team's own last year, or an inactive team
+  is regressed twice. `make_row(as_of=game time)` reproduces the training cell bit-for-bit (and
+  `elo_replay` matches the gate's `elo_inputs` on all 9006 major games). It must stay out of the
+  trees (`elo_gap` has no `diff_`/`b_`/`r_`/`sum_`/`is_` prefix, and `select_features` excludes it
+  explicitly — the gate saw Elo-as-a-tree-feature get half the gain). Same-home-league
+  international boards use the home league's pool via `pregame_league`. Pinned by `PregameElo`,
+  `PregameLogitEloCalibration` and `golden/stage1_cases.json` (`elo`, `explain_elo`, per-case
+  `elo_gap`).
 - **The "probability is clipped" warning keys off the calibrated output** (`IngameModel.clip_warning`
   vs `p_min`/`p_max`), never a minute/golddiff rule. A stale warning is worse than none — Stage 3
-  and the UI quote it as fact.
+  and the UI quote it as fact. For the same reason `p_min`/`p_max` must describe the **served**
+  isotonic table (`ingame_train.reachable_range`), not the evaluation model's test extremes: a
+  mismatch either never fires at the real ceiling or fires below it (`IngameServingRefit`).
 - **Never call `/esports/board` on a finished game in a process that logs predictions.**
   `esports_board` would write final-frame p ≈ 0.01/0.99 rows into `predictions/log.jsonl`, the
   scoring file. `tools/board_oracle.py` stubs `log_prediction`, and `collect_live.log_predictions`
@@ -317,16 +405,34 @@ do not), so a refactor near them needs a manual check.
 - **The board blends its pre-game anchor into Stage 4 over minutes 3–15** (post-draft, else
   pre-game, else C; `api._blend_prior` / `web/ingame.ts blendPrior`), on board paths only —
   `/predict/ingame` stays raw. Adopted for continuity, not accuracy (`research/gate_anchor.py`).
-  Change both twins; `test:diff` catches a mismatch.
+  The Stage 4 number it blends is the de-chattered one (see "Do not smooth" below). Change both twins;
+  `test:diff` catches a mismatch.
 - **Collected winners are provisional until Oracle's Elixir confirms them.** `collect_live.py`
   infers a game's winner from the series-score increment, which in LPL once credited one point to
   two games. `oe_correct()` overwrites collected labels with OE results every 6 h
   (`source="oe"`, the old value kept in `was`). Do not train on collected labels that skip it.
-- **Do not smooth the win-probability curve over time.** A trailing average removes the
-  per-second chatter (XGBoost is piecewise-constant in golddiff, plus slice switches at
-  12.5/17.5/22.5 min) but lags exactly when the game is being decided: Brier `t = -13.25` over 150
-  held-out games (`research/gate_smoothing.mjs`). Any de-chattering has to happen in feature space
-  (e.g. averaging over a golddiff neighbourhood) and pass the same gate.
+- **Do not smooth the win-probability curve over time; de-chatter only in feature space, exactly as
+  gated.** A trailing average removes the per-second chatter (XGBoost is piecewise-constant in
+  golddiff, plus slice switches at 12.5/17.5/22.5 min) but lags exactly when the game is being
+  decided: Brier `t = -13.25` over 150 held-out games (`research/gate_smoothing.mjs`). What shipped
+  instead (G3, `research/gate_dechatter.mjs`) is a golddiff-neighbourhood average: golddiff shifted
+  by the nine integers `ingame_service.DECHATTER_SHIFTS` (−200…+200 step 50), every golddiff-derived
+  column rebuilt by `make_row`/`buildRow` (gold_total is not shifted), the nine **calibrated**
+  probabilities summed left to right and divided by 9 (an explicit loop on both sides — Python's
+  `sum()` is compensated since 3.12 and `np.mean` is pairwise, each an ulp off the browser), **then**
+  the 3–15 min blend; the clip warning keys off the final number; evidence/reasons, `slice_used` and
+  `probability_raw` come from the un-shifted row (so on the board `probability_blue` is no longer
+  `calibrate(probability_raw)`, even after minute 15), and the response carries `dechattered: true`.
+  It passed as **display-only, "not significantly worse"** (series `t = +2.39` over 160 games, user
+  sign-off; the direction is better but below +2.5, so never claim it is more accurate), cutting
+  event-free ≥4 pp jumps 25.9 → 7.6 per game. It is on for the board only — headline, curve,
+  per-second timeline, live playback (`_ingame_core(dechatter=True)` / `ingameResponse({dechatter:
+  true})`) — and logged rows carry `dechatter: true` (`prediction_log`), since the held-out `per_T`
+  is single-point; `/predict/ingame` and `/session` ticks stay raw. Change the shifts, order or
+  blend placement only through a new gate, in both implementations together (pinned by
+  `IngameDechatter`, `IngameDechatterBoard`, `golden/ingame_cases.json` → `cal_dc` / `resp_dc` /
+  `dechatter_shifts`). The gate scripts pass `dechatter: false` to `fineTimeline` to keep
+  reproducing the pre-G3 baseline.
 - **A failed start calibration is not a result.** `_game_start` (and `gameStart` in
   `frontend/src/web/feed.ts`) retries every `START_RETRY_SEC` until the calibration windows have
   settled; only then does it accept `frames[0]`. Caching the first-sight failure put every live
@@ -343,7 +449,8 @@ do not), so a refactor near them needs a manual check.
 - Env vars are read from the process environment only — nothing loads an env file. On this machine
   they must be user environment variables (`setx`), which the scheduled tasks inherit;
   `deploy/service.env.example` is only the systemd `EnvironmentFile` template. `LOL_ARTIFACTS`
-  redirects training output (`daily_update.py` uses it to train into `artifacts_staging/`). Others:
+  redirects training output (`daily_update.py` sets it for its children to train into
+  `artifacts_staging/`, and honours a user-set one only under `--dry-run`). Others:
   `NVIDIA_API_KEY` (Stage 3), `TAVILY_API_KEY` / `BRAVE_API_KEY` / `SERPER_API_KEY` (retrieval),
   `DEBATE_KEY` (gates `/debate` behind an `X-Debate-Key` header), `LOL_STALE_DAYS`, `LOL_PRED_LOG`,
   `LOL_API` (where `collect_live.py` reaches the API, default `http://127.0.0.1:8000`),

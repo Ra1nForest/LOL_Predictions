@@ -26,11 +26,16 @@ lolesports 赛事数据接入 (非官方端点)
   5. 没有明显的频率限制 (实测 25 请求 / 2.5 req·s⁻¹ 全通), 但观测到过瞬时
      403。所以要退避重试, 但不必为躲限流设计复杂调度。
 
-  6. 比赛结束之后, 任何更晚的 startingTime 都返回**同一批冻结帧** ——
+  6. 比赛结束之后, 更晚的 startingTime 返回的是终局附近的冻结帧 ——
      不是空。实测 2026-08-23 LCK 那局: 从终局后一分钟一直问到两小时,
      每次都是同样 10 帧, 末帧时间戳恒为 10:48:42.094, gameState=finished,
      经济定格。所以"窗口空了"不能当作比赛结束的信号 (真结束了反而不空);
      判结束看 gameState, 去重看时间戳。见 gold_timeline。
+     **但不保证每个 startingTime 都是同一批**: 2026-10-17 Worlds KC vs MVK 三局, 终局 2.5 小时后
+     startingTime 差 10 秒, 末帧就差一两秒 (18:41:55.322 / 18:41:54.687), 经济差十几块;
+     同一个 URL 重复取则逐字节相同。所以打完的局, 看板的终局经济随请求时刻在终局前后几秒里摆动。
+     两份实现对拍 (frontend/scripts/diff-board.mjs ↔ tools/board_oracle.py) 因此要钉住同一个"此刻"
+     (PINNED_NOW / Feed.pinnedNow), 不然两边各自按自己的时钟取到不同的终局帧, 看着像移植错误。
 """
 from __future__ import annotations
 
@@ -46,6 +51,12 @@ import requests
 
 PERSISTED = "https://esports-api.lolesports.com/persisted/gw"
 FEED = "https://feed.lolesports.com/livestats/v1"
+
+# 只给差分测试用 (tools/board_oracle.py --at): 钉住 _lagged 不带 at 时的"此刻", 让 Python 和浏览器版
+# (Feed.pinnedNow) 请求同一批 startingTime —— 打完的局, 不同 startingTime 拿到的终局帧不一样 (模块顶部第 6 条)。
+# window() 钉住时按查那个历史时刻处理 (不走按真实时钟试探的自适应 lag, 理由见那里); 缓存、卡顿判断仍按真实
+# 时钟。线上永远是 None
+PINNED_NOW: Optional[datetime] = None
 
 # 公开的共享 key, lolesports.com 前端自己就用这个。不是机密。
 API_KEY = "0TvQnueqKa5mxJntVWt0w4LpLfEkrV1Ta8rQBb9Z"
@@ -403,7 +414,7 @@ class EsportsFeed:
     @staticmethod
     def _lagged(lag_seconds: int = 60, at: Optional[datetime] = None) -> str:
         """对齐 10 秒后再减 lag。见模块顶部第 1 条。"""
-        t = at or datetime.now(timezone.utc)
+        t = at or PINNED_NOW or datetime.now(timezone.utc)
         t = t.replace(second=(t.second // 10) * 10, microsecond=0)
         return (t - timedelta(seconds=lag_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -579,8 +590,9 @@ class EsportsFeed:
     def final_frame(self, game_id: str) -> Optional[dict]:
         """一局打完之后的终局帧: {"blue_id", "red_id", "towers": [蓝, 红], "inhibitors": [蓝, 红], "gold": [蓝, 红]}。
 
-        只对比分已经算上的局调 (= 确实打完了)。打完之后任何更晚的 startingTime 都返回同一批冻结帧 (模块顶部
-        第 6 条; 实测三个月前的局用"现在 − 60 秒"照样拿得到), 所以就用当前的 lagged(60), 落空再试 300。
+        只对比分已经算上的局调 (= 确实打完了)。打完之后更晚的 startingTime 都返回终局附近的冻结帧 (模块顶部
+        第 6 条; 实测三个月前的局用"现在 − 60 秒"照样拿得到, 只是末帧随 startingTime 前后差一两秒), 所以就用当前的
+        lagged(60), 落空再试 300。
         蓝方是哪队取帧自己的 gameMetadata (和 frame_sides 同一个理由, 不用 persisted 的 side)。
         帧已经是 finished、或者最后一帧停在 10 分钟以前 (帧流断了, 不会再变), 就按 gameId 记住, 以后不再取。
         """
@@ -926,6 +938,12 @@ class EsportsFeed:
         # 所以"这一局整条链都没有帧"这个结论单独记一段时间。数据本身就落后
         # 70 秒, 晚半分钟发现某局开打完全无所谓。at 不为 None 时是在查历史
         # 时刻, 不走这层。
+        #
+        # 钉住了"此刻" (PINNED_NOW, 只在差分测试里) 就当成查那个历史时刻: 下面的自适应 lag 按**真实**时钟
+        # 每 lag_probe_sec 秒试探一次, 两个进程算同一个看板的节奏不同, 就会用上不同的 lag —— 也就是不同的
+        # startingTime, 钉住时钟就白钉了 (2026-10-17 实测: 只钉 _lagged 时 KC vs MVK 三局照样差在终局帧上)。
+        if at is None and PINNED_NOW is not None:
+            at = PINNED_NOW
         now = time.time()
         if at is None:
             until = self._no_frames.get(game_id)
